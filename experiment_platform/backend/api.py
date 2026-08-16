@@ -32,10 +32,12 @@ def _now_ms() -> int:
 def _compute_clock_status(db: Database, experiment_id: str | None = None) -> dict:
     """Derive the PC↔phone clock offset from recorded downlink ACKs.
 
-    Maps recent downlink ACKs into NTP-style exchanges and reuses
-    ``sync.compute_sync`` (which raises ValueError when there are no valid
-    samples). Returns a ``not_synced`` stub when no ACKs exist yet, so the
-    dashboard reflects the real handshake state instead of a hardcoded value.
+    Maps recent downlink ACKs — 5G-direct probes AND /shake exchanges
+    (OAI-host relayed, already converted to the PC clock base) — into
+    NTP-style exchanges and reuses ``sync.compute_sync`` (which raises
+    ValueError when there are no valid samples). Returns a ``not_synced``
+    stub when no ACKs exist yet, so the dashboard reflects the real
+    handshake state instead of a hardcoded value.
 
     When ``experiment_id`` is given only that experiment's ACKs count — stale
     ACKs from previous experiments must NOT make a fresh run look synced
@@ -44,7 +46,7 @@ def _compute_clock_status(db: Database, experiment_id: str | None = None) -> dic
     if experiment_id:
         rows = db.query(
             "SELECT pc_send_ms, phone_recv_ms, phone_send_ms, pc_recv_ms "
-            "FROM experiment_acks WHERE direction='downlink' AND pc_recv_ms IS NOT NULL "
+            "FROM experiment_acks WHERE direction IN ('downlink','shake') AND pc_recv_ms IS NOT NULL "
             "AND experiment_id=? ORDER BY id DESC LIMIT 30", (experiment_id,))
         delay_where = ("SELECT pc_send_ms, phone_recv_ms FROM experiment_acks "
                        "WHERE direction='sync_confirm' AND experiment_id=? "
@@ -52,7 +54,7 @@ def _compute_clock_status(db: Database, experiment_id: str | None = None) -> dic
     else:
         rows = db.query(
             "SELECT pc_send_ms, phone_recv_ms, phone_send_ms, pc_recv_ms "
-            "FROM experiment_acks WHERE direction='downlink' AND pc_recv_ms IS NOT NULL "
+            "FROM experiment_acks WHERE direction IN ('downlink','shake') AND pc_recv_ms IS NOT NULL "
             "ORDER BY id DESC LIMIT 30")
         delay_where = ("SELECT pc_send_ms, phone_recv_ms FROM experiment_acks "
                        "WHERE direction='sync_confirm' "

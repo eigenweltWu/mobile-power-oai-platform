@@ -55,6 +55,19 @@ def _probe_status(url: str, timeout: float = 3.0) -> dict | None:
     return None
 
 
+def refresh_pdu_ip(settings: Settings, pdu_ip: str) -> None:
+    """Overwrite the cached UE PDU IP (used after /shake resolves a new one).
+
+    After a gNB restart the UE re-registers and usually gets a DIFFERENT
+    PDU address; without this refresh detect_phone keeps probing the stale
+    address and the phone appears OFFLINE forever.
+    """
+    cached = _load(settings)
+    cached["pdu_ip"] = pdu_ip
+    cached["last_seen_ms"] = int(time.time() * 1000)
+    _save(settings, cached)
+
+
 def detect_phone(settings: Settings, serial: str = "53616213",
                  pc_port: int = DEFAULT_PC_PORT) -> dict:
     """Return {state, usb_attached, pdu_ip, agent_url, last_seen_ms,

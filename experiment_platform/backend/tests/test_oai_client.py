@@ -83,12 +83,21 @@ def test_apply_condition_force_restart_always_restarts(monkeypatch, tmp_path):
 
     def fake_post(path: str, payload: dict) -> dict:
         calls.append((path, dict(payload)))
-        if path == "/api/gnb/service":
-            started["at"] = "T1"  # the process was replaced
-            return {"requestId": "req-42"}
         return {"restarted": False}
 
     monkeypatch.setattr(client, "_post", fake_post)
+
+    # gnb_service posts directly via the httpx client (fire-and-poll)
+    def fake_client_post(path: str, json: dict | None = None, **_kw):
+        calls.append((path, dict(json or {})))
+        if path == "/api/gnb/service":
+            started["at"] = "T1"  # the process was replaced
+            return SimpleNamespace(status_code=200, text="",
+                                   json=lambda: {"ok": True, "requestId": "req-42"})
+        raise AssertionError(f"unexpected client.post {path}")
+
+    monkeypatch.setattr(client, "_client",
+                        SimpleNamespace(post=fake_client_post))
 
     def fake_wait(rid, timeout_s=300.0, poll_s=2.0, on_update=None):
         return m.Progress(requestId=rid, active=False, action="restart",
@@ -111,7 +120,8 @@ def test_apply_condition_force_restart_always_restarts(monkeypatch, tmp_path):
     # 1) forced: restart issued, awaited, and verified via startedAt change
     res = client.apply_condition(cfg, force_restart=True)
     svc = [c for c in calls if c[0] == "/api/gnb/service"]
-    assert svc == [("/api/gnb/service", {"action": "restart"})]
+    assert len(svc) == 1 and svc[0][1]["action"] == "restart"
+    assert svc[0][1]["requestId"].startswith("pc-")
     assert res["restart"]["requestId"] == "req-42"
     assert res["progress"].done and res["progress"].requestId == "req-42"
     assert res["restart_verified"] is True
@@ -139,7 +149,11 @@ def test_apply_condition_force_restart_unchanged_started_at_raises(monkeypatch, 
     client = OaiClient(s)
 
     monkeypatch.setattr(client, "_post",
-                        lambda path, payload: {"requestId": "req-42"})
+                        lambda path, payload: {"restarted": False})
+    monkeypatch.setattr(client, "_client", SimpleNamespace(
+        post=lambda path, json=None, **kw: SimpleNamespace(
+            status_code=200, text="",
+            json=lambda: {"ok": True, "requestId": "req-42"})))
     monkeypatch.setattr(client, "wait_for_restart",
                         lambda rid, timeout_s=300.0, poll_s=2.0, on_update=None:
                         m.Progress(requestId=rid, active=False, action="restart",
@@ -154,6 +168,8 @@ def test_apply_condition_force_restart_unchanged_started_at_raises(monkeypatch, 
 
 def test_apply_condition_force_restart_failed_progress_raises(monkeypatch, tmp_path):
     """Restart progress failed → must raise instead of continuing to rearm."""
+    from types import SimpleNamespace
+
     import pytest
 
     from experiment_platform.backend.config import Settings
@@ -164,7 +180,11 @@ def test_apply_condition_force_restart_failed_progress_raises(monkeypatch, tmp_p
     client = OaiClient(s)
 
     monkeypatch.setattr(client, "_post",
-                        lambda path, payload: {"requestId": "req-42"})
+                        lambda path, payload: {"restarted": False})
+    monkeypatch.setattr(client, "_client", SimpleNamespace(
+        post=lambda path, json=None, **kw: SimpleNamespace(
+            status_code=200, text="",
+            json=lambda: {"ok": True, "requestId": "req-42"})))
     monkeypatch.setattr(client, "wait_for_restart",
                         lambda rid, timeout_s=300.0, poll_s=2.0, on_update=None:
                         m.Progress(requestId=rid, active=False, action="restart",
@@ -181,3 +201,122 @@ def test_event_dedup_key_stable():
     assert k1 == k2
     ev2 = {**ev, "slot": 8}
     assert EventCollector.dedup_key(ev2) != k1
+
+
+# ---- /shake + OAI-PC clock base ------------------------------------------- #
+
+def test_shake_returns_payload_on_success(monkeypatch, tmp_path):
+    """Happy path: POST /api/shake returns the exchange payload verbatim."""
+    from experiment_platform.backend.config import Settings
+    from experiment_platform.backend.oai_client import OaiClient
+
+    s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
+                 oai_host="127.0.0.1", oai_port=1)
+    client = OaiClient(s)
+    calls: list[tuple[str, dict]] = []
+
+    def fake_post(path: str, payload: dict) -> dict:
+        calls.append((path, dict(payload)))
+        return {"ok": True, "ue_ip": "10.0.1.77", "rtt_ms": 18.0, "offset_ms": 3.0,
+                "exchanges": [{"seq": 1, "monitoring": True}]}
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    res = client.shake(n_exchanges=3)
+    assert calls == [("/api/shake", {"n_exchanges": 3})]
+    assert res["ok"] is True
+    assert res["ue_ip"] == "10.0.1.77"
+    assert res["exchanges"][0]["monitoring"] is True
+
+
+def test_shake_error_body_returned_not_raised(monkeypatch, tmp_path):
+    """OAI answers 502/503 with a JSON body ({ok:false, ue_ip?, error}) —
+    shake() must return that body instead of raising, so callers can treat
+    'no UE PDU session' / 'downlink failed' as a normal outcome."""
+    import json as _json
+
+    from experiment_platform.backend.config import Settings
+    from experiment_platform.backend.oai_client import OaiClient, OaiError
+
+    s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
+                 oai_host="127.0.0.1", oai_port=1)
+    client = OaiClient(s)
+
+    body = _json.dumps({"ok": False, "ue_ip": "10.0.1.48",
+                        "error": "downlink failed: timed out"})
+
+    def raise_502(path: str, payload: dict) -> dict:
+        raise OaiError("POST", path, 502, body)
+
+    monkeypatch.setattr(client, "_post", raise_502)
+    res = client.shake()
+    assert res["ok"] is False
+    assert res["ue_ip"] == "10.0.1.48"
+    assert "downlink failed" in res["error"]
+
+
+def test_oai_pc_offset_ms_rtt_midpoint(monkeypatch, tmp_path):
+    """oai_pc_offset_ms = PC - OAI estimated at the /api/status RTT midpoint.
+    Uses the raw status dict so the real-world timestamp string shape
+    (ISO-8601 with +00:00) is exercised."""
+    from datetime import datetime, timezone
+
+    from experiment_platform.backend.config import Settings
+    from experiment_platform.backend.oai_client import OaiClient
+
+    s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
+                 oai_host="127.0.0.1", oai_port=1)
+    client = OaiClient(s)
+
+    # OAI reports a timestamp 250 ms behind the PC clock -> offset ≈ +250:
+    # the PC midpoint is ~now, so the offset lands near +250 (tolerance for
+    # test scheduling jitter).
+    from datetime import timedelta
+
+    def fake_status_raw():
+        return {"timestamp": (datetime.now(timezone.utc) - timedelta(milliseconds=250)).isoformat()}
+
+    monkeypatch.setattr(client, "status_raw", fake_status_raw)
+    off = client.oai_pc_offset_ms()
+    assert 200.0 <= off <= 300.0
+
+    # missing timestamp -> 0.0 fallback, never raises
+    monkeypatch.setattr(client, "status_raw", lambda: {})
+    assert client.oai_pc_offset_ms() == 0.0
+
+
+def test_gnb_service_transport_timeout_returns_request_id(monkeypatch, tmp_path):
+    """The OAI handler executes service actions SYNCHRONOUSLY (quiesce UE +
+    docker stop/start + NG-setup wait — 30 s+), far beyond the 8 s shared
+    client timeout. gnb_service must swallow the transport timeout (the OAI
+    handler thread keeps running) and return the requestId so
+    wait_for_restart() can follow the progress. Regression for
+    'start experiment fails with timed out'."""
+    from types import SimpleNamespace
+
+    import httpx
+
+    from experiment_platform.backend.config import Settings
+    from experiment_platform.backend.oai_client import OaiClient
+
+    s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
+                 oai_host="127.0.0.1", oai_port=1)
+    client = OaiClient(s)
+
+    # slow path: transport times out while OAI is still executing the action
+    def slow_post(path, json=None, **kw):
+        raise httpx.ReadTimeout("read timed out")
+
+    monkeypatch.setattr(client, "_client", SimpleNamespace(post=slow_post))
+    resp = client.gnb_service("restart")
+    assert resp["ok"] is True
+    assert resp["requestId"].startswith("pc-")
+
+    # fast path: response arrives within the timeout — id echoed/attached back
+    def fast_post(path, json=None, **kw):
+        return SimpleNamespace(status_code=200, text="",
+                               json=lambda: {"ok": True, "message": "基站已重新启动"})
+
+    monkeypatch.setattr(client, "_client", SimpleNamespace(post=fast_post))
+    resp2 = client.gnb_service("restart")
+    assert resp2["requestId"].startswith("pc-")
+    assert resp2["message"] == "基站已重新启动"

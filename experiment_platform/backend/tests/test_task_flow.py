@@ -35,6 +35,8 @@ def _make_loop(tmp_path) -> tuple[DownlinkLoop, Database, MagicMock]:
                    "state": "PREPARING"})
     oai = MagicMock()
     oai.research_ues.return_value = FakeUes()
+    oai.shake.return_value = {"ok": False, "ue_ip": None, "error": "no UE PDU session"}
+    oai.oai_pc_offset_ms.return_value = 0.0
     plan = {"experimentId": "EXP", "runId": "R1", "conditionId": "C1",
             "environment": "AC", "startDelaySeconds": 1.0, "phases": DEFAULT_PHASES}
     loop = DownlinkLoop("EXP", "53616213", 8420, db, s, oai, plan,
@@ -98,6 +100,8 @@ def test_start_experiment_no_condition_creates_default(tmp_path):
     oai.status.return_value = MagicMock()
     oai.status.return_value.gnb = MagicMock(running=True)
     oai.research_ues.side_effect = RuntimeError("no ues yet")
+    oai.shake.return_value = {"ok": False, "ue_ip": None, "error": "no UE PDU session"}
+    oai.oai_pc_offset_ms.return_value = 0.0
 
     flow = TaskFlow(s, db, oai)
     res = flow.start_experiment("EXP2", "53616213")  # no run/condition pre-created
@@ -132,6 +136,8 @@ def test_start_then_stop_marks_run_stopped(tmp_path):
     oai.status.return_value = MagicMock()
     oai.status.return_value.gnb = MagicMock(running=True)
     oai.research_ues.side_effect = RuntimeError("no ues yet")
+    oai.shake.return_value = {"ok": False, "ue_ip": None, "error": "no UE PDU session"}
+    oai.oai_pc_offset_ms.return_value = 0.0
 
     flow = TaskFlow(s, db, oai)
     res = flow.start_experiment("EXP3", "53616213")
@@ -247,6 +253,9 @@ def _make_template_flow(tmp_path):
                           "schema_version": 1})
     db.upsert_condition({"condition_id": "C1", "experiment_id": "EXP3", "environment": "AC"})
     oai = MagicMock()
+    oai.shake.return_value = {"ok": True, "ue_ip": "10.0.1.99", "rtt_ms": 12.0,
+                              "offset_ms": 1.5, "exchanges": []}
+    oai.oai_pc_offset_ms.return_value = 0.0
     flow = TaskFlow(s, db, oai)
     flow.add_template("EXP3", "T1", {"bandwidthMHz": 20, "txGainDb": 70})
     tid = flow.list_templates("EXP3")[0]["id"]
@@ -322,10 +331,177 @@ def test_apply_template_idle_applies_and_rearms(tmp_path, monkeypatch):
     db.close()
 
 
+# ---- /shake integration (post-restart time sync + UE IP discovery) -------- #
+
+def test_shake_and_refresh_records_and_refreshes_ip(tmp_path):
+    """A successful /shake must (a) overwrite the cached PDU address and
+    (b) record the timestamped exchanges as direction='shake' rows in
+    experiment_acks + sync_anchors, so the clock status flips to synced
+    even before 5G-direct downlink ACKs resume."""
+    import json
+
+    from experiment_platform.backend.task_flow import shake_and_refresh
+
+    s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
+                 oai_host="127.0.0.1", oai_port=1)
+    s.ensure_dirs()
+    db = Database(s.db_path)
+    db.upsert_experiment({"experiment_id": "EXP", "environment": "AC",
+                          "operator_name": "", "notes": "", "purpose": "", "flow": "",
+                          "initial_oai_config": None,
+                          "created_utc": "2026-01-01T00:00:00+00:00",
+                          "schema_version": 1})
+    db.upsert_condition({"condition_id": "C1", "experiment_id": "EXP", "environment": "AC"})
+    db.upsert_run({"run_id": "R1", "experiment_id": "EXP", "condition_id": "C1",
+                   "state": "PREPARING"})
+
+    oai = MagicMock()
+    # OAI-host-stamped exchange; the phone is monitoring so timestamps exist.
+    oai.shake.return_value = {
+        "ok": True, "ue_ip": "10.0.1.77", "rtt_ms": 20.0, "offset_ms": 5.0,
+        "monitoring": True,
+        "exchanges": [{"seq": 1, "pc_send_ms": 1000.0, "pc_recv_ms": 1020.0,
+                       "phone_recv_ms": 1005.0, "phone_send_ms": 1007.0,
+                       "phone_elapsed_ns": 9_000_000_000, "rtt_ms": 20.0,
+                       "monitoring": True}],
+    }
+    oai.oai_pc_offset_ms.return_value = 0.0  # same clock base for the test
+
+    res = shake_and_refresh(s, oai, db, "EXP", run_id="R1", n_exchanges=1)
+
+    assert res["ok"] is True
+    assert res["ue_ip"] == "10.0.1.77"
+    assert res["exchanges_recorded"] is True
+    # (a) the cached phone_state.json now carries the NEW PDU address
+    state = json.loads((s.data_dir / "phone_state.json").read_text(encoding="utf-8"))
+    assert state["pdu_ip"] == "10.0.1.77"
+    # (b) the shake exchange is recorded on both tables
+    acks = db.query("SELECT * FROM experiment_acks WHERE direction='shake'")
+    assert len(acks) == 1
+    assert acks[0]["pc_send_ms"] == 1000.0
+    assert acks[0]["phone_recv_ms"] == 1005.0
+    anchors = db.query("SELECT * FROM sync_anchors WHERE run_id='R1' AND direction='before'")
+    assert len(anchors) == 1
+    assert anchors[0]["rtt_ms"] == 20.0
+    db.close()
+
+
+def test_shake_and_refresh_failure_never_raises(tmp_path):
+    """OAI unreachable / no PDU session: /shake returns ok:false — must come
+    back as a result dict, never raise into the caller (start/apply paths)."""
+    from experiment_platform.backend.task_flow import shake_and_refresh
+
+    s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
+                 oai_host="127.0.0.1", oai_port=1)
+    s.ensure_dirs()
+    db = Database(s.db_path)
+    oai = MagicMock()
+    oai.shake.return_value = {"ok": False, "ue_ip": None, "error": "no UE PDU session"}
+
+    res = shake_and_refresh(s, oai, db, "EXP", run_id=None, n_exchanges=1)
+    assert res["ok"] is False
+    assert res["ue_ip"] is None
+    assert "no UE PDU session" in res["error"]
+    # nothing recorded
+    assert db.query("SELECT * FROM experiment_acks WHERE direction='shake'") == []
+    db.close()
+
+
+def test_downlink_loop_shakes_when_phone_offline(tmp_path):
+    """PDU unreachable (fresh gNB restart, new UE address): the loop must ask
+    /shake to re-resolve the address instead of silently retrying the stale
+    one. Throttled to one /shake per 10 s of offline probing."""
+    loop, db, oai = _make_loop(tmp_path)
+    oai.shake.return_value = {"ok": False, "ue_ip": None, "error": "downlink failed"}
+
+    loop._resolve_agent = lambda: (None, None)
+    loop.start()
+    import time as _t
+    _t.sleep(0.15)  # interval 0.01 s -> many probes, but throttled to 1 shake
+    loop.stop()
+
+    assert oai.shake.call_count >= 1
+    assert loop.last_shake is not None
+    assert loop.last_shake["ok"] is False
+    # no ACK rows were written while offline
+    assert db.query("SELECT * FROM experiment_acks WHERE direction='downlink'") == []
+    db.close()
+
+
+def test_apply_template_shakes_after_gnb_restart(tmp_path, monkeypatch):
+    """Template switch = forced REAL gNB restart -> the UE usually re-lands
+    on a NEW PDU address. The switch must run /shake (sync + IP refresh)
+    between the restart and the rearm, and surface it in the response."""
+    flow, db, oai, tid = _make_template_flow(tmp_path)
+    db.upsert_run({"run_id": "R9", "experiment_id": "EXP3", "condition_id": "C1",
+                   "state": "RUNNING"})
+    agent = _patch_phone(flow, {"status": {"state": "RUNNING", "phase": "IDLE"}},
+                         monkeypatch)
+    agent.rearm.return_value = {"ok": True, "state": "RUNNING", "phase": "IDLE"}
+
+    res = flow.apply_template("EXP3", tid)
+
+    oai.shake.assert_called()
+    assert res["shake"]["attempted"] is True
+    assert res["shake"]["ok"] is True
+    assert res["shake"]["ue_ip"] == "10.0.1.99"
+    # rearm still happened after the shake
+    agent.rearm.assert_called_once()
+    db.close()
+
+
 def test_apply_template_without_active_run_skips_rearm(tmp_path, monkeypatch):
     """With no run in flight the switch just applies the config — no rearm."""
     flow, db, oai, tid = _make_template_flow(tmp_path)
     res = flow.apply_template("EXP3", tid)
     oai.apply_condition.assert_called_once()
     assert res["rearm"]["attempted"] is False
+    db.close()
+
+
+# ---- experiment start ALWAYS force-restarts the gNB ----------------------- #
+
+def test_start_experiment_force_restarts_gnb(tmp_path):
+    """Every experiment start must issue a REAL gNB restart (verified), not
+    just ensure the process is running — a fresh run begins from a known RF
+    state even when the template config is identical to what is applied."""
+    flow, db, oai, _tid = _make_template_flow(tmp_path)
+    flow.start_experiment("EXP3", "53616213")
+    oai.apply_condition.assert_called_once()
+    kwargs = oai.apply_condition.call_args.kwargs
+    assert kwargs.get("force_restart") is True
+    # ensure_gnb_running is no longer on the start path (the forced restart
+    # starts a stopped gNB too — docker restart semantics)
+    oai.ensure_gnb_running.assert_not_called()
+    db.close()
+
+
+def test_start_experiment_restart_failure_marks_run_error(tmp_path):
+    """When the forced gNB restart fails, the run must transition to ERROR
+    (visible on the dashboard) and the failure must propagate to the API."""
+    import pytest
+
+    flow, db, oai, _tid = _make_template_flow(tmp_path)
+    oai.apply_condition.side_effect = RuntimeError("gNB restart FAILED: crashed")
+    with pytest.raises(RuntimeError, match="gNB restart FAILED"):
+        flow.start_experiment("EXP3", "53616213")
+    runs = db.query("SELECT run_id, state FROM runs WHERE experiment_id='EXP3' "
+                    "ORDER BY rowid DESC LIMIT 1")
+    assert runs[0]["state"] == "ERROR"
+    db.close()
+
+
+def test_start_experiment_mounts_channel_collector(tmp_path):
+    """Every run must mount the ChannelCollector — without it the complex-CIR
+    multipath metrics never reach oai_channel and the Timeline CIR charts
+    stay empty even though the frontend implements them."""
+    from experiment_platform.backend.collectors import ChannelCollector
+
+    flow, db, oai, _tid = _make_template_flow(tmp_path)
+    flow.start_experiment("EXP3", "53616213")
+    mounted = flow.collectors.get("EXP3", [])
+    assert any(isinstance(c, ChannelCollector) for c in mounted), \
+        "ChannelCollector not mounted: CIR charts on Timeline will never fill"
+    # stop the threads the start spun up
+    flow._stop_collectors("EXP3")
     db.close()

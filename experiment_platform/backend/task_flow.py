@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
-from .collectors import EventCollector, SnapshotCollector, save_config_provenance
+from .collectors import ChannelCollector, EventCollector, SnapshotCollector, save_config_provenance
 from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
@@ -46,6 +46,81 @@ def build_phases(idle_seconds: float = DEFAULT_IDLE_SECONDS,
     ]
 
 
+def shake_and_refresh(settings, oai, db, experiment_id, run_id=None,
+                      n_exchanges: int = 3) -> dict:
+    """gNB 重启后经 OAI /api/shake 完成对时并刷新 UE PDU IP.
+
+    Every gNB restart (experiment start OR template switch) kicks the UE
+    offline; it re-registers and usually lands on a NEW PDU address that the
+    PC cannot discover by itself (no USB during experiments, and the PC is
+    not in the PDU subnet). /shake solves both at once:
+
+    1. ``ue_ip`` — resolved by the OAI host from the oai-upf session table
+       (USB-free). Refreshed into phone_state.json so detect_phone and the
+       DownlinkLoop immediately use the new address.
+    2. ``exchanges`` — NTP-style timestamp exchanges the OAI host performs
+       against the phone agent (requires the phone to be in monitoring
+       mode). Stamped with the OAI host clock, converted to the PC clock
+       base via oai_pc_offset_ms and recorded into experiment_acks
+       (direction='shake') + sync_anchors so the clock status reflects the
+       shake-based sync even before 5G-direct downlink ACKs resume.
+
+    Never raises — returns {ok, stage, ...} describing the outcome.
+    """
+    from .phone_detect import refresh_pdu_ip
+    try:
+        resp = oai.shake(n_exchanges)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "stage": "shake", "error": str(e)}
+
+    ue_ip = resp.get("ue_ip")
+    out = {"ok": bool(resp.get("ok")), "ue_ip": ue_ip,
+           "error": resp.get("error"), "monitoring": resp.get("monitoring")}
+    if not ue_ip:
+        out.setdefault("error", out.get("error") or "no UE PDU session")
+        return out
+
+    # 1. refresh the cached PDU address — the DownlinkLoop resumes probing
+    #    the CURRENT UE address over 5G right after this.
+    try:
+        refresh_pdu_ip(settings, ue_ip)
+    except Exception as e:  # noqa: BLE001
+        out["refresh_error"] = str(e)
+
+    # 2. record the timestamped exchanges (phone in monitoring mode) on the
+    #    PC clock base so the clock status can flip to synced from the shake.
+    try:
+        off = oai.oai_pc_offset_ms()
+    except Exception:  # noqa: BLE001
+        off = 0.0
+    ex_ok = False
+    for ex in (resp.get("exchanges") or []):
+        if not ex.get("monitoring", False):
+            continue
+        pr, ps = ex.get("phone_recv_ms"), ex.get("phone_send_ms")
+        if not (pr and ps and ex.get("pc_send_ms") and ex.get("pc_recv_ms")):
+            continue
+        t1 = ex["pc_send_ms"] + off
+        t3 = ex["pc_recv_ms"] + off
+        t2_utc = (pr + ps) / 2.0
+        rtt = ex["rtt_ms"]
+        offset = (t1 + rtt / 2.0) - t2_utc
+        db.execute(
+            "INSERT INTO experiment_acks(experiment_id,run_id,seq,direction,pc_send_ms,phone_recv_ms,phone_send_ms,pc_recv_ms,rtt_ms) VALUES(?,?,?,?,?,?,?,?,?)",
+            (experiment_id, run_id, ex.get("seq"), "shake", t1, pr, ps, t3, rtt))
+        if run_id:
+            db.execute(
+                "INSERT INTO sync_anchors(run_id,direction,attempt_index,t1_ms,t2_elapsed_ns,t2_utc_ms,t3_ms,rtt_ms,offset_ms) VALUES(?,?,?,?,?,?,?,?,?)",
+                (run_id, "before", ex.get("seq") or 0, t1,
+                 ex.get("phone_elapsed_ns"), t2_utc, t3, rtt, offset))
+        ex_ok = True
+    out["exchanges_recorded"] = ex_ok
+    if ex_ok:
+        out["rtt_ms"] = resp.get("rtt_ms")
+        out["offset_ms"] = resp.get("offset_ms")
+    return out
+
+
 class DownlinkLoop:
     """Continuously pings the phone (downlink) and records the uplink ACK timestamps.
 
@@ -73,6 +148,8 @@ class DownlinkLoop:
         self.sync_confirmed = False
         self.last_ack: Optional[dict] = None
         self.last_sync_confirm: Optional[dict] = None
+        self._last_shake_ms = 0.0
+        self.last_shake: Optional[dict] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -110,7 +187,18 @@ class DownlinkLoop:
             try:
                 agent, cleanup = self._resolve_agent()
                 if agent is None:
-                    # phone offline — wait and retry (it may come online shortly)
+                    # phone offline — after a gNB restart the UE usually
+                    # re-registers with a NEW PDU address the PC cannot see.
+                    # Ask the OAI host (inside the PDU subnet) via /shake to
+                    # re-resolve the address (and sync clocks when the phone
+                    # is already monitoring). Throttled: /shake scans UPF
+                    # docker logs, too expensive to run every 2 s probe.
+                    now_ms = time.time() * 1000.0
+                    if now_ms - self._last_shake_ms >= 10_000:
+                        self._last_shake_ms = now_ms
+                        self.last_shake = shake_and_refresh(
+                            self.settings, self.oai, self.db,
+                            self.experiment_id, self.run_id, n_exchanges=1)
                     self._stop.wait(self.interval_s)
                     continue
 
@@ -233,9 +321,13 @@ class TaskFlow:
             pass  # provenance is best-effort; the run itself may proceed
         snap = SnapshotCollector(run_id, self.s, self.db, self.oai, interval_s=1.0)
         ev = EventCollector(run_id, self.s, self.db, self.oai, interval_s=2.0)
+        # ChannelCollector persists complex-CIR multipath metrics + the raw
+        # power-delay profile into oai_channel (feeds the Timeline CIR charts).
+        ch = ChannelCollector(run_id, self.s, self.db, self.oai, interval_s=1.0)
         snap.start()
         ev.start()
-        self.collectors[experiment_id] = [snap, ev]
+        ch.start()
+        self.collectors[experiment_id] = [snap, ev, ch]
 
     def _stop_collectors(self, experiment_id: str) -> None:
         for c in self.collectors.pop(experiment_id, []):
@@ -291,6 +383,25 @@ class TaskFlow:
         # REAL gNB restart — the phone then re-runs idle → loaded → idle.
         result = self.oai.apply_condition(cfg, force_restart=True)
 
+        # The gNB just restarted — the UE re-registers (usually with a NEW
+        # PDU address). Re-resolve it via /shake and sync clocks before the
+        # rearm below, otherwise rearm targets the stale address and fails.
+        # Retried briefly: right after a restart the UE may take a few
+        # seconds to complete its PDU session; each attempt is cheap.
+        shake: dict = {"ok": False, "attempted": False}
+        run_row = self.db.query_one(
+            "SELECT run_id FROM runs WHERE experiment_id=? "
+            "AND state IN ('ARMED','RUNNING') ORDER BY rowid DESC LIMIT 1",
+            (experiment_id,))
+        for _ in range(4):
+            shake["attempted"] = True
+            shake = {**shake, **shake_and_refresh(
+                self.s, self.oai, self.db, experiment_id,
+                run_row["run_id"] if run_row else None, n_exchanges=1)}
+            if shake.get("ok"):
+                break
+            time.sleep(5.0)
+
         # The gNB restarted with new RF conditions — re-trigger the phone's
         # phase machine (idle → loaded → idle) over the 5G PDU link.
         rearm: dict = {"attempted": False}
@@ -301,7 +412,7 @@ class TaskFlow:
                     rearm.update(agent.rearm())
             except Exception as e:
                 rearm["error"] = str(e)
-        return {"config": cfg, "result": result, "rearm": rearm}
+        return {"config": cfg, "result": result, "shake": shake, "rearm": rearm}
 
     # ---- start / stop ------------------------------------------------------ #
     def start_experiment(self, experiment_id: str, serial: str, pc_port: int = 8420,
@@ -372,15 +483,22 @@ class TaskFlow:
         })
         self.db.transition(run_id, "PREPARING", "start_experiment: gNB starting + downlink loop")
 
-        # 1. Ensure the gNB process is running (do NOT block waiting for the
-        #    UE here — after the restart below the UE re-selects the cell and
-        #    completes the air-interface handshake on its own).
-        gnb_ready = self.oai.ensure_gnb_running(wait_ue=False)
-
-        # 2. Apply the selected template's config unconditionally — the
-        #    experiment must run under the chosen RF conditions, so a running
-        #    gNB is restarted with the template values.
-        result = self.oai.apply_condition(initial) if initial else {"no_config": True}
+        # 1. Apply the selected template's config and ALWAYS force a REAL
+        #    gNB restart on experiment start — every run must begin from a
+        #    known RF state (a previous experiment or template switch may
+        #    have left effective parameters half-applied, and per-parameter
+        #    restart:false writes give no reliable restart signal).
+        #    apply_condition(force_restart=True) submits the parameters,
+        #    issues ONE restart, awaits it and VERIFIES the process was
+        #    replaced. The UE re-registers on its own afterwards — we never
+        #    block waiting for it here.
+        gnb_ready = False
+        try:
+            result = self.oai.apply_condition(initial or {}, force_restart=True)
+            gnb_ready = True
+        except Exception as e:
+            self.db.transition(run_id, "ERROR", f"start_experiment: gNB restart failed: {e}")
+            raise
 
         # 3. Verify gNB + UE in-sync
         st = self.oai.status()
@@ -391,20 +509,27 @@ class TaskFlow:
         except Exception:
             in_sync = False
 
-        # 4. Start the downlink loop (records ACKs, triggers sync-confirm on the
+        # 4. The gNB (re)start above kicks the UE offline — re-resolve its
+        #    PDU address via /shake and sync clocks when the phone is already
+        #    monitoring. Best-effort here (single attempt, never raises);
+        #    the DownlinkLoop keeps re-shaking every 10 s while the phone is
+        #    unreachable, so the start call never blocks on the UE.
+        shake = shake_and_refresh(self.s, self.oai, self.db, experiment_id, run_id, n_exchanges=1)
+
+        # 5. Start the downlink loop (records ACKs, triggers sync-confirm on the
         #    first ACK — the phone arms itself, the PC never arms directly)
         loop = DownlinkLoop(experiment_id, serial, pc_port, self.db, self.s, self.oai, plan, run_id)
         loop.start()
         self.downlinks[experiment_id] = loop
 
-        # 5. OAI research collectors — record per-UE ul/dl_goodput_mbps, PUSCH
+        # 6. OAI research collectors — record per-UE ul/dl_goodput_mbps, PUSCH
         #    SNR/MCS/PRB into oai_snapshots (1 s) and scheduler events into
         #    oai_events (2 s) for THIS run, so the platform stores the gNB-side
         #    goodput alongside the phone telemetry.
         self._start_collectors(run_id, experiment_id)
         return {"ok": ready and in_sync, "gnb_started": gnb_ready, "gnb_running": ready,
                 "ue_in_sync": in_sync, "config_applied": initial, "downlink_started": True,
-                "sync_pending": True, "run_id": run_id}
+                "sync_pending": True, "run_id": run_id, "shake": shake}
 
     def stop_experiment(self, experiment_id: str, serial: str = "53616213",
                         pc_port: int = 8420) -> dict:

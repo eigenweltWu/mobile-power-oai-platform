@@ -104,7 +104,77 @@ class OaiClient:
 
     # ---- POST control ---------------------------------------------------- #
     def gnb_service(self, action: str) -> dict:
-        return self._post("/api/gnb/service", {"action": action})
+        """POST /api/gnb/service — fire the action, never block on it.
+
+        The OAI handler executes service actions SYNCHRONOUSLY (quiesce UE,
+        docker stop, host preflight, docker start, NG-setup wait, UE restore
+        — easily 30 s+), far beyond the shared client timeout
+        (``oai_timeout_s`` = 8 s). So we submit our own ``requestId`` and
+        TOLERATE the transport timeout: the OAI handler thread keeps running
+        regardless of the dropped connection. The requestId is returned so
+        the caller follows the action via :meth:`wait_for_restart` polling
+        ``/api/gnb/progress`` instead of holding the POST open.
+        """
+        rid = f"pc-{int(time.time() * 1000)}"
+        try:
+            r = self._client.post("/api/gnb/service",
+                                  json={"action": action, "requestId": rid})
+            if r.status_code >= 400:
+                raise OaiError("POST", "/api/gnb/service", r.status_code, r.text)
+            resp = r.json()
+            # Fast path (< timeout): the action already finished server-side.
+            if not resp.get("requestId"):
+                resp["requestId"] = rid
+            return resp
+        except httpx.TimeoutException:
+            # The request reached the OAI host; its handler thread continues
+            # the (long) action. Surface the requestId so wait_for_restart()
+            # can follow the progress.
+            return {"ok": True, "message": f"{action} initiated (async)",
+                    "requestId": rid}
+
+    def shake(self, n_exchanges: int = 3) -> dict:
+        """POST /api/shake — OAI 主机代发 UE downlink 探测.
+
+        The OAI host sits INSIDE the PDU subnet (10.0.1.0/24) while the PC
+        does not, so only the OAI host can reach the phone's agent over 5G.
+        The route resolves the current UE PDU IP from the oai-upf session
+        table (USB-free, independent of the phone app) and performs
+        NTP-style timestamp exchanges against ue_ip:8420/agent/downlink.
+
+        Returns the raw JSON: on success ``{ok, ue_ip, rtt_ms, offset_ms,
+        exchanges[]}``; on failure the OAI side answers HTTP 502/503 with a
+        JSON body (``{ok:false, ue_ip?, error}``) which is returned as-is
+        instead of raising — callers decide whether the error is fatal.
+        """
+        import json as _json
+        try:
+            return self._post("/api/shake", {"n_exchanges": n_exchanges})
+        except OaiError as e:
+            try:
+                return _json.loads(e.body)
+            except Exception:
+                return {"ok": False, "error": str(e)}
+
+    def oai_pc_offset_ms(self) -> float:
+        """PC 时钟 - OAI 主机时钟 (ms)，用 /api/status 的 timestamp 以 RTT 中点估算.
+
+        Needed because /shake stamps its exchanges with the OAI host clock;
+        adding this offset converts them to the PC clock base the platform
+        stores in experiment_acks / sync_anchors.
+        """
+        from datetime import datetime
+        t0 = time.time() * 1000.0
+        raw = self.status_raw()
+        t1 = time.time() * 1000.0
+        ts = raw.get("timestamp")
+        if not ts:
+            return 0.0
+        try:
+            oai_ms = datetime.fromisoformat(str(ts)).timestamp() * 1000.0
+        except ValueError:
+            return 0.0
+        return ((t0 + t1) / 2.0) - oai_ms
 
     def gnb_bandwidth(self, bandwidth_mhz: int, restart: bool) -> dict:
         return self._post("/api/gnb/bandwidth", {"bandwidthMHz": bandwidth_mhz, "restart": restart})

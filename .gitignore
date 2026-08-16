@@ -14,6 +14,14 @@ experiment_platform/config.local.json
 experiment_platform/web/node_modules/
 experiment_platform/web/dist/
 
+# 混响室厂商控制程序（76MB 第三方 SDK/DLL，仅本地参考）
+measurement system/
+
+# 临时脚本 / 提交信息文件
+.tmp_*
+COMMIT_MSG*.txt
+*.bak.*
+
 # Android
 android/.gradle/
 android/build/

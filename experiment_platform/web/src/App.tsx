@@ -1,0 +1,135 @@
+import { useEffect, useState } from 'react';
+import Dashboard from './pages/Dashboard';
+import Experiments from './pages/Experiments';
+import RunDetail from './pages/RunDetail';
+import Comparison from './pages/Comparison';
+import Matrix from './pages/Matrix';
+import Data from './pages/Data';
+import Timeline from './pages/Timeline';
+import Settings from './pages/Settings';
+import { Icon, ToastHost } from './components/ui';
+
+const NAV: { path: string; label: string; icon: string }[] = [
+  { path: '/dashboard', label: 'Dashboard', icon: 'grid' },
+  { path: '/experiments', label: 'Experiments', icon: 'flask' },
+  { path: '/run', label: 'Run Detail', icon: 'play' },
+  { path: '/comparison', label: 'AC/RC Compare', icon: 'compare' },
+  { path: '/matrix', label: 'Matrix', icon: 'matrix' },
+  { path: '/data', label: 'Data', icon: 'data' },
+  { path: '/settings', label: 'Settings', icon: 'settings' },
+];
+
+const TITLES: Record<string, string> = {
+  dashboard: 'Dashboard',
+  experiments: 'Experiments',
+  run: 'Run Detail',
+  comparison: 'AC/RC Compare',
+  matrix: 'Experiment Matrix',
+  data: 'Data Browser',
+  timeline: 'Timeline',
+  settings: 'Settings',
+};
+
+function useHashRoute(): [string, (path: string) => void] {
+  const [hash, setHash] = useState<string>(() => window.location.hash.slice(1) || '/dashboard');
+  useEffect(() => {
+    const onHash = () => setHash(window.location.hash.slice(1) || '/dashboard');
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+  const nav = (path: string) => {
+    window.location.hash = path;
+  };
+  return [hash, nav];
+}
+
+export default function App() {
+  const [hash, nav] = useHashRoute();
+  const [pathPart, queryPart] = hash.split('?');
+  const params = new URLSearchParams(queryPart || '');
+  const segments = pathPart.replace(/^\/+/, '').split('/').filter(Boolean);
+  const section = segments[0] || 'dashboard';
+  const runId = segments[1] ? decodeURIComponent(segments[1]) : undefined;
+  const initialExperimentId = params.get('exp') ?? undefined;
+
+  const isActive = (path: string) =>
+    path === '/run' ? section === 'run' : section === path.slice(1);
+
+  let page: React.ReactNode;
+  switch (section) {
+    case 'dashboard':
+      page = <Dashboard />;
+      break;
+    case 'experiments':
+      page = <Experiments nav={nav} />;
+      break;
+    case 'run':
+      page = <RunDetail runId={runId} nav={nav} />;
+      break;
+    case 'comparison':
+      page = <Comparison nav={nav} />;
+      break;
+    case 'matrix':
+      page = <Matrix nav={nav} />;
+      break;
+    case 'data':
+      page = <Data nav={nav} />;
+      break;
+    case 'timeline':
+      page = <Timeline experimentId={decodeURIComponent(segments[1] || '')} />;
+      break;
+    case 'settings':
+      page = <Settings />;
+      break;
+    // Run Planner and Export now live inside the Experiments hub.
+    case 'planner':
+    case 'export':
+      page = <Experiments nav={nav} />;
+      break;
+    default:
+      page = <Dashboard />;
+  }
+
+  const title = TITLES[section] ?? 'Dashboard';
+
+  return (
+    <div className="app">
+      <aside className="sidebar">
+        <div className="sidebar-brand">
+          <div className="logo">
+            <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth={1.9} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2v20M4 7l3-3 3 3M4 17l3 3 3-3M16 4h4M16 9h4M16 14h4M16 19h4" />
+            </svg>
+          </div>
+          <div>
+            <div className="brand-name">5G Energy Platform</div>
+            <div className="brand-sub">research instrument</div>
+          </div>
+        </div>
+        <nav className="side-nav">
+          {NAV.map((n) => (
+            <button key={n.path} className={isActive(n.path) ? 'active' : ''} onClick={() => nav(n.path)}>
+              <Icon name={n.icon} />
+              {n.label}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-foot">v0.1.0 · OAI lab</div>
+      </aside>
+
+      <div className="app-main">
+        <header className="topbar">
+          <div className="topbar-title">
+            <span className="crumb">platform /</span>
+            {title}
+          </div>
+          <div className="topbar-actions">
+            <span className="live-dot">live</span>
+          </div>
+        </header>
+        <main className="page">{page}</main>
+      </div>
+      <ToastHost />
+    </div>
+  );
+}

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 旧版 monitor.py 的运行时数据与工具（ADB/CIT/GPSTest 大文件，不提交）
+data/
+.tools/
+config.json
+
+# 实验平台
+experiment_platform/data/
+experiment_platform/config.local.json
+experiment_platform/web/node_modules/
+experiment_platform/web/dist/
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.apk
+*.jks
+*.keystore
+
+# 通用
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db

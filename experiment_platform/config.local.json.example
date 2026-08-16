@@ -1,0 +1,8 @@
+{
+  "oai_host": "192.168.31.119",
+  "oai_port": 8787,
+  "oai_control_token": "",
+  "oai_timeout_s": 8.0,
+  "listen_host": "127.0.0.1",
+  "listen_port": 8900
+}

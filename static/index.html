@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#080b0f">
+    <title>暗室无线功耗监控</title>
+    <meta name="description" content="红米 K30i 电流、电压、GNSS、蜂窝和 WLAN 实时监控">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="ambient" aria-hidden="true"></div>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">M</span>
+        <div>
+          <p class="eyebrow">MOBILE LAB / LIVE TELEMETRY</p>
+          <h1>暗室无线功耗监控</h1>
+        </div>
+      </div>
+      <div class="top-actions">
+        <div class="device-pill">
+          <span class="status-dot" id="status-dot"></span>
+          <div>
+            <strong id="device-name">等待设备</strong>
+            <span id="device-state">正在建立采集连接</span>
+          </div>
+        </div>
+        <button class="button ghost" id="pause-button" type="button">暂停采集</button>
+        <a class="button primary" href="/api/export" download>导出 CSV</a>
+      </div>
+    </header>
+
+    <main>
+      <section class="overview">
+        <article class="power-hero panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">BATTERY CURRENT</p>
+              <h2>电池端实时功耗</h2>
+            </div>
+            <span class="metric-state" id="battery-state">—</span>
+          </div>
+          <div class="power-reading">
+            <div>
+              <span class="hero-number" id="current-value">—</span>
+              <span class="hero-unit">mA</span>
+            </div>
+            <div class="power-secondary">
+              <strong id="power-value">— W</strong>
+              <span id="current-raw">原始值 —</span>
+            </div>
+          </div>
+          <div class="power-line">
+            <div class="line-fill" id="power-line-fill"></div>
+          </div>
+          <div class="mini-metrics">
+            <div><span>电压</span><strong id="voltage-value">—</strong></div>
+            <div><span>电量</span><strong id="level-value">—</strong></div>
+            <div><span>温度</span><strong id="temperature-value">—</strong></div>
+            <div><span>供电</span><strong id="supply-value">—</strong></div>
+          </div>
+        </article>
+
+        <article class="chart-panel panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">POWER TRACE</p>
+              <h2>电流与信号趋势</h2>
+            </div>
+            <div class="legend">
+              <span><i class="legend-current"></i>电流</span>
+              <span><i class="legend-gps"></i>GNSS C/N₀</span>
+              <span><i class="legend-cell"></i>蜂窝</span>
+              <span><i class="legend-wifi"></i>WLAN</span>
+            </div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="trend-chart" aria-label="最近五分钟电流和信号变化图"></canvas>
+            <div class="chart-empty" id="chart-empty">等待首个样本</div>
+          </div>
+          <div class="chart-footer">
+            <span>最近 <strong id="window-label">5 分钟</strong></span>
+            <span id="sample-time">—</span>
+          </div>
+        </article>
+      </section>
+
+      <section class="power-control-panel panel">
+        <div class="panel-heading power-control-heading">
+          <div>
+            <p class="eyebrow">BATTERY-ONLY MEASUREMENT</p>
+            <h2>USB 供电隔离与电量变化</h2>
+          </div>
+          <span class="metric-state" id="power-control-state">等待状态</span>
+        </div>
+        <div class="power-control-body">
+          <div class="battery-delta-grid">
+            <div><span>当前电量</span><strong id="battery-live-level">—</strong></div>
+            <div><span>当前剩余电荷</span><strong id="battery-live-charge">—</strong></div>
+            <div><span>电量变化</span><strong id="battery-delta-level">—</strong></div>
+            <div><span>电荷变化</span><strong id="battery-delta-charge">—</strong></div>
+            <div><span>累计消耗</span><strong id="battery-consumed">—</strong></div>
+            <div><span>平均放电电流</span><strong id="battery-average-discharge">—</strong></div>
+          </div>
+          <div class="power-control-copy">
+            <strong id="power-control-title">USB 正在供电</strong>
+            <p id="power-control-message">未 Root 的系统不能通过 ADB 真实关闭 USB 充电。请先建立无线 ADB，再拔掉数据线。</p>
+            <span id="battery-baseline-time">电量基线 —</span>
+          </div>
+          <div class="power-control-actions">
+            <button class="button primary" id="prepare-wireless-button" type="button">建立无线 ADB</button>
+            <button class="button ghost" id="reset-baseline-button" type="button">重置电量基线</button>
+          </div>
+        </div>
+        <p class="power-control-warning">
+          “建立无线 ADB”不会关闭充电；必须实际拔掉 USB，或使用可独立断开 VBUS 的硬件数据隔离器。无线 ADB 下不能运行会关闭 Wi-Fi 的蜂窝主动测速。
+        </p>
+      </section>
+
+      <section class="radio-grid">
+        <article class="radio-card panel">
+          <div class="card-icon gps-icon" aria-hidden="true">◎</div>
+          <div class="radio-head">
+            <div><p class="eyebrow">GNSS</p><h2>卫星信号</h2></div>
+            <span class="metric-state" id="gps-state">—</span>
+          </div>
+          <div class="signal-reading">
+            <div><strong id="gps-signal">—</strong><span>dB-Hz · Top 4</span></div>
+            <div class="signal-bars" id="gps-bars" aria-label="GNSS 信号等级"></div>
+          </div>
+          <div class="detail-grid">
+            <div><span>平均 C/N₀</span><strong id="gps-average">—</strong></div>
+            <div><span>最强 C/N₀</span><strong id="gps-max">—</strong></div>
+            <div><span>可见卫星</span><strong id="gps-visible">—</strong></div>
+            <div><span>用于定位</span><strong id="gps-used">—</strong></div>
+          </div>
+          <p class="card-note" id="gps-note">GNSS 未工作时不会产生瞬时 C/N₀。</p>
+        </article>
+
+        <article class="radio-card panel">
+          <div class="card-icon cell-icon" aria-hidden="true">▥</div>
+          <div class="radio-head">
+            <div><p class="eyebrow">CELLULAR</p><h2>4G / 5G</h2></div>
+            <span class="metric-state" id="cell-state">—</span>
+          </div>
+          <div class="signal-reading">
+            <div><strong id="cell-signal">—</strong><span id="cell-signal-label">dBm · RSSI</span></div>
+            <div class="signal-bars" id="cell-bars" aria-label="蜂窝信号等级"></div>
+          </div>
+          <div class="detail-grid">
+            <div><span>制式</span><strong id="cell-radio">—</strong></div>
+            <div><span>RSRP</span><strong id="cell-rsrp">—</strong></div>
+            <div><span>RSRQ</span><strong id="cell-rsrq">—</strong></div>
+            <div><span>SINR</span><strong id="cell-sinr">—</strong></div>
+          </div>
+          <div class="throughput">
+            <div><span>↓ 下行</span><strong id="cell-down">—</strong></div>
+            <div><span>↑ 上行</span><strong id="cell-up">—</strong></div>
+          </div>
+          <p class="card-note">白卡未入网时，“未注册 / 无信号”为正常测量结果。</p>
+        </article>
+
+        <article class="radio-card panel">
+          <div class="card-icon wifi-icon" aria-hidden="true">⌁</div>
+          <div class="radio-head">
+            <div><p class="eyebrow">WLAN</p><h2>Wi-Fi</h2></div>
+            <span class="metric-state" id="wifi-state">—</span>
+          </div>
+          <div class="signal-reading">
+            <div><strong id="wifi-signal">—</strong><span>dBm · RSSI</span></div>
+            <div class="signal-bars" id="wifi-bars" aria-label="Wi-Fi 信号等级"></div>
+          </div>
+          <div class="detail-grid">
+            <div><span>网络</span><strong id="wifi-ssid">—</strong></div>
+            <div><span>频率</span><strong id="wifi-frequency">—</strong></div>
+            <div><span>协商发送</span><strong id="wifi-tx-link">—</strong></div>
+            <div><span>协商接收</span><strong id="wifi-rx-link">—</strong></div>
+          </div>
+          <div class="throughput">
+            <div><span>↓ 下行</span><strong id="wifi-down">—</strong></div>
+            <div><span>↑ 上行</span><strong id="wifi-up">—</strong></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="workload-panel panel">
+        <div class="panel-heading workload-heading">
+          <div>
+            <p class="eyebrow">ACTIVE TEST CONTROL</p>
+            <h2>手机主动负载控制</h2>
+          </div>
+          <span class="workload-warning">测速会产生实际网络流量</span>
+        </div>
+        <div class="workload-grid">
+          <article class="workload-item">
+            <div class="workload-icon gps-load-icon">◎</div>
+            <div class="workload-copy">
+              <div class="workload-title">
+                <strong>持续 GNSS 搜星</strong>
+                <span class="load-status" id="workload-gps-status">未启动</span>
+              </div>
+              <p id="workload-gps-message">由电脑启动前台定位请求，使 GNSS 持续工作。</p>
+              <div class="load-readout"><span>方式</span><strong>MIUI CIT / GPSTest · 1 Hz</strong></div>
+            </div>
+            <button class="load-button" type="button" data-workload="gps">启动搜星</button>
+          </article>
+
+          <article class="workload-item">
+            <div class="workload-icon wifi-load-icon">⌁</div>
+            <div class="workload-copy">
+              <div class="workload-title">
+                <strong>WLAN 双向测速</strong>
+                <span class="load-status" id="workload-wifi-status">未启动</span>
+              </div>
+              <p id="workload-wifi-message">绑定 wlan 接口，循环下载与上传固定数据量。</p>
+              <div class="load-readout">
+                <span id="workload-wifi-interface">接口 —</span>
+                <strong><i>↓</i> <b id="workload-wifi-down">—</b>　<i>↑</i> <b id="workload-wifi-up">—</b></strong>
+              </div>
+            </div>
+            <button class="load-button" type="button" data-workload="wifi">启动测速</button>
+          </article>
+
+          <article class="workload-item">
+            <div class="workload-icon cell-load-icon">▥</div>
+            <div class="workload-copy">
+              <div class="workload-title">
+                <strong>4G / 5G 双向测速</strong>
+                <span class="load-status" id="workload-cellular-status">未启动</span>
+              </div>
+              <p id="workload-cellular-message">自动选择已验证的数据卡；测速期间会暂时关闭 Wi-Fi。</p>
+              <div class="load-readout">
+                <span id="workload-cellular-interface">接口 —</span>
+                <strong><i>↓</i> <b id="workload-cellular-down">—</b>　<i>↑</i> <b id="workload-cellular-up">—</b></strong>
+              </div>
+            </div>
+            <button class="load-button" type="button" data-workload="cellular">启动测速</button>
+          </article>
+        </div>
+        <details class="speed-config">
+          <summary>测速服务器设置 <span>公网不可达或使用实验室专网时修改</span></summary>
+          <div class="speed-config-grid">
+            <label>
+              <span>下载 URL</span>
+              <input id="speed-download-url" type="url" spellcheck="false" aria-label="下载测速 URL">
+            </label>
+            <label>
+              <span>上传 URL</span>
+              <input id="speed-upload-url" type="url" spellcheck="false" aria-label="上传测速 URL">
+            </label>
+            <label class="size-field">
+              <span>每方向 / 每轮</span>
+              <div><input id="speed-size-mb" type="number" min="1" max="100" step="1" aria-label="每轮数据量"><b>MB</b></div>
+            </label>
+            <button class="save-config-button" id="save-speed-config" type="button">保存设置</button>
+          </div>
+          <p class="config-message" id="speed-config-message">下载 URL 可使用 <code>{bytes}</code> 表示本轮字节数。白卡没有数据出口时，任何公网测速地址都会超时。</p>
+        </details>
+      </section>
+
+      <section class="notice panel" id="notice-panel">
+        <div class="notice-icon">!</div>
+        <div>
+          <strong id="notice-title">测量提醒</strong>
+          <p id="notice-text">USB 连接会给手机供电；界面显示的是电池端电流，不等同于整机从外部电源吸收的总电流。</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span id="footer-session">LOCAL SESSION</span>
+      <span>数据仅保存在本机</span>
+    </footer>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

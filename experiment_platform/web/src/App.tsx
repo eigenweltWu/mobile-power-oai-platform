@@ -3,11 +3,13 @@ import Dashboard from './pages/Dashboard';
 import Experiments from './pages/Experiments';
 import Timeline from './pages/Timeline';
 import Settings from './pages/Settings';
+import PhoneSync from './pages/PhoneSync';
 import { Icon, ToastHost } from './components/ui';
 
 const NAV: { path: string; label: string; icon: string }[] = [
   { path: '/dashboard', label: 'Dashboard', icon: 'grid' },
   { path: '/experiments', label: 'Experiments', icon: 'flask' },
+  { path: '/sync', label: 'Phone Sync', icon: 'download' },
   { path: '/settings', label: 'Settings', icon: 'settings' },
 ];
 
@@ -15,6 +17,7 @@ const TITLES: Record<string, string> = {
   dashboard: 'Dashboard',
   experiments: 'Experiments',
   timeline: 'Timeline',
+  sync: 'Phone Sync',
   settings: 'Settings',
 };
 
@@ -51,6 +54,9 @@ export default function App() {
       break;
     case 'timeline':
       page = <Timeline experimentId={decodeURIComponent(segments[1] || '')} />;
+      break;
+    case 'sync':
+      page = <PhoneSync />;
       break;
     case 'settings':
       page = <Settings />;

@@ -514,6 +514,18 @@ def phone_tasks(serial: str = Query(...), pc_port: int = 8420):
     return _flow().phone_inventory(serial, pc_port)
 
 
+@app.post("/api/phone/pull")
+def phone_pull(payload: dict = Body(...)):
+    """Pull ONE run's data from the phone over the USB tunnel (task 4)."""
+    hostname = payload.get("hostname") or _socket.gethostname()
+    try:
+        return _flow().pull_phone_run(
+            payload["experimentId"], payload["runId"],
+            payload.get("serial", ""), hostname, int(payload.get("pc_port", 8420)))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, str(e))
+
+
 @app.post("/api/experiments/{experiment_id}/templates/{template_id}/apply")
 def apply_template(experiment_id: str, template_id: int, payload: dict = Body(default={})):
     """Apply an OAI template (restarts the gNB with the template's config).

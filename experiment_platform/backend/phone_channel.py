@@ -16,6 +16,8 @@ from typing import Optional
 
 import httpx
 
+from urllib.parse import quote
+
 # The Android agent's local control port (must match the app).
 AGENT_PHONE_PORT = 8420
 
@@ -129,6 +131,10 @@ class PhoneAgent:
     def list_tasks(self) -> dict:
         return self._get("/agent/tasks")
 
+    def data_inventory(self) -> dict:
+        """Phone-side task/run inventory (TaskStore tasks + Room run summaries)."""
+        return self._get("/agent/data/inventory")
+
     def push_task(self, task: dict) -> dict:
         return self._post("/agent/tasks", task)
 
@@ -146,9 +152,15 @@ class PhoneAgent:
     def mark_collected(self, experiment_id: str, hostname: str) -> dict:
         return self._post("/agent/collected", {"experimentId": experiment_id, "hostname": hostname})
 
-    def export(self, dest_dir: Path) -> list[Path]:
-        """Pull the agent's export payload (JSON lines) and write files locally."""
-        r = httpx.get(self.base + "/agent/export", timeout=60.0)
+    def export(self, dest_dir: Path, run_id: Optional[str] = None) -> list[Path]:
+        """Pull the agent's export payload (JSON lines) and write files locally.
+
+        ``run_id`` targets a HISTORICAL run (USB data-pull flow); without it the
+        agent exports the current plan's run (live collect flow)."""
+        url = self.base + "/agent/export"
+        if run_id:
+            url += "?runId=" + quote(run_id, safe="")
+        r = httpx.get(url, timeout=120.0)
         r.raise_for_status()
         data = r.json()
         files = data.get("files", {}) if isinstance(data, dict) else {}

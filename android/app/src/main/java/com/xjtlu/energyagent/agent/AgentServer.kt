@@ -29,11 +29,12 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
             when {
                 session.method == Method.GET && uri == "/agent/status" -> json(ok(status()))
                 session.method == Method.GET && uri == "/agent/time" -> json(ok(time()))
-                session.method == Method.GET && uri == "/agent/export" -> json(ok(export()))
+                session.method == Method.GET && uri == "/agent/export" -> json(ok(export(session)))
                 session.method == Method.POST && uri == "/agent/session" -> json(ok(session(session)))
                 session.method == Method.POST && uri == "/agent/arm" -> json(ok(arm(session)))
                 session.method == Method.POST && uri == "/agent/abort" -> json(ok(abort()))
                 session.method == Method.GET && uri == "/agent/tasks" -> json(ok(tasks()))
+                session.method == Method.GET && uri == "/agent/data/inventory" -> json(ok(dataInventory()))
                 session.method == Method.POST && uri == "/agent/tasks" -> json(ok(addTask(session)))
                 session.method == Method.POST && uri == "/agent/task/start" -> json(ok(taskStart(session)))
                 session.method == Method.POST && uri == "/agent/task/stop" -> json(ok(taskStop()))
@@ -281,10 +282,12 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
         return JSONObject().apply { put("ok", true); put("collection", rec) }
     }
 
-    private fun export(): JSONObject {
+    private fun export(session: IHTTPSession): JSONObject {
         val db = AppDatabase.get(context)
         val plan = AgentState.currentPlan
-        val runId = plan?.runId
+        // Optional ?runId= targets a HISTORICAL run (USB data pull); without
+        // it the current plan's run is exported (live collect flow).
+        val runId = session.parameters["runId"]?.firstOrNull()?.takeIf { it.isNotBlank() } ?: plan?.runId
         val files = JSONObject()
         if (runId != null) {
             val samples = runBlocking { db.samples().byRun(runId) }
@@ -293,14 +296,49 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
             files.put("phone_samples.csv", CsvExporter.samplesCsv(samples))
             files.put("phone_events.csv", CsvExporter.eventsCsv(markers))
             files.put("phone_sync.json", CsvExporter.syncJson(anchors))
-            files.put("phone_session.json", sessionJson(db))
+            files.put("phone_session.json", sessionJson(db, runId))
         }
         return JSONObject().apply { put("ok", true); put("files", files) }
     }
 
-    private fun sessionJson(db: AppDatabase): String = runBlocking {
+    /** Everything the PC needs to render the phone-side task/run inventory:
+     *  TaskStore tasks merged with per-run sample summaries from Room. */
+    private fun dataInventory(): JSONObject {
+        val db = AppDatabase.get(context)
+        val summaries = runBlocking { db.samples().runSummaries() }
+        val tasks = TaskStore.listTasks(context)
+        val byExperiment = LinkedHashMap<String, JSONObject>()
+        for (t in tasks) {
+            val eid = t.optString("experimentId")
+            if (eid.isBlank()) continue
+            byExperiment[eid] = JSONObject().apply { put("task", t) }
+        }
+        for (s in summaries) {
+            val eid = s.experiment_id ?: continue
+            val entry = byExperiment.getOrPut(eid) { JSONObject() }
+            if (!entry.has("task")) entry.put("task", JSONObject.NULL)
+            val runs = entry.optJSONArray("runs") ?: JSONArray().also { entry.put("runs", it) }
+            runs.put(JSONObject().apply {
+                put("runId", s.run_id)
+                put("conditionId", s.condition_id ?: JSONObject.NULL)
+                put("sampleCount", s.sample_count)
+                put("firstUtcMs", s.first_utc_ms ?: JSONObject.NULL)
+                put("lastUtcMs", s.last_utc_ms ?: JSONObject.NULL)
+            })
+        }
+        for (eid in byExperiment.keys.toList()) {
+            val entry = byExperiment[eid]!!
+            entry.put("experimentId", eid)
+            entry.put("collectionCount", TaskStore.collectionCount(context, eid))
+        }
+        return JSONObject().apply {
+            put("experiments", JSONArray().apply { for (e in byExperiment.values) put(e) })
+        }
+    }
+
+    private fun sessionJson(db: AppDatabase, runId: String? = null): String = runBlocking {
         val device = db.meta().device()
-        val run = db.meta().latestRun()
+        val run = (runId?.let { db.meta().run(it) } ?: db.meta().latestRun())
         JSONObject().apply {
             put("device", JSONObject().apply {
                 put("device_id", device?.deviceId)
@@ -315,7 +353,7 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
                 put("battery_capacity_uah", device?.batteryCapacityUah)
             })
             put("run", JSONObject().apply {
-                put("run_id", run?.runId)
+                put("run_id", run?.runId ?: runId)
                 put("experiment_id", run?.experimentId)
                 put("condition_id", run?.conditionId)
                 put("state", run?.state)

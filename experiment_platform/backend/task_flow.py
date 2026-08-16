@@ -618,6 +618,29 @@ class TaskFlow:
         with self._phone(serial, pc_port) as (agent, _ph):
             return agent.list_tasks()
 
+    @contextmanager
+    def _phone_usb(self, serial: str, pc_port: int = 8420):
+        """USB-only tunnel for post-experiment data sync (inventory / per-run pull).
+
+        Opens an ``adb forward`` on a DEDICATED port (pc_port + 2000) so it never
+        fights with the detection probe (pc_port + 1000) or the live downlink
+        loop (pc_port) — sharing ports made adb tear each other's tunnels down.
+        """
+        from .phone_channel import AdbTransport
+        from .phone_detect import AGENT_PORT
+        data_port = pc_port + 2000
+        transport = AdbTransport()
+        if serial not in transport.devices():
+            raise RuntimeError("phone not attached via USB (plug in and enable debugging)")
+        transport.forward(serial, data_port, AGENT_PORT)
+        try:
+            yield PhoneAgent(base_port=data_port, timeout=60.0)
+        finally:
+            try:
+                transport.remove_forward(serial, data_port)
+            except Exception:
+                pass
+
     # ---- collection -------------------------------------------------------- #
     def collect_from_phone(self, experiment_id: str, serial: str, hostname: str, pc_port: int = 8420) -> dict:
         dest = self.s.raw_dir / "phone" / experiment_id
@@ -638,20 +661,96 @@ class TaskFlow:
                 "collected_utc_ms": now, "count": (count["n"] if count else 0) + 1}
 
     def phone_inventory(self, serial: str, pc_port: int = 8420) -> dict:
-        """List phone-side experiments and whether this PC has collected each."""
+        """Phone-side experiment/run inventory merged with this platform's state.
+
+        USB-only (task 4): lists every experiment the phone knows (TaskStore)
+        together with per-run sample summaries (Room), then flags which runs and
+        experiments also exist HERE so the UI can highlight the intersection.
+        """
         try:
-            phone_tasks = self.list_phone_tasks(serial, pc_port)
+            with self._phone_usb(serial, pc_port) as agent:
+                inv = agent.data_inventory()
         except Exception as e:
             return {"ok": False, "error": str(e)}
-        items = phone_tasks.get("experiments", []) if isinstance(phone_tasks, dict) else []
+        platform_exps = {r["experiment_id"] for r in
+                         self.db.query("SELECT experiment_id FROM experiments")}
+        platform_runs = {r["run_id"]: r for r in self.db.query(
+            "SELECT run_id, experiment_id, state, started_utc_ms, ended_utc_ms FROM runs")}
+        platform_samples = {r["run_id"]: r["n"] for r in self.db.query(
+            "SELECT run_id, COUNT(*) n FROM phone_samples GROUP BY run_id")}
         out = []
-        for it in items:
-            eid = it.get("experimentId") if isinstance(it, dict) else it
-            collected = self.db.query(
+        for it in (inv.get("experiments") or []):
+            eid = it.get("experimentId") or ""
+            runs = []
+            for r in (it.get("runs") or []):
+                rid = r.get("runId") or ""
+                pr = platform_runs.get(rid)
+                runs.append({
+                    "run_id": rid,
+                    "phone_sample_count": r.get("sampleCount"),
+                    "first_utc_ms": r.get("firstUtcMs"),
+                    "last_utc_ms": r.get("lastUtcMs"),
+                    "in_platform": pr is not None,
+                    "platform_state": pr["state"] if pr else None,
+                    "platform_started_ms": pr["started_utc_ms"] if pr else None,
+                    "platform_sample_count": platform_samples.get(rid, 0),
+                })
+            collected = self.db.query_one(
                 "SELECT COUNT(*) n, MAX(collected_utc_ms) last FROM collections WHERE experiment_id=?", (eid,))
-            out.append({"experiment_id": eid, "collected_count": collected[0]["n"] if collected else 0,
-                        "last_collected_ms": collected[0]["last"] if collected else None, "raw": it})
-        return {"ok": True, "phone_experiments": out}
+            task = it.get("task") if isinstance(it.get("task"), dict) else {}
+            out.append({
+                "experiment_id": eid,
+                "environment": task.get("environment"),
+                "phone_collection_count": it.get("collectionCount"),
+                "in_platform": eid in platform_exps,
+                "collected_count": collected["n"] if collected else 0,
+                "last_collected_ms": collected["last"] if collected else None,
+                "runs": runs,
+            })
+        out.sort(key=lambda e: (not e["in_platform"], e["experiment_id"]))
+        return {"ok": True, "serial": serial, "phone_experiments": out}
+
+    def pull_phone_run(self, experiment_id: str, run_id: str, serial: str, hostname: str,
+                       pc_port: int = 8420) -> dict:
+        """Pull ONE run's data from the phone over USB and import it (task 4).
+
+        The phone exports that run's raw CSV/JSON via ``/agent/export?runId=``;
+        imported samples REPLACE any previous rows for the same run, so pulling
+        twice is idempotent.
+        """
+        import pandas as pd
+        from .manager import _PHONE_SAMPLE_DB_COLS
+        dest = self.s.raw_dir / "phone" / run_id
+        dest.mkdir(parents=True, exist_ok=True)
+        with self._phone_usb(serial, pc_port) as agent:
+            files = agent.export(dest, run_id=run_id)
+            agent.mark_collected(experiment_id, hostname)
+        for f in files:
+            self.db.record_file(f)
+        imported = {"samples": 0, "events": False, "session": False, "sync": False}
+        samples_csv = dest / "phone_samples.csv"
+        if samples_csv.exists():
+            df = pd.read_csv(samples_csv)
+            cols = [c for c in df.columns if c in _PHONE_SAMPLE_DB_COLS]
+            self.db.execute("DELETE FROM phone_samples WHERE run_id=?", (run_id,))
+            rows = df[cols].where(pd.notna(df[cols]), None).itertuples(index=False, name=None)
+            self.db.executemany(
+                f"INSERT INTO phone_samples({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
+                rows)
+            imported["samples"] = int(len(df))
+        imported["events"] = (dest / "phone_events.csv").exists()
+        imported["session"] = (dest / "phone_session.json").exists()
+        imported["sync"] = (dest / "phone_sync.json").exists()
+        now = int(time.time() * 1000)
+        count = self.db.query_one(
+            "SELECT COUNT(*) n FROM collections WHERE experiment_id=?", (experiment_id,))
+        self.db.execute(
+            "INSERT INTO collections(experiment_id,device_id,hostname,collected_utc_ms,files_json,count)"
+            " VALUES(?,?,?,?,?,?)",
+            (experiment_id, serial, hostname, now,
+             json.dumps([str(f) for f in files]), (count["n"] if count else 0) + 1))
+        return {"ok": True, "run_id": run_id, "files": [f.name for f in files],
+                "imported": imported}
 
     # ---- timeline / clip --------------------------------------------------- #
     def timeline(self, experiment_id: str) -> dict:

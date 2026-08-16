@@ -180,7 +180,26 @@ interface SampleDao {
     /** Discard a monitoring session that never received a platform run id. */
     @Query("DELETE FROM phone_samples WHERE experimentId = :eid AND runId IS NULL")
     suspend fun deleteUnarmed(eid: String): Int
+
+    /** Per-run summary for the USB data inventory (agent /agent/data/inventory). */
+    @Query(
+        "SELECT runId AS run_id, experimentId AS experiment_id, conditionId AS condition_id," +
+            " COUNT(*) AS sample_count, MIN(utcEpochMs) AS first_utc_ms, MAX(utcEpochMs) AS last_utc_ms" +
+            " FROM phone_samples WHERE runId IS NOT NULL AND runId != ''" +
+            " GROUP BY runId ORDER BY MIN(utcEpochMs) ASC"
+    )
+    suspend fun runSummaries(): List<RunSummary>
 }
+
+/** Aggregate row returned by [SampleDao.runSummaries]. */
+data class RunSummary(
+    val run_id: String,
+    val experiment_id: String?,
+    val condition_id: String?,
+    val sample_count: Int,
+    val first_utc_ms: Long?,
+    val last_utc_ms: Long?
+)
 
 @Dao
 interface MarkerDao {

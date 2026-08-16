@@ -766,7 +766,7 @@ export default function Experiments({ nav }: { nav: (p: string) => void }) {
                   {runs.map((r) => (
                     <div key={r.run_id} className="card" style={{ padding: 12 }}>
                       <div className="row between">
-                        <button className="btn sm mono" onClick={() => nav(`/run/${encodeURIComponent(r.run_id)}`)}>{r.run_id}</button>
+                        <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{r.run_id}</span>
                         <button className="btn sm danger" onClick={() => deleteRun(r.run_id)}>Delete</button>
                       </div>
                       <div className="row gap-sm" style={{ marginTop: 8 }}>

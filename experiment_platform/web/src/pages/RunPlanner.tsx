@@ -422,7 +422,6 @@ export default function RunPlanner({ nav, initialExperimentId }: { nav: (p: stri
           <div className="row gap-sm" style={{ marginTop: 12 }}>
             <Badge tone="accent">run {run.run_id}</Badge>
             <Badge tone="muted">state {run.state}</Badge>
-            <button className="btn" onClick={() => nav(`/run/${encodeURIComponent(run.run_id)}`)}>open Run Detail →</button>
           </div>
         )}
       </Card>

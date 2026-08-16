@@ -12,15 +12,36 @@ from typing import Optional
 from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
-from .phone_channel import PhoneAgent, PhoneChannel
+from .phone_channel import PhoneAgent
 
-# Default phase plan handed to the phone at sync-confirm when no explicit plan
-# is supplied (mirrors manager.PLAN_PHASES_DEFAULT).
+# Default phase plan handed to the phone at sync-confirm.
+# Flow: idle(idle_seconds) → loaded(collection_seconds) → idle(continuous until
+# user stops). The first idle window lets the phone stabilise before the
+# loaded test; loaded is the high-occupancy measurement window; after loaded
+# the phone returns to idle and keeps recording until the user presses stop
+# on either side. A phase with durationSeconds == 0 runs forever (the phone
+# RunEngine treats 0-duration as "continuous until stop").
+DEFAULT_IDLE_SECONDS = 15.0
+DEFAULT_COLLECTION_SECONDS = 120.0
 DEFAULT_PHASES = [
-    {"name": "baseline", "durationSeconds": 30},
-    {"name": "active", "durationSeconds": 120},
-    {"name": "tail", "durationSeconds": 60},
+    {"name": "idle",     "durationSeconds": DEFAULT_IDLE_SECONDS},
+    {"name": "loaded",   "durationSeconds": DEFAULT_COLLECTION_SECONDS},
+    {"name": "idle",     "durationSeconds": 0.0},
 ]
+
+
+class TemplateSwitchNotAllowed(ValueError):
+    """Template switch rejected: the active run is not in an IDLE phase."""
+
+
+def build_phases(idle_seconds: float = DEFAULT_IDLE_SECONDS,
+                 collection_seconds: float = DEFAULT_COLLECTION_SECONDS) -> list[dict]:
+    """Compose the idle→loaded→idle plan for the phone."""
+    return [
+        {"name": "idle",   "durationSeconds": float(idle_seconds)},
+        {"name": "loaded", "durationSeconds": float(collection_seconds)},
+        {"name": "idle",   "durationSeconds": 0.0},
+    ]
 
 
 class DownlinkLoop:
@@ -61,16 +82,17 @@ class DownlinkLoop:
         self._stop.set()
 
     def _resolve_agent(self):
-        """Return (PhoneAgent, cleanup_fn) for the current phone state, or (None, None)
-        when the phone is offline (the loop retries on the next tick)."""
-        from .phone_detect import detect_phone
+        """Return (PhoneAgent, None) when a 5G PDU IP is known, else (None, None).
+
+        Live communication ONLY goes over the 5G air interface — during
+        experiments the USB cable is unplugged by design. There is no USB
+        fallback: USB is used exclusively for post-experiment data
+        collection. When the PDU IP is unknown the loop keeps waiting."""
+        from .phone_detect import AGENT_PORT, detect_phone
         ph = detect_phone(self.settings, self.serial)
-        if ph["state"] == "CONNECTED" and ph.get("agent_url"):
-            return PhoneAgent(base_url=ph["agent_url"]), None
-        if ph["state"] == "ATTACHED":
-            ch = PhoneChannel(self.serial, self.pc_port)
-            ch.connect()
-            return ch.agent, ch.disconnect
+        pdu = ph.get("pdu_ip")
+        if pdu:
+            return PhoneAgent(base_url=f"http://{pdu}:{AGENT_PORT}"), None
         return None, None
 
     def _gnb_timestamp_ms(self) -> int:
@@ -179,20 +201,17 @@ class TaskFlow:
     # ---- phone connection (detected before every phone operation) ---------- #
     @contextmanager
     def _phone(self, serial: str, pc_port: int = 8420):
-        """Yield (PhoneAgent, detection). Raise if the phone is unreachable."""
-        from .phone_detect import detect_phone
+        """Yield (PhoneAgent, detection). Raise if the phone is unreachable.
+
+        5G air interface ONLY — during experiments USB is unplugged by design;
+        USB is used exclusively for post-experiment data collection."""
+        from .phone_detect import AGENT_PORT, detect_phone
         ph = detect_phone(self.s, serial)
-        if ph["state"] == "CONNECTED" and ph.get("agent_url"):
-            yield PhoneAgent(base_url=ph["agent_url"]), ph
-        elif ph["state"] == "ATTACHED":
-            ch = PhoneChannel(serial, pc_port)
-            ch.connect()
-            try:
-                yield ch.agent, ph
-            finally:
-                ch.disconnect()
+        pdu = ph.get("pdu_ip")
+        if pdu:
+            yield PhoneAgent(base_url=f"http://{pdu}:{AGENT_PORT}"), ph
         else:
-            raise RuntimeError("phone OFFLINE: neither USB-attached nor 5G-reachable")
+            raise RuntimeError("phone unreachable: no 5G PDU link (USB is not used during experiments)")
 
     # ---- OAI templates ----------------------------------------------------- #
     def list_templates(self, experiment_id: str) -> list[dict]:
@@ -208,41 +227,128 @@ class TaskFlow:
     def delete_template(self, experiment_id: str, template_id: int) -> None:
         self.db.execute("DELETE FROM oai_templates WHERE id=? AND experiment_id=?", (template_id, experiment_id))
 
-    def apply_template(self, experiment_id: str, template_id: int) -> dict:
+    def apply_template(self, experiment_id: str, template_id: int,
+                       serial: str = "53616213", pc_port: int = 8420) -> dict:
         row = self.db.query_one("SELECT * FROM oai_templates WHERE id=? AND experiment_id=?", (template_id, experiment_id))
         if not row:
             raise ValueError("template not found")
         cfg = json.loads(row["config_json"])
+
+        # Template switching is only allowed while the experiment is IDLE:
+        # either no run in flight, or the active run currently sits in an
+        # IDLE phase (head or tail). Switching mid-LOADED would corrupt the
+        # measurement window, and switching during PREPARING would fight the
+        # start flow's own gNB restart. The phase is read over the 5G PDU
+        # link only — USB is never used while an experiment is running.
+        run = self.db.query_one(
+            "SELECT run_id, state FROM runs WHERE experiment_id=? "
+            "AND state IN ('PREPARING','ARMED','RUNNING') ORDER BY rowid DESC LIMIT 1",
+            (experiment_id,))
+        if run:
+            try:
+                with self._phone(serial, pc_port) as (agent, ph):
+                    # NOTE: _phone() yields a (PhoneAgent, detection) tuple —
+                    # the detection dict already carries the phone's
+                    # /agent/status payload harvested during PDU probing.
+                    phase = ((ph.get("status") or {}).get("phase"))
+            except Exception as e:
+                raise TemplateSwitchNotAllowed(
+                    f"cannot confirm idle phase: phone unreachable over 5G PDU ({e})")
+            if phase != "IDLE":
+                raise TemplateSwitchNotAllowed(
+                    f"template switch allowed only in idle phase (current: {phase or 'unknown'})")
+
         result = self.oai.apply_condition(cfg)
-        return {"config": cfg, "result": result}
+
+        # The gNB restarted with new RF conditions — re-trigger the phone's
+        # phase machine (idle → loaded → idle) over the 5G PDU link.
+        rearm: dict = {"attempted": False}
+        if run:
+            rearm["attempted"] = True
+            try:
+                with self._phone(serial, pc_port) as (agent, ph):
+                    rearm.update(agent.rearm())
+            except Exception as e:
+                rearm["error"] = str(e)
+        return {"config": cfg, "result": result, "rearm": rearm}
 
     # ---- start / stop ------------------------------------------------------ #
     def start_experiment(self, experiment_id: str, serial: str, pc_port: int = 8420,
-                         run_id: Optional[str] = None, plan: Optional[dict] = None) -> dict:
+                         collection_seconds: Optional[float] = None,
+                         idle_seconds: Optional[float] = None,
+                         template_id: Optional[int] = None) -> dict:
         exp = self.db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (experiment_id,))
         if not exp:
             raise ValueError("experiment not found")
-        initial = json.loads(exp["initial_oai_config"]) if exp.get("initial_oai_config") else {}
 
-        # Build the run plan handed to the phone at sync-confirm. When the caller
-        # supplies a run_id (the frontend does), reuse its condition/delay; the
-        # phone receives this plan and arms itself after the handshake.
-        if plan is None:
-            run = self.db.get_run(run_id) if run_id else None
-            plan = {
-                "experimentId": experiment_id,
-                "runId": run_id or f"{experiment_id}_auto_{int(time.time() * 1000)}",
-                "conditionId": run["condition_id"] if run else f"{experiment_id}_default",
+        # Initial OAI config resolution: the selected Template (there is no
+        # separate "initial config" concept — the startup config IS one of the
+        # experiment's templates) > the experiment's stored initial_oai_config.
+        initial = None
+        if template_id is not None:
+            row = self.db.query_one(
+                "SELECT config_json FROM oai_templates WHERE id=? AND experiment_id=?",
+                (template_id, experiment_id))
+            if row and row["config_json"]:
+                initial = json.loads(row["config_json"])
+        if initial is None:
+            initial = json.loads(exp["initial_oai_config"]) if exp.get("initial_oai_config") else {}
+
+        # Resolve idle/collection timings (explicit param > global default).
+        idle_s = float(idle_seconds) if idle_seconds is not None else DEFAULT_IDLE_SECONDS
+        collection_s = (float(collection_seconds)
+                        if collection_seconds is not None else DEFAULT_COLLECTION_SECONDS)
+
+        # A FRESH run_id for every start — never reuse a previous run. The id
+        # travels to the phone inside the sync-confirm plan; the phone persists
+        # it (RunEntity) so later data exchange can match on it.
+        run_id = f"{experiment_id}_r{int(time.time() * 1000)}"
+        condition_id = f"{experiment_id}_default"
+        plan = {
+            "experimentId": experiment_id,
+            "runId": run_id,
+            "conditionId": condition_id,
+            "environment": exp["environment"],
+            "plannedStartUtc": "",  # phone uses elapsedRealtime countdown, not wall clock
+            "startDelaySeconds": 0.0,
+            "idleSeconds": idle_s,
+            "collectionSeconds": collection_s,
+            "phases": build_phases(idle_s, collection_s),
+        }
+
+        # Stop any leftover downlink loop for this experiment before starting
+        # a new one (repeated starts must not leak probes fighting each other).
+        old_loop = self.downlinks.pop(experiment_id, None)
+        if old_loop:
+            old_loop.stop()
+
+        # Create/activate the run so the dashboard's latest_run reflects the
+        # current experiment (not a stale STOPPED row from a previous run).
+        # runs.condition_id has an FK to conditions — make sure the row exists
+        # (auto experiments may reference a synthesized "<exp>_default" id).
+        if not self.db.query_one("SELECT 1 FROM conditions WHERE condition_id=?", (condition_id,)):
+            self.db.upsert_condition({
+                "condition_id": condition_id,
+                "experiment_id": experiment_id,
                 "environment": exp["environment"],
-                "plannedStartUtc": "",  # phone uses elapsedRealtime countdown, not wall clock
-                "startDelaySeconds": float(run.get("start_delay_s") or 30.0) if run else 30.0,
-                "phases": DEFAULT_PHASES,
-            }
+            })
+        self.db.upsert_run({
+            "run_id": run_id, "experiment_id": experiment_id,
+            "condition_id": condition_id,
+            "device_id": serial, "session_id": None, "state": "PREPARING",
+            "planned_order": None, "random_seed": None,
+            "start_delay_s": 0.0,
+        })
+        self.db.transition(run_id, "PREPARING", "start_experiment: gNB starting + downlink loop")
 
-        # 1. Ensure the gNB is started (agreed flow: Start Experiment auto-starts gNB)
-        gnb_ready = self.oai.ensure_gnb_running()
+        # 1. Ensure the gNB process is running (do NOT block waiting for the
+        #    UE here — after the restart below the UE re-selects the cell and
+        #    completes the air-interface handshake on its own).
+        gnb_ready = self.oai.ensure_gnb_running(wait_ue=False)
 
-        # 2. Apply the initial OAI config (may restart again if params differ)
+        # 2. Apply the selected template's config unconditionally — the
+        #    experiment must run under the chosen RF conditions, so a running
+        #    gNB is restarted with the template values.
         result = self.oai.apply_condition(initial) if initial else {"no_config": True}
 
         # 3. Verify gNB + UE in-sync
@@ -261,20 +367,56 @@ class TaskFlow:
         self.downlinks[experiment_id] = loop
         return {"ok": ready and in_sync, "gnb_started": gnb_ready, "gnb_running": ready,
                 "ue_in_sync": in_sync, "config_applied": initial, "downlink_started": True,
-                "sync_pending": True, "run_id": plan.get("runId")}
+                "sync_pending": True, "run_id": run_id}
 
-    def stop_experiment(self, experiment_id: str) -> dict:
+    def stop_experiment(self, experiment_id: str, serial: str = "53616213",
+                        pc_port: int = 8420) -> dict:
+        """Complete stop: downlink loop + phone stop_task + gNB stop + run transition.
+
+        Mirrors the /api/runs/{run_id}/stop flow so both stop entry points
+        (by experiment_id and by run_id) do the full teardown — the phone
+        receives the stop command (records its stop timestamp) and the gNB
+        is shut down, not just the downlink loop.
+        """
         loop = self.downlinks.pop(experiment_id, None)
         run_id = loop.run_id if loop else None
         if loop:
             loop.stop()
+        if run_id is None:
+            # Loop lost (e.g. backend restarted mid-run): fall back to the
+            # experiment's active run row so the run still gets marked STOPPED
+            # and the dashboard switches back to the start button.
+            row = self.db.query_one(
+                "SELECT run_id FROM runs WHERE experiment_id=? "
+                "AND state IN ('PREPARING','ARMED','RUNNING') ORDER BY rowid DESC LIMIT 1",
+                (experiment_id,))
+            run_id = row["run_id"] if row else None
         stop_ms = int(time.time() * 1000)
+
+        # 1. PC stop ACK row
         self.db.execute(
             "INSERT INTO experiment_acks(experiment_id,run_id,seq,direction,pc_send_ms,phone_recv_ms,phone_send_ms,pc_recv_ms,rtt_ms) VALUES(?,?,?,?,?,?,?,?,?)",
             (experiment_id, run_id, -1, "pc_stop", stop_ms, None, None, None, None))
+
+        # 2. Tell the phone to stop (records the phone-side stop timestamp)
+        phone_stop_ms = None
+        try:
+            with self._phone(serial, pc_port) as (agent, _ph):
+                pr = agent.stop_task()
+                phone_stop_ms = pr.get("stopUtcMs")
+        except Exception:
+            pass  # phone already offline / unplugged — PC stop still recorded
+
+        # 3. Stop the gNB
+        try:
+            self.oai.gnb_service("stop")
+        except Exception:
+            pass
+
+        # 4. Mark the run STOPPED
         if run_id:
             self.db.transition(run_id, "STOPPED", "stopped by user", utc_ms=stop_ms)
-        return {"ok": True, "pc_stop_ms": stop_ms, "run_id": run_id}
+        return {"ok": True, "pc_stop_ms": stop_ms, "phone_stop_ms": phone_stop_ms, "run_id": run_id}
 
     # ---- push / phone inventory ------------------------------------------- #
     def push_task(self, experiment_id: str, serial: str, pc_port: int = 8420) -> dict:

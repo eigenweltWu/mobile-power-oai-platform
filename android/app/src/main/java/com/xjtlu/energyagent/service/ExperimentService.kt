@@ -69,6 +69,7 @@ class ExperimentService : Service() {
                 val eid = intent?.getStringExtra(EXTRA_EXPERIMENT_ID)
                 if (eid != null) AgentState.monitoringExperimentId = eid
                 ensureRunning()
+                recordUsbStateAtMonitoring()
             }
             ACTION_ARM -> {
                 val planJson = intent.getStringExtra(EXTRA_PLAN_JSON)
@@ -78,6 +79,7 @@ class ExperimentService : Service() {
                 }
             }
             ACTION_SYNC_CONFIRM -> handleSyncConfirm(intent)
+            ACTION_REARM -> handleRearm()
             ACTION_STOP -> stopExperiment()
         }
         return START_STICKY
@@ -93,31 +95,60 @@ class ExperimentService : Service() {
     }
 
     private fun arm(plan: ExperimentPlan) {
-        Log.i(TAG, "arm() runId=" + plan.runId)
+        // Apply the phone-local "空载时间" override so the operator always
+        // gets their chosen stabilisation window regardless of what the PC
+        // plan originally contained.
+        val effective = applyLocalIdleOverride(plan)
+        Log.i(TAG, "arm() runId=" + effective.runId +
+            " idleSec=" + effective.idleSeconds +
+            " collectionSec=" + effective.collectionSeconds)
         ensureRunning()
-        AgentState.currentPlan = plan
+        AgentState.currentPlan = effective
         scope.launch {
             try {
                 db.meta().upsertExperiment(
                     com.xjtlu.energyagent.db.ExperimentEntity(
-                        plan.experimentId, plan.environment, null, null, System.currentTimeMillis()
+                        effective.experimentId, effective.environment, null, null, System.currentTimeMillis()
                     )
                 )
                 db.meta().upsertRun(
                     com.xjtlu.energyagent.db.RunEntity(
-                        plan.runId, plan.experimentId, plan.conditionId, null, null,
-                        "ARMED", null, plan.startDelaySeconds, null, null
+                        effective.runId, effective.experimentId, effective.conditionId, null, null,
+                        "ARMED", null, effective.startDelaySeconds, null, null
                     )
                 )
-                AgentState.runEngine.arm(plan, SystemClock.elapsedRealtimeNanos()) { marker ->
-                    recordMarker(plan, marker)
+                AgentState.runEngine.arm(effective, SystemClock.elapsedRealtimeNanos()) { marker ->
+                    recordMarker(effective, marker)
                 }
                 acquireWakeLock()
-                Log.i(TAG, "arm() engine ARMED")
+                Log.i(TAG, "arm() engine ARMED phases=" + effective.phases.joinToString { "${it.name}(${it.durationSeconds}s)" })
             } catch (e: Exception) {
                 Log.e(TAG, "arm() error", e)
             }
         }
+    }
+
+    /**
+     * Re-trigger the phase machine on the SAME run (idle → loaded → idle) —
+     * the PC sends this after a template switch restarted the gNB with new
+     * RF conditions. Sampling never stops; markers record the re-trigger.
+     */
+    private fun handleRearm() {
+        val plan = AgentState.currentPlan
+        val st = AgentState.runEngine.state
+        if (plan == null || (st != com.xjtlu.energyagent.run.RunEngine.State.ARMED
+                        && st != com.xjtlu.energyagent.run.RunEngine.State.RUNNING)) {
+            Log.i(TAG, "handleRearm ignored (state=$st plan=${plan?.runId})")
+            return
+        }
+        Log.i(TAG, "handleRearm: re-arming runId=" + plan.runId)
+        // Stop any in-flight workload — the fresh IDLE phase must be quiet.
+        workload?.stop()
+        recordMarker(plan, "REARM", JSONObject().apply {
+            put("phaseBefore", AgentState.runEngine.currentPhase ?: "null")
+            put("utcMs", System.currentTimeMillis())
+        }.toString())
+        arm(plan)
     }
 
     private fun startSamplingIfNeeded() {
@@ -153,13 +184,15 @@ class ExperimentService : Service() {
 
         val phase = AgentState.runEngine.update(elapsedNs) { marker -> recordMarker(plan, marker) }
 
-        // workload control: start on ACTIVE, stop otherwise (for UL modes in the plan)
+        // workload control: start high-traffic uplink when we enter the LOADED
+        // phase, stop whenever we leave it (idle before / idle tail after /
+        // abort). Matches the platform plan: idle → loaded → idle.
         val wl = workload
         if (wl != null && AgentState.runEngine.state == com.xjtlu.energyagent.run.RunEngine.State.RUNNING) {
-            if (phase == "ACTIVE" && wl.mode == WorkloadEngine.Mode.IDLE) {
-                // start UL_CBR if the condition indicates traffic; server address is configurable
+            val p = (phase ?: "").uppercase()
+            if (p == "LOADED" && wl.mode == WorkloadEngine.Mode.IDLE) {
                 startWorkloadIfNeeded()
-            } else if (phase != "ACTIVE" && wl.mode != WorkloadEngine.Mode.IDLE) {
+            } else if (p != "LOADED" && wl.mode != WorkloadEngine.Mode.IDLE) {
                 wl.stop()
             }
         }
@@ -357,14 +390,78 @@ class ExperimentService : Service() {
     }
 
     private fun startWorkloadIfNeeded() {
-        // Server address is provided by the plan/session (default: OAI external DN host).
-        // The app never knows gNB internals; the server is just an external-DN sink.
-        workload?.start(WorkloadEngine.Mode.UL_CBR, 5.0, "192.168.70.129", 5201)
+        // Server address comes from the phone's Settings dialog (Settings → 测试站),
+        // defaulting to the OAI external-DN sink. Verify reachability there with
+        // the "测试连通" button before running a loaded phase.
+        val prefs = getSharedPreferences("agent_settings", Context.MODE_PRIVATE)
+        val host = prefs.getString("server_host", "192.168.70.129") ?: "192.168.70.129"
+        val port = prefs.getInt("server_port", 5201)
+        val mbps = prefs.getFloat("target_mbps", 5.0f).toDouble()
+        Log.i(TAG, "startWorkload UL_CBR ${mbps}Mbps -> $host:$port")
+        workload?.start(WorkloadEngine.Mode.UL_CBR, mbps, host, port)
     }
 
     private fun noSignalSeconds(): Long {
         val prefs = getSharedPreferences("agent_settings", Context.MODE_PRIVATE)
         return prefs.getLong("no_signal_seconds", 60L)
+    }
+
+    /** Record the USB connection state when monitoring starts (before the sync
+     *  handshake). Experiments communicate over the 5G air interface only; a
+     *  cable still attached at this point is an anomaly worth keeping in the
+     *  data trail (the UI also asks the user to confirm before monitoring). */
+    private fun recordUsbStateAtMonitoring() {
+        val connected = try {
+            val state = java.io.File("/sys/class/android_usb/android0/state").readText().trim()
+            state == "CONFIGURED" || state == "CONNECTED"
+        } catch (e: Exception) { false }
+        recordMarker(
+            null,
+            if (connected) "USB_CONNECTED_AT_MONITORING" else "MONITORING_STARTED",
+            org.json.JSONObject().put("usbConnected", connected).toString()
+        )
+        if (connected) {
+            Log.w(TAG, "USB still connected when monitoring started — user should unplug it")
+        }
+    }
+
+    /** Local "空载时间" override (seconds). The user can set this on the task
+     *  detail screen; it overrides whatever the PC plan shipped with so the
+     *  phone always observes the operator's chosen stabilisation window before
+     *  the loaded test begins. Default 15 s. */
+    private fun idleSecondsOverride(): Double {
+        val prefs = getSharedPreferences("agent_settings", Context.MODE_PRIVATE)
+        val raw = prefs.getLong("idle_seconds", -1L)
+        return if (raw < 0) 15.0 else raw.toDouble()
+    }
+
+    /**
+     * Apply the phone-local idle-seconds override to the PC-supplied plan.
+     * The first idle phase gets the overridden duration and the top-level
+     * idleSeconds field is aligned. All other phases and fields are preserved.
+     */
+    private fun applyLocalIdleOverride(plan: ExperimentPlan): ExperimentPlan {
+        val localIdle = idleSecondsOverride()
+        val phases = plan.phases.toMutableList()
+        if (phases.isEmpty()) {
+            phases += com.xjtlu.energyagent.run.Phase("idle", localIdle)
+            phases += com.xjtlu.energyagent.run.Phase("loaded", plan.collectionSeconds)
+            phases += com.xjtlu.energyagent.run.Phase("idle", 0.0)
+        } else {
+            var replacedFirstIdle = false
+            for (i in phases.indices) {
+                val p = phases[i]
+                if (!replacedFirstIdle && p.name.equals("idle", ignoreCase = true)) {
+                    phases[i] = p.copy(durationSeconds = localIdle)
+                    replacedFirstIdle = true
+                    break
+                }
+            }
+            if (!replacedFirstIdle) {
+                phases.add(0, com.xjtlu.energyagent.run.Phase("idle", localIdle))
+            }
+        }
+        return plan.copy(idleSeconds = localIdle, phases = phases)
     }
 
     private fun monitorSignal(nr: Map<String, Any?>, nowNs: Long) {
@@ -466,6 +563,7 @@ class ExperimentService : Service() {
         const val ACTION_START_SERVICE = "com.xjtlu.energyagent.START"
         const val ACTION_ARM = "com.xjtlu.energyagent.ARM"
         const val ACTION_SYNC_CONFIRM = "com.xjtlu.energyagent.SYNC_CONFIRM"
+        const val ACTION_REARM = "com.xjtlu.energyagent.REARM"
         const val ACTION_STOP = "com.xjtlu.energyagent.STOP"
         const val EXTRA_PLAN_JSON = "plan_json"
         const val EXTRA_EXPERIMENT_ID = "experiment_id"

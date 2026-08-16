@@ -128,6 +128,32 @@ class WorkloadEngine(private val context: Context) {
         return rate
     }
 
+    /**
+     * Manual reachability probe for the configured test server (Settings → 测试站).
+     * The UDP sender gets no feedback, so a TCP connect is the practical check:
+     * success means a listener is up and the 5G data path to it works.
+     * Returns null on success, or an error description.
+     */
+    fun probeServer(host: String, port: Int, timeoutMs: Int = 3000): String? {
+        return try {
+            val socket = java.net.Socket()
+            val network = findCellularNetwork()
+            if (network != null) {
+                network.bindSocket(socket)
+            }
+            val t0 = System.currentTimeMillis()
+            socket.connect(java.net.InetSocketAddress(host, port), timeoutMs)
+            val rtt = System.currentTimeMillis() - t0
+            socket.close()
+            null.also { lastProbeRttMs = rtt }
+        } catch (e: Exception) {
+            e.message ?: e.javaClass.simpleName
+        }
+    }
+
+    @Volatile var lastProbeRttMs: Long = -1
+        private set
+
     private fun findCellularNetwork(): Network? {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         for (n in cm.allNetworks) {

@@ -208,10 +208,14 @@ class OaiClient:
 
         return results
 
-    def ensure_gnb_running(self, timeout_s: float = 300.0) -> bool:
-        """Start the gNB if it is stopped, then wait until gNB running + UE in-sync
-        (research collection fresh). Single shared implementation for every
-        start/run path."""
+    def ensure_gnb_running(self, timeout_s: float = 300.0, wait_ue: bool = True) -> bool:
+        """Start the gNB if it is stopped, then (optionally) wait until gNB
+        running + UE in-sync (research collection fresh).
+
+        ``wait_ue=False`` returns as soon as the gNB process is running — use
+        this on the experiment-start path: the air-interface handshake flow
+        brings the UE in on its own, and blocking start for minutes when the
+        UE has not (re)attached yet makes the platform look hung."""
         st = self.status()
         if not (st.gnb and st.gnb.running):
             try:
@@ -225,6 +229,9 @@ class OaiClient:
                 # POST may block/time out during gNB start; the action is already
                 # initiated on the OAI host — fall through to polling.
                 pass
+        st = self.status()
+        if not wait_ue:
+            return bool(st.gnb and st.gnb.running)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             st = self.status()

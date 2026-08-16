@@ -25,6 +25,16 @@
     <string name="task_complete_hint">实验已完成，可导出数据</string>
     <string name="task_busy_hint">另一个任务正在运行，请先停止</string>
     <string name="task_load_failed">任务加载失败</string>
+    <string name="settings_title">实验参数设置</string>
     <string name="settings_no_signal_title">无信号刷新阈值（秒）</string>
     <string name="settings_no_signal_msg">持续无信号多少秒后开启飞行模式刷新（默认 60）</string>
+    <string name="settings_idle_title">空载时间（秒）</string>
+    <string name="settings_idle_msg">进入满载测试前的稳定时长（默认 15）。可独立于 PC 下发的 plan 在手机上修改。</string>
+    <string name="settings_server_title">测试站（满载上行目标）</string>
+    <string name="settings_probe_btn">测试连通</string>
+    <string name="settings_server_msg">满载阶段向该地址发送 UDP 流量。请先测试连通，不通时 loaded 阶段不会有吞吐量。</string>
+    <string name="usb_attached_title">检测到 USB 已连接</string>
+    <string name="usb_attached_msg">实验进行时，与平台的通信（下行探测 / ACK / 对时）仅通过 5G 空口进行，USB 应处于拔出状态（USB 仅用于实验结束后的数据传输）。请拔掉 USB 后继续；如确要保持连接，请点击「继续」。</string>
+    <string name="usb_attached_continue">继续</string>
+    <string name="usb_attached_cancel">取消</string>
 </resources>

@@ -138,6 +138,11 @@ class PhoneAgent:
     def stop_task(self) -> dict:
         return self._post("/agent/task/stop", {})
 
+    def rearm(self) -> dict:
+        """Re-trigger the phase machine on the phone (idle → loaded → idle)
+        after a template switch restarted the gNB with new RF conditions."""
+        return self._post("/agent/rearm", {})
+
     def mark_collected(self, experiment_id: str, hostname: str) -> dict:
         return self._post("/agent/collected", {"experimentId": experiment_id, "hostname": hostname})
 

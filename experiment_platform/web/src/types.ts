@@ -80,7 +80,15 @@ export interface LatestRun {
 }
 
 export interface PlatformStatus {
-  phone: { state: string; device: string | null; usb_attached?: boolean; agent_url?: string | null };
+  phone: {
+    state: string;
+    device: string | null;
+    usb_attached?: boolean;
+    agent_url?: string | null;
+    serial?: string | null;
+    /** Full on-phone /agent/status payload (monitoring, experimentId, phase…). */
+    status?: Record<string, unknown> | null;
+  };
   oai: {
     healthy: boolean;
     gnb_running: boolean;
@@ -90,6 +98,8 @@ export interface PlatformStatus {
     frequency_mhz: number | null;
     bandwidth_mhz: number | null;
     research_stale: boolean | null;
+    /** Aggregated gNB goodput sample for the live throughput chart. */
+    throughput?: { epochMs: number | null; dlMbps: number; ulMbps: number; nUes: number } | null;
   };
   clock: { offset_ms: number | null; state: string; delay_ms?: number | null; rtt_min_ms?: number | null };
   experiment: { latest_run: LatestRun | null };

@@ -29,19 +29,34 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _compute_clock_status(db: Database) -> dict:
+def _compute_clock_status(db: Database, experiment_id: str | None = None) -> dict:
     """Derive the PC↔phone clock offset from recorded downlink ACKs.
 
     Maps recent downlink ACKs into NTP-style exchanges and reuses
     ``sync.compute_sync`` (which raises ValueError when there are no valid
     samples). Returns a ``not_synced`` stub when no ACKs exist yet, so the
     dashboard reflects the real handshake state instead of a hardcoded value.
-    """
+
+    When ``experiment_id`` is given only that experiment's ACKs count — stale
+    ACKs from previous experiments must NOT make a fresh run look synced
+    before the phone has even started monitoring."""
     from .sync import compute_sync
-    rows = db.query(
-        "SELECT pc_send_ms, phone_recv_ms, phone_send_ms, pc_recv_ms "
-        "FROM experiment_acks WHERE direction='downlink' AND pc_recv_ms IS NOT NULL "
-        "ORDER BY id DESC LIMIT 30")
+    if experiment_id:
+        rows = db.query(
+            "SELECT pc_send_ms, phone_recv_ms, phone_send_ms, pc_recv_ms "
+            "FROM experiment_acks WHERE direction='downlink' AND pc_recv_ms IS NOT NULL "
+            "AND experiment_id=? ORDER BY id DESC LIMIT 30", (experiment_id,))
+        delay_where = ("SELECT pc_send_ms, phone_recv_ms FROM experiment_acks "
+                       "WHERE direction='sync_confirm' AND experiment_id=? "
+                       "ORDER BY id DESC LIMIT 1", (experiment_id,))
+    else:
+        rows = db.query(
+            "SELECT pc_send_ms, phone_recv_ms, phone_send_ms, pc_recv_ms "
+            "FROM experiment_acks WHERE direction='downlink' AND pc_recv_ms IS NOT NULL "
+            "ORDER BY id DESC LIMIT 30")
+        delay_where = ("SELECT pc_send_ms, phone_recv_ms FROM experiment_acks "
+                       "WHERE direction='sync_confirm' "
+                       "ORDER BY id DESC LIMIT 1", ())
     exchanges = []
     for r in rows:
         if not (r["phone_recv_ms"] and r["phone_send_ms"]):
@@ -54,9 +69,7 @@ def _compute_clock_status(db: Database) -> dict:
     except ValueError:
         return {"offset_ms": None, "state": "not_synced", "delay_ms": None, "rtt_min_ms": None}
     # communication delay = phone_now - pc_ts, recorded at the last sync-confirm
-    delay_row = db.query_one(
-        "SELECT pc_send_ms, phone_recv_ms FROM experiment_acks WHERE direction='sync_confirm' "
-        "ORDER BY id DESC LIMIT 1")
+    delay_row = db.query_one(*delay_where)
     delay_ms = None
     if delay_row and delay_row["phone_recv_ms"] is not None and delay_row["pc_send_ms"] is not None:
         delay_ms = delay_row["phone_recv_ms"] - delay_row["pc_send_ms"]
@@ -88,13 +101,32 @@ def platform_status():
     except Exception as e:  # noqa: BLE001
         oai_ok = False
         status = None
+    ues = None
     try:
         ues = _oai.research_ues()
         coll = ues.collection
     except Exception:  # noqa: BLE001
         coll = None
-    runs = _db.query("SELECT run_id,state,experiment_id,condition_id FROM runs ORDER BY run_id DESC LIMIT 1")
-    latest_run = runs[0] if runs else None
+    # Rolling throughput sample for the dashboard's 1-minute live chart.
+    throughput = None
+    if ues and ues.ues:
+        try:
+            throughput = {
+                "epochMs": int((ues.timestampEpochNs or 0) / 1e6) or None,
+                "dlMbps": round(sum(u.downlink.goodputMbps or 0.0 for u in ues.ues if u.downlink), 3),
+                "ulMbps": round(sum(u.uplink.goodputMbps or 0.0 for u in ues.ues if u.uplink), 3),
+                "nUes": len(ues.ues),
+            }
+        except Exception:  # noqa: BLE001
+            throughput = None
+    # Active run first (state PREPARING/ARMED/RUNNING, newest rowid); fall back
+    # to the most recent run for post-stop display. NOTE: run_id is a string —
+    # ordering by it is unreliable, use rowid.
+    active = _db.query(
+        "SELECT run_id,state,experiment_id,condition_id FROM runs "
+        "WHERE state IN ('PREPARING','ARMED','RUNNING') ORDER BY rowid DESC LIMIT 1")
+    latest_run = (active or _db.query(
+        "SELECT run_id,state,experiment_id,condition_id FROM runs ORDER BY rowid DESC LIMIT 1") or [None])[0]
     if latest_run:
         err_rows = _db.query(
             "SELECT note FROM run_transitions WHERE run_id=? AND to_state='FAILED' ORDER BY utc_ms DESC LIMIT 1",
@@ -103,9 +135,15 @@ def platform_status():
     files = _db.query("SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes),0) AS bytes FROM files")
     from . import phone_detect as _pd
     phone = _pd.detect_phone(_settings)
+    # Clock state is only meaningful for the ACTIVE experiment; stale ACKs
+    # from earlier experiments must not make a fresh run look synced.
+    clock = (_compute_clock_status(_db, active[0]["experiment_id"]) if active
+             else {"offset_ms": None, "state": "not_synced", "delay_ms": None, "rtt_min_ms": None})
     return {
         "phone": {"state": phone["state"], "device": phone.get("pdu_ip"),
-                  "usb_attached": phone.get("usb_attached"), "agent_url": phone.get("agent_url")},
+                  "usb_attached": phone.get("usb_attached"), "agent_url": phone.get("agent_url"),
+                  "serial": phone.get("serial"),
+                  "status": phone.get("status")},
         "oai": {
             "healthy": oai_ok,
             "gnb_running": bool(status.gnb and status.gnb.running) if status else None,
@@ -116,8 +154,9 @@ def platform_status():
             "frequency_mhz": status.radio.frequencyMHz if status and status.radio else None,
             "bandwidth_mhz": status.radio.bandwidthMHz if status and status.radio else None,
             "research_stale": coll.stale if coll else None,
+            "throughput": throughput,
         },
-        "clock": _compute_clock_status(_db),
+        "clock": clock,
         "experiment": {"latest_run": latest_run},
         "storage": {"n_files": files[0]["n"] if files else 0, "bytes": files[0]["bytes"] if files else 0},
     }
@@ -473,21 +512,51 @@ def phone_tasks(serial: str = Query(...), pc_port: int = 8420):
     return _flow().phone_inventory(serial, pc_port)
 
 
+@app.post("/api/experiments/{experiment_id}/templates/{template_id}/apply")
+def apply_template(experiment_id: str, template_id: int, payload: dict = Body(default={})):
+    """Apply an OAI template (restarts the gNB with the template's config).
+
+    Thin HTTP wrapper around the existing ``task_flow.apply_template`` method —
+    no new business logic, just exposes what TaskFlow already does. Only
+    allowed while the active run is in an IDLE phase (409 otherwise).
+    """
+    try:
+        return _flow().apply_template(
+            experiment_id, template_id,
+            serial=payload.get("serial") or "53616213",
+            pc_port=int(payload.get("pc_port", 8420)),
+        )
+    except _tf.TemplateSwitchNotAllowed as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except OaiError as e:
+        raise HTTPException(502, f"OAI apply_condition failed: {e}")
+
+
 @app.post("/api/experiments/{experiment_id}/start")
 def start_experiment(experiment_id: str, payload: dict = Body(...)):
     try:
-        return _flow().start_experiment(experiment_id, payload.get("serial", ""),
-                                        int(payload.get("pc_port", 8420)),
-                                        run_id=payload.get("run_id"),
-                                        plan=payload.get("plan"))
+        return _flow().start_experiment(
+            experiment_id,
+            payload.get("serial", ""),
+            int(payload.get("pc_port", 8420)),
+            collection_seconds=payload.get("collection_seconds"),
+            idle_seconds=payload.get("idle_seconds"),
+            template_id=payload.get("template_id"),
+        )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
 
 
 @app.post("/api/experiments/{experiment_id}/stop")
-def stop_experiment(experiment_id: str):
+def stop_experiment(experiment_id: str, payload: dict = Body(default={})):
     try:
-        return _flow().stop_experiment(experiment_id)
+        return _flow().stop_experiment(
+            experiment_id,
+            payload.get("serial", "53616213"),
+            int(payload.get("pc_port", 8420)),
+        )
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
 

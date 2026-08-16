@@ -1,10 +1,6 @@
 import { useEffect, useState } from 'react';
 import Dashboard from './pages/Dashboard';
 import Experiments from './pages/Experiments';
-import RunDetail from './pages/RunDetail';
-import Comparison from './pages/Comparison';
-import Matrix from './pages/Matrix';
-import Data from './pages/Data';
 import Timeline from './pages/Timeline';
 import Settings from './pages/Settings';
 import { Icon, ToastHost } from './components/ui';
@@ -12,20 +8,12 @@ import { Icon, ToastHost } from './components/ui';
 const NAV: { path: string; label: string; icon: string }[] = [
   { path: '/dashboard', label: 'Dashboard', icon: 'grid' },
   { path: '/experiments', label: 'Experiments', icon: 'flask' },
-  { path: '/run', label: 'Run Detail', icon: 'play' },
-  { path: '/comparison', label: 'AC/RC Compare', icon: 'compare' },
-  { path: '/matrix', label: 'Matrix', icon: 'matrix' },
-  { path: '/data', label: 'Data', icon: 'data' },
   { path: '/settings', label: 'Settings', icon: 'settings' },
 ];
 
 const TITLES: Record<string, string> = {
   dashboard: 'Dashboard',
   experiments: 'Experiments',
-  run: 'Run Detail',
-  comparison: 'AC/RC Compare',
-  matrix: 'Experiment Matrix',
-  data: 'Data Browser',
   timeline: 'Timeline',
   settings: 'Settings',
 };
@@ -49,11 +37,9 @@ export default function App() {
   const params = new URLSearchParams(queryPart || '');
   const segments = pathPart.replace(/^\/+/, '').split('/').filter(Boolean);
   const section = segments[0] || 'dashboard';
-  const runId = segments[1] ? decodeURIComponent(segments[1]) : undefined;
   const initialExperimentId = params.get('exp') ?? undefined;
 
-  const isActive = (path: string) =>
-    path === '/run' ? section === 'run' : section === path.slice(1);
+  const isActive = (path: string) => section === path.slice(1);
 
   let page: React.ReactNode;
   switch (section) {
@@ -63,25 +49,18 @@ export default function App() {
     case 'experiments':
       page = <Experiments nav={nav} />;
       break;
-    case 'run':
-      page = <RunDetail runId={runId} nav={nav} />;
-      break;
-    case 'comparison':
-      page = <Comparison nav={nav} />;
-      break;
-    case 'matrix':
-      page = <Matrix nav={nav} />;
-      break;
-    case 'data':
-      page = <Data nav={nav} />;
-      break;
     case 'timeline':
       page = <Timeline experimentId={decodeURIComponent(segments[1] || '')} />;
       break;
     case 'settings':
       page = <Settings />;
       break;
-    // Run Planner and Export now live inside the Experiments hub.
+    // Removed pages (to be rebuilt later): Run Detail, AC/RC Compare,
+    // Matrix, Data. Also Run Planner / Export live inside the Experiments hub.
+    case 'run':
+    case 'comparison':
+    case 'matrix':
+    case 'data':
     case 'planner':
     case 'export':
       page = <Experiments nav={nav} />;

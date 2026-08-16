@@ -25,6 +25,7 @@ import com.xjtlu.energyagent.db.AppDatabase
 import com.xjtlu.energyagent.export.CsvExporter
 import com.xjtlu.energyagent.run.ExperimentPlan
 import com.xjtlu.energyagent.run.RunEngine
+import com.xjtlu.energyagent.run.WorkloadEngine
 import com.xjtlu.energyagent.service.ExperimentService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -184,6 +185,26 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.task_load_failed, Toast.LENGTH_SHORT).show()
             return
         }
+        // USB must be unplugged during experiments — live traffic (downlink
+        // probing, ACK, sync-confirm) goes over the 5G air interface only, and
+        // USB is reserved for post-experiment data collection. If the cable is
+        // still attached at monitoring start (i.e. BEFORE the sync handshake),
+        // ask the user to confirm.
+        if (isUsbConnected()) {
+            AlertDialog.Builder(this)
+                .setTitle(R.string.usb_attached_title)
+                .setMessage(R.string.usb_attached_msg)
+                .setPositiveButton(R.string.usb_attached_continue) { _, _ -> enterMonitoring() }
+                .setNegativeButton(R.string.usb_attached_cancel, null)
+                .show()
+            return
+        }
+        enterMonitoring()
+    }
+
+    /** Enter environment-monitoring mode (phase machine stays IDLE until the
+     *  PC sync-confirm auto-arms the run). */
+    private fun enterMonitoring() {
         // Environment monitoring only: sampling runs, but the phase machine stays
         // IDLE until the PC completes the sync handshake and auto-arms the run.
         startForegroundService(
@@ -193,6 +214,17 @@ class MainActivity : AppCompatActivity() {
         )
         AgentState.clearDisplay()
         refresh()
+    }
+
+    /** True when the phone is physically connected to a host over USB.
+     *  Read from the kernel USB gadget state (no permission needed). */
+    private fun isUsbConnected(): Boolean {
+        return try {
+            val state = java.io.File("/sys/class/android_usb/android0/state").readText().trim()
+            state == "CONFIGURED" || state == "CONNECTED"
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun onStopTask() {
@@ -338,26 +370,140 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** Edit the no-signal refresh threshold (seconds) persisted for the service. */
+    /** Edit the no-signal refresh threshold (seconds) and the idle window
+     *  (空载时间, seconds before the loaded test begins). Both persist to the
+     *  same SharedPreferences bucket and are read by ExperimentService when
+     *  the next run arms. */
     private fun showNoSignalSettings() {
         val prefs = getSharedPreferences("agent_settings", Context.MODE_PRIVATE)
-        val current = prefs.getLong("no_signal_seconds", 60L)
-        val input = EditText(this).apply {
+        val currentNoSignal = prefs.getLong("no_signal_seconds", 60L)
+        val currentIdle = prefs.getLong("idle_seconds", 15L)
+        val currentHost = prefs.getString("server_host", "192.168.70.129") ?: "192.168.70.129"
+        val currentPort = prefs.getInt("server_port", 5201)
+        val currentMbps = prefs.getFloat("target_mbps", 5.0f)
+
+        val noSignalInput = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
-            setText(current.toString())
+            setText(currentNoSignal.toString())
             hint = "60"
         }
+        val idleInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(currentIdle.toString())
+            hint = "15"
+        }
+        val hostInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(currentHost)
+            hint = "192.168.70.129"
+        }
+        val portInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(currentPort.toString())
+            hint = "5201"
+        }
+        val mbpsInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(currentMbps.toString())
+            hint = "5.0"
+        }
+        val probeResult = TextView(this).apply {
+            text = getString(R.string.settings_server_msg)
+            setTextColor(android.graphics.Color.parseColor("#666666"))
+            textSize = 12f
+            setPadding(0, 8, 0, 0)
+        }
+        val probeBtn = android.widget.Button(this).apply {
+            text = getString(R.string.settings_probe_btn)
+            setOnClickListener {
+                val h = hostInput.text.toString().trim()
+                val p = portInput.text.toString().trim().toIntOrNull() ?: 5201
+                if (h.isEmpty()) {
+                    probeResult.text = "请输入服务器地址"
+                    return@setOnClickListener
+                }
+                probeResult.text = "测试中 $h:$p …"
+                lifecycleScope.launch {
+                    val err = withContext(Dispatchers.IO) {
+                        WorkloadEngine(this@MainActivity).probeServer(h, p)
+                    }
+                    probeResult.text = if (err == null) {
+                        "连通 ✓（TCP 握手成功，可承载满载上行）"
+                    } else {
+                        "不通 ✗：$err（检查服务器监听 / 5G 数据链路）"
+                    }
+                }
+            }
+        }
+        val container = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(64, 24, 64, 0)
+        }
+        container.addView(TextView(this).apply {
+            text = getString(R.string.settings_no_signal_title)
+            setTextColor(android.graphics.Color.parseColor("#111111"))
+            textSize = 14f
+            setPadding(0, 0, 0, 6)
+        })
+        container.addView(noSignalInput)
+        container.addView(TextView(this).apply {
+            text = getString(R.string.settings_idle_title)
+            setTextColor(android.graphics.Color.parseColor("#111111"))
+            textSize = 14f
+            setPadding(0, 24, 0, 6)
+        })
+        container.addView(idleInput)
+        container.addView(TextView(this).apply {
+            text = getString(R.string.settings_server_title)
+            setTextColor(android.graphics.Color.parseColor("#111111"))
+            textSize = 14f
+            setPadding(0, 24, 0, 6)
+        })
+        container.addView(hostInput)
+        container.addView(portInput)
+        container.addView(mbpsInput)
+        container.addView(probeBtn)
+        container.addView(probeResult)
+        container.addView(TextView(this).apply {
+            text = getString(R.string.settings_idle_msg)
+            setTextColor(android.graphics.Color.parseColor("#666666"))
+            textSize = 12f
+            setPadding(0, 12, 0, 0)
+        })
         AlertDialog.Builder(this)
-            .setTitle(R.string.settings_no_signal_title)
-            .setMessage(R.string.settings_no_signal_msg)
-            .setView(input)
+            .setTitle(R.string.settings_title)
+            .setView(container)
             .setPositiveButton("保存") { _, _ ->
-                val v = input.text.toString().trim().toLongOrNull()
-                if (v != null && v >= 5) {
-                    prefs.edit().putLong("no_signal_seconds", v).apply()
-                    Toast.makeText(this, "已设置：${v}s", Toast.LENGTH_SHORT).show()
+                val ns = noSignalInput.text.toString().trim().toLongOrNull()
+                val ids = idleInput.text.toString().trim().toLongOrNull()
+                val host = hostInput.text.toString().trim()
+                val port = portInput.text.toString().trim().toIntOrNull()
+                val mbps = mbpsInput.text.toString().trim().toFloatOrNull()
+                val edits = mutableListOf<String>()
+                if (ns != null && ns >= 5) {
+                    prefs.edit().putLong("no_signal_seconds", ns).apply()
+                    edits += "无信号阈值 ${ns}s"
+                }
+                if (ids != null && ids >= 0) {
+                    prefs.edit().putLong("idle_seconds", ids).apply()
+                    edits += "空载时间 ${ids}s"
+                }
+                if (host.isNotEmpty()) {
+                    prefs.edit().putString("server_host", host).apply()
+                    edits += "测试站 $host"
+                }
+                if (port != null && port in 1..65535) {
+                    prefs.edit().putInt("server_port", port).apply()
+                    edits += "端口 $port"
+                }
+                if (mbps != null && mbps > 0f) {
+                    prefs.edit().putFloat("target_mbps", mbps).apply()
+                    edits += "目标 ${mbps}Mbps"
+                }
+                if (edits.isNotEmpty()) {
+                    Toast.makeText(this, "已设置：${edits.joinToString("，")}", Toast.LENGTH_SHORT).show()
                 } else {
-                    Toast.makeText(this, "请输入不小于 5 的整数", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "请输入有效数值", Toast.LENGTH_SHORT).show()
                 }
             }
             .setNegativeButton("取消", null)

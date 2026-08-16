@@ -39,6 +39,7 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
                 session.method == Method.POST && uri == "/agent/task/stop" -> json(ok(taskStop()))
                 session.method == Method.POST && uri == "/agent/downlink" -> json(ok(downlink(session)))
                 session.method == Method.POST && uri == "/agent/sync/confirm" -> json(ok(syncConfirm(session)))
+                session.method == Method.POST && uri == "/agent/rearm" -> json(ok(rearm()))
                 session.method == Method.POST && uri == "/agent/collected" -> json(ok(collected(session)))
                 else -> json(error(404, "not found"))
             }
@@ -143,6 +144,33 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
         val intent = Intent(context, ExperimentService::class.java).setAction(ExperimentService.ACTION_STOP)
         context.startService(intent)
         return JSONObject().apply { put("ok", true); put("state", "STOPPED"); put("stopUtcMs", System.currentTimeMillis()) }
+    }
+
+    /**
+     * Re-trigger the phase machine (idle → loaded → idle) on the SAME run —
+     * sent by the PC after a template switch restarted the gNB with new RF
+     * conditions. Only valid while the phone is actually running a task.
+     */
+    private fun rearm(): JSONObject {
+        val st = AgentState.runEngine.state
+        if (st != RunEngine.State.ARMED && st != RunEngine.State.RUNNING) {
+            return JSONObject().apply {
+                put("ok", false); put("reason", "not_running"); put("state", st.name)
+            }
+        }
+        // Template switching is only allowed in an IDLE phase — re-arming
+        // mid-LOADED would truncate the measurement window.
+        val phase = AgentState.runEngine.currentPhase
+        if (phase == "LOADED") {
+            return JSONObject().apply {
+                put("ok", false); put("reason", "phase_not_idle")
+                put("state", st.name); put("phase", phase)
+            }
+        }
+        val intent = Intent(context, ExperimentService::class.java)
+            .setAction(ExperimentService.ACTION_REARM)
+        context.startForegroundService(intent)
+        return JSONObject().apply { put("ok", true); put("state", st.name); put("phase", phase ?: "null") }
     }
 
     /**

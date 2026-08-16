@@ -7,11 +7,11 @@
 #   powershell -ExecutionPolicy Bypass -File deploy.ps1 -NoBackendRestart
 
 param(
-    [switch]$SkipFrontend,   # 跳过前端构建
-    [switch]$SkipAndroid,    # 跳过安卓构建
-    [switch]$NoInstall,      # 构建但不安装到手机
+    [switch]$SkipFrontend,     # 跳过前端构建
+    [switch]$SkipAndroid,      # 跳过安卓构建
+    [switch]$NoInstall,        # 构建但不安装到手机
     [switch]$NoBackendRestart, # 不重启后端
-    [string]$Serial = ''     # 指定手机序列号（留空自动检测）
+    [string]$Serial = ''       # 指定手机序列号（留空自动检测）
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,26 +35,38 @@ function Find-Adb {
     return $null
 }
 
-# ---- 1. 定位 gradle（优先 PATH，再 wrapper，再缓存发行版）----------------------
-function Find-Gradle {
-    $g = Get-Command gradle -ErrorAction SilentlyContinue
-    if ($g) { return "gradle" }
-    $wrapper = Join-Path $ROOT 'android\gradlew.bat'
-    if (Test-Path $wrapper) { return $wrapper }
-    $dist = Get-ChildItem "$env:USERPROFILE\.gradle\wrapper\dists" -Directory -ErrorAction SilentlyContinue |
+# ---- 1. 定位 gradle 发行版 lib 目录（用 java -classpath 直接启动主类）--------
+# 本机 gradle.bat / gradlew.bat 在 Oracle javapath 下有 "-classpath requires
+# class path specification" 问题，故绕过脚本直接用 java 启动 GradleMain。
+function Find-GradleLib {
+    $dists = Get-ChildItem "$env:USERPROFILE\.gradle\wrapper\dists" -Directory -ErrorAction SilentlyContinue |
         ForEach-Object { Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue } |
         ForEach-Object { Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue } |
-        Where-Object { Test-Path (Join-Path $_.FullName 'bin\gradle.bat') } |
-        Sort-Object Name -Descending | Select-Object -First 1
-    if ($dist) { return (Join-Path $dist.FullName 'bin\gradle.bat') }
+        Where-Object { Test-Path (Join-Path $_.FullName 'lib\gradle-launcher-*.jar') } |
+        Sort-Object Name -Descending
+    if ($dists) { return (Join-Path $dists[0].FullName 'lib') }
     return $null
 }
 
-$adb = Find-Adb
-$gradle = Find-Gradle
+function Invoke-Gradle([string[]]$GradleArgs) {
+    $lib = Find-GradleLib
+    if ($lib) {
+        java -classpath "$lib\*" org.gradle.launcher.GradleMain @GradleArgs
+        return
+    }
+    $g = Get-Command gradle -ErrorAction SilentlyContinue
+    if ($g) {
+        & gradle @GradleArgs
+        return
+    }
+    throw "未找到 gradle；请安装或用 Android Studio 打开 android/"
+}
 
-Write-Host "adb    : $adb" -ForegroundColor DarkGray
-Write-Host "gradle : $gradle" -ForegroundColor DarkGray
+$adb = Find-Adb
+$gradleLib = Find-GradleLib
+
+Write-Host "adb       : $adb" -ForegroundColor DarkGray
+Write-Host "gradle lib: $gradleLib" -ForegroundColor DarkGray
 
 # ---- 2. 构建前端 -----------------------------------------------------------
 if (-not $SkipFrontend) {
@@ -67,12 +79,10 @@ if (-not $SkipFrontend) {
 # ---- 3. 构建安卓 APK ---------------------------------------------------------
 if (-not $SkipAndroid) {
     Write-Step "构建 Android APK"
-    if (-not $gradle) { throw "未找到 gradle；请安装或用 Android Studio 打开 android/" }
     Push-Location (Join-Path $ROOT 'android')
     try {
-        if ($gradle -eq 'gradle') { & gradle assembleDebug --no-daemon }
-        else { & $gradle assembleDebug --no-daemon }
-        if ($LASTEXITCODE -ne 0) { throw "APK 构建失败" }
+        Invoke-Gradle @('assembleDebug', '--no-daemon')
+        if ($LASTEXITCODE -ne 0) { throw "APK 构建失败（exit=$LASTEXITCODE）" }
     } finally { Pop-Location }
 }
 
@@ -84,9 +94,10 @@ if (-not $NoInstall -and -not $SkipAndroid) {
     else {
         $serial = $Serial
         if (-not $serial) {
-            $devs = & $adb devices | Select-Object -Skip 1 | Where-Object { $_ -match 'device$' } | ForEach-Object { ($_ -split '\s+')[0] }
+            # 强制数组（单设备时避免字符串下标取到首字符）
+            $devs = @(& $adb devices | Select-Object -Skip 1 | Where-Object { $_ -match 'device' } | ForEach-Object { ($_ -split '\s+')[0] } | Where-Object { $_ })
             if ($devs.Count -eq 1) { $serial = $devs[0] }
-            elseif ($devs.Count -gt 1) { $serial = $devs | Select-Object -First 1; Write-Host "多设备，使用 $serial（用 -Serial 指定）" -ForegroundColor Yellow }
+            elseif ($devs.Count -gt 1) { $serial = $devs[0]; Write-Host "多设备，使用 $serial（用 -Serial 指定）" -ForegroundColor Yellow }
             else { Write-Host "未检测到手机，跳过安装" -ForegroundColor Yellow }
         }
         if ($serial) {

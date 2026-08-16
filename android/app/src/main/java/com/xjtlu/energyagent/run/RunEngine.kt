@@ -16,13 +16,20 @@ data class PhaseProgress(
     val remainingSeconds: Double
 )
 
-/** Preloaded experiment plan (from the PC over the USB control channel). */
+/** Preloaded experiment plan (from the PC over the USB control channel).
+ *
+ * Standard phases from the PC: idle(idleSeconds) → loaded(collectionSeconds)
+ * → idle(0 = continuous until stop). The phone applies its local idle-seconds
+ * setting on top of the plan before arming (see ExperimentService.applyLocalIdleOverride).
+ */
 data class ExperimentPlan(
     val experimentId: String,
     val runId: String,
     val conditionId: String,
     val environment: String,
     val startDelaySeconds: Double,
+    val idleSeconds: Double = 15.0,
+    val collectionSeconds: Double = 120.0,
     val phases: List<Phase>
 ) {
     companion object {
@@ -33,13 +40,19 @@ data class ExperimentPlan(
                 val p = arr.optJSONObject(i) ?: continue
                 phases += Phase(p.optString("name", "phase$i"), p.optDouble("durationSeconds", 0.0))
             }
+            val idleSeconds = json.optDouble("idleSeconds", 15.0)
+            val collectionSeconds = json.optDouble("collectionSeconds", 120.0)
             return ExperimentPlan(
                 experimentId = json.optString("experimentId"),
                 runId = json.optString("runId"),
                 conditionId = json.optString("conditionId"),
                 environment = json.optString("environment", "AC"),
-                startDelaySeconds = json.optDouble("startDelaySeconds", 30.0),
-                phases = phases.ifEmpty { listOf(Phase("baseline", 30.0), Phase("active", 120.0), Phase("tail", 60.0)) }
+                startDelaySeconds = json.optDouble("startDelaySeconds", 0.0),
+                idleSeconds = idleSeconds,
+                collectionSeconds = collectionSeconds,
+                phases = phases.ifEmpty {
+                    listOf(Phase("idle", idleSeconds), Phase("loaded", collectionSeconds), Phase("idle", 0.0))
+                }
             )
         }
     }
@@ -115,6 +128,11 @@ class RunEngine {
     /**
      * Called every sample. Returns the current phase string (null if not yet started).
      * Fires phase-transition markers exactly once per boundary.
+     *
+     * A phase with ``durationSeconds == 0`` runs **continuously** until the user
+     * stops the experiment — it never transitions into COMPLETE on its own.
+     * This is how the trailing "idle" tail behaves: after the loaded test
+     * finishes the phone returns to idle and keeps recording indefinitely.
      */
     fun update(nowElapsedNs: Long, onMarker: (String) -> Unit): String? {
         if (state != State.ARMED && state != State.RUNNING) return currentPhase
@@ -123,24 +141,27 @@ class RunEngine {
         if (state == State.ARMED) {
             state = State.RUNNING
             currentPhaseIndex = 0
-            onMarker("BASELINE_START")
+            onMarker("${phaseNames[0]}_START")
         }
 
-        // advance through phase boundaries
-        while (currentPhaseIndex + 1 < phaseStartsNs.size && nowElapsedNs >= phaseStartsNs[currentPhaseIndex + 1]) {
+        // advance through phase boundaries. A phase with duration 0 is the
+        // "run forever" sentinel — never cross into the next phase from it.
+        while (currentPhaseIndex + 1 < phaseStartsNs.size &&
+            nowElapsedNs >= phaseStartsNs[currentPhaseIndex + 1]) {
+            val leavingDur = plan?.phases?.get(currentPhaseIndex)?.durationSeconds ?: 0.0
+            if (leavingDur == 0.0) break   // continuous phase — keep recording
             val leaving = currentPhaseIndex
             currentPhaseIndex++
-            val leavingName = phaseNames[leaving].uppercase()
-            val enteringName = phaseNames[currentPhaseIndex].uppercase()
-            onMarker("${leavingName}_END")
-            onMarker("${enteringName}_START")
+            onMarker("${phaseNames[leaving].uppercase()}_END")
+            onMarker("${phaseNames[currentPhaseIndex].uppercase()}_START")
         }
 
-        // completion: past the end of the last phase
-        if (currentPhaseIndex == phaseStartsNs.size - 1) {
+        // completion: only when the LAST phase has a finite (>0) duration and
+        // we've passed its end. A 0-duration tail never auto-completes.
+        if (currentPhaseIndex == phaseStartsNs.size - 1 && state == State.RUNNING) {
             val lastStart = phaseStartsNs[currentPhaseIndex]
             val lastDurNs = ((plan?.phases?.get(currentPhaseIndex)?.durationSeconds ?: 0.0) * 1e9).toLong()
-            if (nowElapsedNs >= lastStart + lastDurNs && state == State.RUNNING) {
+            if (lastDurNs > 0 && nowElapsedNs >= lastStart + lastDurNs) {
                 onMarker("${phaseNames[currentPhaseIndex]}_END")
                 onMarker("RUN_COMPLETE")
                 state = State.COMPLETE

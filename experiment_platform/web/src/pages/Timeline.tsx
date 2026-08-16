@@ -7,6 +7,8 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceL
 type Ack = { id: number; seq: number; direction: string; pc_send_ms: number | null; pc_recv_ms: number | null; rtt_ms: number | null };
 type Sample = { id: number; elapsed_realtime_ns: number; utc_epoch_ms: number | null; battery_power_w: number | null; ss_rsrp_dbm: number | null; run_id: string };
 type GnbSnapshot = { fetched_utc_ms: number; ul_goodput_mbps: number | null; dl_goodput_mbps: number | null };
+type ChannelMetric = { run_id: string; fetched_utc_ms: number; rms_delay_ns: number | null; k_factor_db: number | null; tap_count: number | null; peak_db: number | null; noise_db: number | null };
+type Cir = { dt_ns: number; n_samples: number; pdp: { tau_ns: number; power_db: number }[] };
 
 export default function Timeline({ experimentId }: { experimentId: string }) {
   const { data, error, loading } = useLoad<any>(() => api.get(`/api/experiments/${encodeURIComponent(experimentId)}/timeline`), [experimentId]);
@@ -34,6 +36,22 @@ export default function Timeline({ experimentId }: { experimentId: string }) {
           t: (g.fetched_utc_ms - t0Utc) / 1000,
           ulg: g.ul_goodput_mbps,
           dlg: g.dl_goodput_mbps,
+        }))
+    : [];
+
+  const channel: ChannelMetric[] = data?.channel ?? [];
+  const cir: Cir | null = data?.cir ?? null;
+
+  const channelRows = t0Utc != null
+    ? channel
+        .filter((c) => c.fetched_utc_ms != null)
+        .map((c) => ({
+          t: (c.fetched_utc_ms - t0Utc) / 1000,
+          rms_ns: c.rms_delay_ns,
+          k_db: c.k_factor_db,
+          taps: c.tap_count,
+          peak: c.peak_db,
+          noise: c.noise_db,
         }))
     : [];
 
@@ -131,6 +149,56 @@ export default function Timeline({ experimentId }: { experimentId: string }) {
               </span>
             </div>
           </>
+        )}
+      </Card>
+
+      <Card
+        title="CIR · 多径指标"
+        sub={channelRows.length
+          ? `RMS delay spread / K-factor / tap 数 · ${channelRows.length} 帧 · 与手机采样按 UTC 对齐`
+          : '本实验未记录复信道（ChannelCollector 未运行或 OAI daemon 不可达）'}
+      >
+        {channelRows.length === 0 ? (
+          <EmptyState>暂无 CIR 多径指标数据。</EmptyState>
+        ) : (
+          <>
+            <div style={{ height: 240 }}>
+              <ResponsiveContainer>
+                <LineChart data={channelRows}>
+                  <XAxis dataKey="t" type="number" domain={['dataMin', 'dataMax']} tick={{ fontSize: 10 }} label={{ value: '秒', position: 'insideBottomRight', fontSize: 10 }} />
+                  <YAxis yAxisId="d" tick={{ fontSize: 10 }} label={{ value: 'delay ns', angle: -90, position: 'insideLeft', fontSize: 10 }} />
+                  <YAxis yAxisId="k" orientation="right" tick={{ fontSize: 10 }} label={{ value: 'K dB', angle: 90, position: 'insideRight', fontSize: 10 }} />
+                  <Tooltip />
+                  <Line yAxisId="d" dataKey="rms_ns" name="RMS delay (ns)" dot={false} isAnimationActive={false} stroke="#8e44ad" strokeWidth={2} connectNulls />
+                  <Line yAxisId="k" dataKey="k_db" name="K-factor (dB)" dot={false} isAnimationActive={false} stroke="#e67e22" strokeWidth={2} connectNulls />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="row gap-sm" style={{ marginTop: 10 }}>
+              <span className="row" style={{ gap: 6, fontSize: 12 }}><span style={{ width: 10, height: 3, background: '#8e44ad' }} />RMS delay spread</span>
+              <span className="row" style={{ gap: 6, fontSize: 12 }}><span style={{ width: 10, height: 3, background: '#e67e22' }} />K-factor</span>
+            </div>
+          </>
+        )}
+      </Card>
+
+      <Card
+        title="CIR · 功率延迟谱 (PDP)"
+        sub={cir ? `|h(τ)|² vs 延迟 · ${cir.n_samples} 复采样 @ ${cir.dt_ns.toFixed(2)} ns/点（已降采样）` : '暂无复信道数据'}
+      >
+        {!cir || !cir.pdp.length ? (
+          <EmptyState>暂无 CIR 功率延迟谱。</EmptyState>
+        ) : (
+          <div style={{ height: 240 }}>
+            <ResponsiveContainer>
+              <LineChart data={cir.pdp}>
+                <XAxis dataKey="tau_ns" type="number" domain={['dataMin', 'dataMax']} tick={{ fontSize: 10 }} label={{ value: '延迟 ns', position: 'insideBottomRight', fontSize: 10 }} />
+                <YAxis tick={{ fontSize: 10 }} label={{ value: '|h|² dB', angle: -90, position: 'insideLeft', fontSize: 10 }} />
+                <Tooltip labelFormatter={(v) => `延迟 ${v} ns`} />
+                <Line dataKey="power_db" name="|h(τ)|² (dB)" dot={false} isAnimationActive={false} stroke="#2e9e5b" strokeWidth={1.5} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
         )}
       </Card>
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import socket
 import threading
 import time
@@ -539,7 +540,39 @@ class TaskFlow:
                 "SELECT run_id, fetched_utc_ms, ts_utc, rnti, ul_goodput_mbps, dl_goodput_mbps,"
                 " pusch_snr_db, ul_mcs, n_prb, collection_stale"
                 " FROM oai_snapshots WHERE run_id=? ORDER BY fetched_utc_ms", (rid,))
-        return {"samples": rows, "acks": acks, "clips": clips, "runs": runs, "gnb": gnb}
+        # CIR multipath metrics time-series (oai_channel table).
+        channel = []
+        for rid in run_ids:
+            channel += self.db.query(
+                "SELECT run_id, fetched_utc_ms, ts_utc, rms_delay_ns, k_factor_db,"
+                " tap_count, peak_db, noise_db, mean_delay_ns"
+                " FROM oai_channel WHERE run_id=? ORDER BY fetched_utc_ms", (rid,))
+        # Latest CIR power-delay profile (|h(tau)|^2 in dB) for the PDP chart.
+        cir = None
+        if run_ids:
+            latest = self.db.query_one(
+                "SELECT raw_json_path, dt_ns FROM oai_channel WHERE run_id=?"
+                " ORDER BY fetched_utc_ms DESC LIMIT 1", (run_ids[0],))
+            if latest and latest.get("raw_json_path"):
+                p = Path(latest["raw_json_path"])
+                if p.exists():
+                    try:
+                        raw = json.loads(p.read_text(encoding="utf-8"))
+                        re = raw.get("cirRe") or []
+                        im = raw.get("cirIm") or []
+                        dt_ns = latest.get("dt_ns") or raw.get("dtNs") or 8.138
+                        n = min(len(re), len(im))
+                        step = max(1, n // 512)
+                        pdp = []
+                        for i in range(0, n, step):
+                            v = re[i] * re[i] + im[i] * im[i]
+                            pdp.append({"tau_ns": round(i * dt_ns, 1),
+                                        "power_db": round(10.0 * math.log10(max(v, 1e-30)), 2)})
+                        cir = {"dt_ns": dt_ns, "n_samples": n, "pdp": pdp}
+                    except Exception:
+                        cir = None
+        return {"samples": rows, "acks": acks, "clips": clips, "runs": runs,
+                "gnb": gnb, "channel": channel, "cir": cir}
 
     def clip(self, experiment_id: str, run_id: Optional[str], start_ms: float, end_ms: float,
              label: str) -> dict:

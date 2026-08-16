@@ -93,6 +93,15 @@ class OaiClient:
         params = {"id": request_id} if request_id else {}
         return m.Progress.model_validate(self._get("/api/gnb/progress", **params))
 
+    def channel_cir(self) -> dict:
+        """Fetch the latest complex UL channel impulse response + multipath
+        metrics from the oai_channel_daemon (gNB scope 8090 -> HTTP 8091)."""
+        url = f"http://{self.s.oai_host}:{self.s.oai_channel_port}/channel"
+        r = self._client.get(url)
+        if r.status_code >= 400:
+            raise OaiError("GET", url, r.status_code, r.text)
+        return r.json()
+
     # ---- POST control ---------------------------------------------------- #
     def gnb_service(self, action: str) -> dict:
         return self._post("/api/gnb/service", {"action": action})
@@ -155,7 +164,8 @@ class OaiClient:
         return last
 
     def apply_condition(self, requested: "dict[str, Any]", on_update=None,
-                        restart_timeout_s: float = 300.0) -> dict[str, Any]:
+                        restart_timeout_s: float = 300.0,
+                        force_restart: bool = False) -> dict[str, Any]:
         """Apply a full condition while minimizing restarts (task §11).
 
         ``requested`` keys (all optional): ``bandwidthMHz``, ``txGainDb``,
@@ -165,6 +175,14 @@ class OaiClient:
         Every parameter is persisted with ``restart:false`` first; if any
         effective change requires a restart, a single ``restart`` is issued and
         awaited via the progress API.
+
+        ``force_restart=True`` ALWAYS issues the real restart and awaits it —
+        used by template switching, where the gNB must come back up running
+        the template's full RF configuration. The per-parameter responses are
+        not a reliable restart signal: a ``restart:false`` write just answers
+        ``restarted:false`` with no hint that a restart would be needed, so
+        relying on them silently degrades into "parameters submitted, gNB
+        never restarted".
         """
         results: dict[str, Any] = {}
         needs_restart = False
@@ -200,13 +218,61 @@ class OaiClient:
             results["ulScheduler"] = r
             _maybe_restart(r)
 
-        if needs_restart:
+        if needs_restart or force_restart:
+            # Objective before-evidence: the gNB process start timestamp.
+            before = self._gnb_started_at() if force_restart else None
             r = self.gnb_service("restart")
             results["restart"] = r
             rid = self.extract_request_id(r)
-            results["progress"] = self.wait_for_restart(rid, timeout_s=restart_timeout_s, on_update=on_update)
+            prog = self.wait_for_restart(rid, timeout_s=restart_timeout_s, on_update=on_update)
+            results["progress"] = prog
+            if force_restart:
+                # A forced restart must be REAL — fail loudly instead of
+                # silently continuing with "parameters submitted".
+                if prog.failed:
+                    raise OaiError("POST", "/api/gnb/service", 0,
+                                   f"gNB restart FAILED: {prog.error or prog.message or 'failed'}")
+                if not prog.done:
+                    raise OaiError("POST", "/api/gnb/service", 0,
+                                   f"gNB restart did not complete: phase={prog.phase} error={prog.error}")
+                ok, after, running = self.verify_restarted(before)
+                results["restart_verified"] = ok
+                results["startedAt"] = {"before": before, "after": after}
+                if not ok:
+                    detail = ("gNB NOT running after restart"
+                              if not running else
+                              f"gNB did NOT actually restart — process startedAt unchanged ({before})")
+                    raise OaiError("POST", "/api/gnb/service", 0, detail)
 
         return results
+
+    def _gnb_started_at(self) -> Optional[str]:
+        try:
+            st = self.status()
+            return st.gnb.startedAt if st.gnb else None
+        except Exception:
+            return None
+
+    def verify_restarted(self, before: Optional[str], timeout_s: float = 60.0,
+                         poll_s: float = 3.0) -> tuple[bool, Optional[str], bool]:
+        """Prove the gNB process was actually replaced: it must be running
+        AND (when the previous ``startedAt`` was known) the start timestamp
+        must differ from ``before``. Returns (ok, startedAt_after, running)."""
+        deadline = time.monotonic() + timeout_s
+        after: Optional[str] = None
+        running = False
+        while time.monotonic() < deadline:
+            try:
+                st = self.status()
+            except Exception:
+                time.sleep(poll_s)
+                continue
+            running = bool(st.gnb and st.gnb.running)
+            after = st.gnb.startedAt if st.gnb else None
+            if running and (before is None or (after is not None and after != before)):
+                return True, after, running
+            time.sleep(poll_s)
+        return False, after, running
 
     def ensure_gnb_running(self, timeout_s: float = 300.0, wait_ue: bool = True) -> bool:
         """Start the gNB if it is stopped, then (optionally) wait until gNB

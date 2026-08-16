@@ -19,7 +19,7 @@ experiment_platform/
 │   ├── task_flow.py          任务流（模板/下发/开始/停止/下行ACK对时/采集/剪辑）
 │   ├── phone_channel.py      USB(adb forward)/5G 双通道手机客户端
 │   ├── phone_detect.py       手机连接检测（OFFLINE/ATTACHED/CONNECTED）
-│   ├── collectors.py         1 Hz snapshot / event / config 采集器
+│   ├── collectors.py         snapshot / event / channel(CIR) / config 采集器
 │   ├── sync.py               手机↔PC NTP 式对时 + drift 修正
 │   ├── fusion.py             时钟修正 + 1 s 融合 + 能量积分
 │   ├── quality.py            运行质量标记
@@ -61,12 +61,13 @@ python -m experiment_platform.backend.server
 
 ### OAI 连接（3 种方式，优先级从高到低）
 
-1. **环境变量**：`OAI_HOST`、`OAI_PORT`、`OAI_CONTROL_TOKEN`、`OAI_TIMEOUT_S`。
+1. **环境变量**：`OAI_HOST`、`OAI_PORT`、`OAI_CHANNEL_PORT`、`OAI_CONTROL_TOKEN`、`OAI_TIMEOUT_S`。
 2. **`config.local.json`**（不入库、不提交 git）：
    ```json
    {
      "oai_host": "192.168.3.7",
      "oai_port": 8787,
+     "oai_channel_port": 8091,
      "oai_control_token": "",
      "oai_timeout_s": 8.0,
      "listen_host": "127.0.0.1",
@@ -176,6 +177,34 @@ powershell -ExecutionPolicy Bypass -File E:\Pythonprojects\MOBILE\.tools\setup_r
 - Level 1：`data/processed/time_aligned/`（时钟修正后）。
 - Level 2：`data/processed/merged_1s/`（统一 1 s 分析表）。
 - 导出：`GET /api/experiments/{id}/export` → ZIP（manifest + raw + processed + features_m1/m2/m3 + parquet）。
+
+## 复值信道频响（CIR）采集
+
+RC 多径分析需要 gNB 侧的上行信道冲激响应（含相位）。OAI 的 WebScope 只输出幅度
+`|H|²`（丢相位），因此做了两处扩展：
+
+1. **OAI gNB 侧（已提交 OAI git，commit `0c9800c`）**：在 websrv scope 新增
+   `SCOPEMSG_DATAID_CIR=5` 图 `UL Channel Impulse Response (complex Re/Im)`，
+   输出 `gNBulDelay`（复值时域信道估计，`c16_t`）的 Re/Im 交错 float32。
+2. **OAI 主机常驻 daemon**（`../scripts/oai_channel_daemon.js` + systemd 服务
+   `oai-channel-daemon`）：读 scope `:8090` → 计算多径指标 → 暴露 HTTP
+   `:8091/channel`（JSON：`metrics` + `cirRe`/`cirIm` 复值 CIR）。
+
+平台侧 `ChannelCollector`（1 Hz）轮询 `:8091/channel`，把指标写入 `oai_channel`
+表（`rms_delay_ns` / `k_factor_db` / `tap_count` / `peak_db` / `noise_db` /
+`mean_delay_ns`），并把完整复值 CIR 存为 Level 0 raw JSON（`raw/oai/channel/`）。
+
+```powershell
+# 部署 daemon（OAI 主机上，一次性）
+scp ../scripts/oai_channel_daemon.js usrp2@<OAI_IP>:/tmp/
+ssh usrp2@<OAI_IP> "sudo cp /tmp/oai_channel_daemon.js /usr/local/bin/ && \
+  sudo cp /tmp/oai-channel-daemon.service /etc/systemd/system/ && \
+  sudo systemctl daemon-reload && sudo systemctl enable --now oai-channel-daemon"
+```
+
+> 指标算法用噪声地板（|h|² 中位数）+ 峰值 25 dB 阈值筛选真实多径 tap；延迟轴
+> 步长 `dt = 1/(4096·30kHz) ≈ 8.14 ns`。弱信号（保活）下信道估计 SNR 低，指标
+> 会被噪声主导，**应在 Loaded 满负荷 UL 时采**才有意义。
 
 ## 测试
 

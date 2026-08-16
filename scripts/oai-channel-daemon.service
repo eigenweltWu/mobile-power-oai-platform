@@ -1,0 +1,15 @@
+[Unit]
+Description=OAI complex channel impulse response daemon (scope 8090 -> HTTP 8091)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /usr/local/bin/oai_channel_daemon.js
+Environment=OAI_CHANNEL_HOST=0.0.0.0
+Environment=OAI_CHANNEL_PORT=8091
+Restart=always
+RestartSec=3
+User=usrp2
+
+[Install]
+WantedBy=multi-user.target

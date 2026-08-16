@@ -143,6 +143,40 @@ class EventCollector(Collector):
         return inserted
 
 
+class ChannelCollector(Collector):
+    name = "channel-collector"
+
+    def __init__(self, run_id: str, settings: Settings, db: Database, client: OaiClient,
+                 interval_s: float = 1.0):
+        super().__init__(run_id, settings, db, client, interval_s)
+
+    def collect_once(self) -> dict:
+        raw = self.client.channel_cir()
+        out_dir = self.settings.raw_dir / "oai" / "channel"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fetched = _now_ms()
+        path = out_dir / f"{self.run_id}__{fetched}.json"
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        self.db.record_file(path)
+
+        if not raw.get("ok"):
+            return raw
+        m = raw.get("metrics") or {}
+        self.db.execute(
+            """INSERT INTO oai_channel(
+               run_id, fetched_utc_ms, ts_utc, n_samples, dt_ns,
+               peak_db, noise_db, rms_delay_ns, k_factor_db,
+               tap_count, peak_idx, mean_delay_ns, raw_json_path)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                self.run_id, fetched, raw.get("tsUtc"), raw.get("nSamples"), raw.get("dtNs"),
+                m.get("peakDb"), m.get("noiseDb"), m.get("rmsDelayNs"), m.get("kFactorDb"),
+                m.get("tapCount"), m.get("peakIdx"), m.get("meanDelayNs"), str(path),
+            ),
+        )
+        return raw
+
+
 def save_config_provenance(run_id: str, stage: str, settings: Settings, db: Database, client: OaiClient) -> dict:
     """Read status/controls/config (and rf calibration) and save to Level 0 (task §36)."""
     out_dir = settings.raw_dir / "oai" / ("config" if "config" in stage else "status")

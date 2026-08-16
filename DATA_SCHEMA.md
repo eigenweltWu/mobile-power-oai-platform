@@ -97,6 +97,7 @@ DeviceInfo + Experiment + Session + Condition + Run 元数据（含 chamber meta
 | `sync_anchors` | run_id, direction, attempt_index, t1_ms, t2_elapsed_ns, t2_utc_ms, t3_ms, rtt_ms, offset_ms, uncertainty_ms |
 | `oai_snapshots` | id, run_id, fetched_utc_ms, ts_epoch_ns, ts_utc, rnti, imsi, rsrp_dbm, ssb_sinr_db, ph_raw_db, ph_normalized_db, pcmax_dbm, pusch_snr_db, pusch_rssi, pusch_rssi_unit, ul_mcs, dl_mcs, qm, n_prb, cqi, ri, pmi, ul_ri, tpmi, ul_bler, dl_bler, harq_*, dtx, goodput_mbps, collection_stale, raw_json_path |
 | `oai_events` | id, run_id, ts_epoch_ns, ts_utc, rnti, frame, slot, pusch_snr_db, ph_normalized_db, tpc_pusch, tb_size_bytes, tpc_in_flight_db, delta_mcs_db, n_prb, mcs, rssi, rssi_unit, dedup_key(UNIQUE), raw_json_path |
+| `oai_channel` | id, run_id, fetched_utc_ms, ts_utc, n_samples, dt_ns, peak_db, noise_db, rms_delay_ns, k_factor_db, tap_count, peak_idx, mean_delay_ns, raw_json_path |
 | `oai_config` | id, run_id, stage(before|after), config_json_path, sha256 |
 | `files` | file_path, size_bytes, sha256, created_utc |
 | `run_transitions` | run_id, from_state, to_state, utc_ms, note |

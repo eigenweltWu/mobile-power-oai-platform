@@ -9,7 +9,7 @@ from typing import Optional
 import pandas as pd
 
 from . import fusion, quality, state_machine as sm
-from .collectors import EventCollector, SnapshotCollector, save_config_provenance
+from .collectors import ChannelCollector, EventCollector, SnapshotCollector, save_config_provenance
 from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
@@ -153,9 +153,10 @@ class ExperimentManager:
         self._transition(run_id, "RUNNING")
         snap = SnapshotCollector(run_id, self.settings, self.db, self.oai, interval_s=1.0)
         ev = EventCollector(run_id, self.settings, self.db, self.oai, interval_s=2.0)
-        for c in (snap, ev):
+        ch = ChannelCollector(run_id, self.settings, self.db, self.oai, interval_s=1.0)
+        for c in (snap, ev, ch):
             c.start()
-        self.collectors[run_id] = [snap, ev]
+        self.collectors[run_id] = [snap, ev, ch]
 
     def stop_collectors(self, run_id: str) -> None:
         for c in self.collectors.pop(run_id, []):

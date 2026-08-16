@@ -146,6 +146,19 @@ CREATE TABLE IF NOT EXISTS oai_events (
     raw_json_path TEXT
 );
 
+CREATE TABLE IF NOT EXISTS oai_channel (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    fetched_utc_ms INTEGER NOT NULL,
+    ts_utc TEXT,
+    n_samples INTEGER,
+    dt_ns REAL,
+    peak_db REAL, noise_db REAL,
+    rms_delay_ns REAL, k_factor_db REAL,
+    tap_count INTEGER, peak_idx INTEGER, mean_delay_ns REAL,
+    raw_json_path TEXT
+);
+
 CREATE TABLE IF NOT EXISTS oai_config (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,

@@ -589,8 +589,24 @@ def experiment_timeline(experiment_id: str):
 
 @app.post("/api/experiments/{experiment_id}/clip")
 def clip_experiment(experiment_id: str, payload: dict = Body(...)):
-    return _flow().clip(experiment_id, payload.get("run_id"), float(payload["start_ms"]),
-                        float(payload["end_ms"]), payload.get("label", ""))
+    """Fused clip on the sync-zeroed axis: start_ms/end_ms are RELATIVE to the
+    first pre-run clock sync (t=0); saves a fused CSV copy (phone+gNB+channel)."""
+    try:
+        return _flow().clip(experiment_id, payload.get("run_id"), float(payload["start_ms"]),
+                            float(payload["end_ms"]), payload.get("label", ""))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/clips/{clip_id}/download")
+def download_clip(clip_id: int):
+    row = _db.query_one("SELECT * FROM clips WHERE id=?", (clip_id,))
+    if not row:
+        raise HTTPException(404, "clip not found")
+    p = Path(row.get("output_path") or "")
+    if not p.exists():
+        raise HTTPException(404, "clip file missing on disk")
+    return FileResponse(p, media_type="text/csv", filename=p.name)
 
 
 # --------------------------------------------------------------------------- #

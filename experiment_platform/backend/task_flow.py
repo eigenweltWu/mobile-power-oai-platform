@@ -753,8 +753,38 @@ class TaskFlow:
                 "imported": imported}
 
     # ---- timeline / clip --------------------------------------------------- #
+    def clip_t0(self, experiment_id: str) -> dict:
+        """Time origin for the fused timeline: the FIRST pre-run clock sync
+        (task 5: “把首次开始对时的时间设为 0”). Falls back to the earliest
+        phone sample, then the earliest run start, all on the PC/UTC axis."""
+        runs = self.db.query("SELECT run_id, started_utc_ms FROM runs WHERE experiment_id=?",
+                             (experiment_id,))
+        run_ids = [r["run_id"] for r in runs]
+        ph = ",".join("?" for _ in run_ids)
+        cands: list[tuple[int, str]] = []
+        if run_ids:
+            row = self.db.query_one(
+                f"SELECT MIN(t1_ms) AS t FROM sync_anchors WHERE direction='before'"
+                f" AND t1_ms IS NOT NULL AND run_id IN ({ph})", tuple(run_ids))
+            if row and row["t"]:
+                cands.append((int(row["t"]), "sync_before"))
+            row = self.db.query_one(
+                f"SELECT MIN(utc_epoch_ms) AS t FROM phone_samples WHERE utc_epoch_ms IS NOT NULL"
+                f" AND run_id IN ({ph})", tuple(run_ids))
+            if row and row["t"]:
+                cands.append((int(row["t"]), "phone_first_sample"))
+        for r in runs:
+            if r.get("started_utc_ms"):
+                cands.append((int(r["started_utc_ms"]), "run_started"))
+        if not cands:
+            raise ValueError("no timestamps to anchor the fused timeline")
+        t0, src = min(cands, key=lambda c: c[0])
+        return {"t0_utc_ms": t0, "t0_source": src}
+
     def timeline(self, experiment_id: str) -> dict:
-        runs = self.db.query("SELECT run_id FROM runs WHERE experiment_id=?", (experiment_id,))
+        runs = self.db.query(
+            "SELECT run_id, state, started_utc_ms, ended_utc_ms FROM runs WHERE experiment_id=?",
+            (experiment_id,))
         run_ids = [r["run_id"] for r in runs]
         rows = []
         for rid in run_ids:
@@ -804,28 +834,66 @@ class TaskFlow:
                         cir = {"dt_ns": dt_ns, "n_samples": n, "pdp": pdp}
                     except Exception:
                         cir = None
+        try:
+            origin = self.clip_t0(experiment_id)
+        except ValueError:
+            origin = {"t0_utc_ms": None, "t0_source": None}
         return {"samples": rows, "acks": acks, "clips": clips, "runs": runs,
-                "gnb": gnb, "channel": channel, "cir": cir}
+                "gnb": gnb, "channel": channel, "cir": cir, **origin}
 
     def clip(self, experiment_id: str, run_id: Optional[str], start_ms: float, end_ms: float,
              label: str) -> dict:
-        rows = self.db.query(
-            "SELECT * FROM phone_samples WHERE run_id=? AND elapsed_realtime_ns>=? AND elapsed_realtime_ns<=? ORDER BY elapsed_realtime_ns",
-            (run_id, int(start_ms * 1e6), int(end_ms * 1e6)))
+        """Fused clip on the sync-zeroed time axis (task 5).
+
+        ``start_ms``/``end_ms`` are milliseconds RELATIVE to the experiment's
+        time origin (first pre-run clock sync — see clip_t0). The clip fuses
+        phone samples + gNB snapshots + channel metrics inside the window into
+        one CSV stamped ``t_s`` (seconds since the origin) and records it as a
+        new copy in the clips table (re-saving never overwrites).
+        """
+        import pandas as pd
+        from datetime import datetime, timezone
+        t0 = self.clip_t0(experiment_id)["t0_utc_ms"]
+        lo, hi = t0 + float(start_ms), t0 + float(end_ms)
+        phone = self.db.query(
+            "SELECT utc_epoch_ms AS ts, run_id, phase, battery_power_w, battery_current_now_ua,"
+            " battery_voltage_mv, soc_percent, ss_rsrp_dbm, ss_sinr_db, workload_actual_mbps"
+            " FROM phone_samples WHERE utc_epoch_ms IS NOT NULL AND utc_epoch_ms BETWEEN ? AND ?"
+            " ORDER BY utc_epoch_ms", (lo, hi))
+        gnb = self.db.query(
+            "SELECT fetched_utc_ms AS ts, run_id, ul_goodput_mbps, dl_goodput_mbps, pusch_snr_db,"
+            " ul_mcs, n_prb FROM oai_snapshots WHERE fetched_utc_ms IS NOT NULL"
+            " AND fetched_utc_ms BETWEEN ? AND ? ORDER BY fetched_utc_ms", (lo, hi))
+        channel = self.db.query(
+            "SELECT fetched_utc_ms AS ts, run_id, rms_delay_ns, k_factor_db, tap_count, peak_db,"
+            " noise_db FROM oai_channel WHERE fetched_utc_ms IS NOT NULL"
+            " AND fetched_utc_ms BETWEEN ? AND ? ORDER BY fetched_utc_ms", (lo, hi))
+
+        def _frame(rows: list[dict], source: str):
+            if not rows:
+                return None
+            df = pd.DataFrame(rows)
+            df.insert(0, "t_s", ((df["ts"] - t0) / 1000.0).round(3))
+            df.insert(1, "source", source)
+            return df.drop(columns=["ts"])
+
+        frames = [f for f in (_frame(phone, "phone"), _frame(gnb, "gnb"),
+                              _frame(channel, "channel")) if f is not None]
+        fused = pd.concat(frames, ignore_index=True, sort=False) if frames else \
+            pd.DataFrame(columns=["t_s", "source"])
         out_dir = self.s.processed_dir / "clips"
         out_dir.mkdir(parents=True, exist_ok=True)
-        import pandas as pd
-        df = pd.DataFrame(rows)
-        fname = f"{experiment_id}_{label or 'clip'}_{int(start_ms)}_{int(end_ms)}.csv"
+        fname = f"{experiment_id}_{label or 'clip'}_s{int(start_ms)}_e{int(end_ms)}_{int(time.time() * 1000)}.csv"
         path = out_dir / fname
-        df.to_csv(path, index=False)
+        fused.to_csv(path, index=False)
         self.db.record_file(path)
-        from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
-        self.db.execute(
-            "INSERT INTO clips(experiment_id,run_id,start_ms,end_ms,label,created_utc,output_path) VALUES(?,?,?,?,?,?,?)",
+        clip_id = self.db.execute(
+            "INSERT INTO clips(experiment_id,run_id,start_ms,end_ms,label,created_utc,output_path)"
+            " VALUES(?,?,?,?,?,?,?)",
             (experiment_id, run_id, start_ms, end_ms, label, now, str(path)))
-        return {"ok": True, "path": str(path), "n_rows": int(len(df))}
+        return {"ok": True, "clip_id": clip_id, "path": str(path), "n_rows": int(len(fused)),
+                "t0_utc_ms": t0}
 
 
 _flows: dict[str, TaskFlow] = {}

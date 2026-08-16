@@ -396,9 +396,14 @@ class ExperimentService : Service() {
         val prefs = getSharedPreferences("agent_settings", Context.MODE_PRIVATE)
         val host = prefs.getString("server_host", "192.168.70.129") ?: "192.168.70.129"
         val port = prefs.getInt("server_port", 5201)
-        val mbps = prefs.getFloat("target_mbps", 5.0f).toDouble()
-        Log.i(TAG, "startWorkload UL_CBR ${mbps}Mbps -> $host:$port")
-        workload?.start(WorkloadEngine.Mode.UL_CBR, mbps, host, port)
+        // UL target from the PC plan (template's ulTrafficMbps) wins; fall back
+        // to the local settings value. >= threshold → saturation (blast UDP).
+        val planMbps = AgentState.currentPlan?.ulTrafficMbps ?: 0.0
+        val mbps = if (planMbps > 0.0) planMbps else prefs.getFloat("target_mbps", 5.0f).toDouble()
+        val mode = if (mbps >= com.xjtlu.energyagent.run.ExperimentPlan.UL_SATURATION_THRESHOLD_MBPS)
+            WorkloadEngine.Mode.UL_SATURATION else WorkloadEngine.Mode.UL_CBR
+        Log.i(TAG, "startWorkload $mode ${mbps}Mbps -> $host:$port")
+        workload?.start(mode, mbps, host, port)
     }
 
     private fun noSignalSeconds(): Long {

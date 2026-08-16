@@ -27,7 +27,13 @@ const OAI_FIELDS: OaiFieldDef[] = [
   { key: 'mcs', label: 'MCS', type: 'number' },
   { key: 'qm', label: 'Qm', type: 'number' },
   { key: 'nPrb', label: 'N_PRB', type: 'number' },
+  { key: 'ulTrafficMbps', label: 'UL Traffic Saturation (Mbps)', type: 'number' },
 ];
+
+/** UL Mbps at or above this threshold means "saturate the link" (the phone
+ *  switches its workload engine from UL_CBR to UL_SATURATION). */
+const UL_SATURATION_THRESHOLD_MBPS = 100;
+const UL_TRAFFIC_DEFAULT_MBPS = 999;
 
 function emptyOaiConfig(): Record<string, string> {
   const c: Record<string, string> = {};
@@ -54,6 +60,7 @@ function configJsonToForm(configJson: string): Record<string, string> {
     if (!form.mcs) form.mcs = '0';
     if (!form.nPrb) form.nPrb = '273';
   }
+  if (!form.ulTrafficMbps) form.ulTrafficMbps = String(UL_TRAFFIC_DEFAULT_MBPS);
   return form;
 }
 
@@ -90,6 +97,7 @@ const DEFAULT_TEMPLATE_CONFIG: Record<string, unknown> = {
   puschTargetMode: 'manual',
   puschTargetSnrX10: 89,
   schedulerMode: 'auto',
+  ulTrafficMbps: UL_TRAFFIC_DEFAULT_MBPS, // ≥100 → phone runs UL saturation
 };
 
 /** Qm → (modulation, feasible MCS range) for the UL scheduler. */
@@ -156,6 +164,8 @@ function buildTemplateConfig(c: Record<string, string>): Record<string, unknown>
     if (mcs !== undefined) cfg.mcs = mcs;
     if (nPrb !== undefined) cfg.nPrb = nPrb;
   }
+  const ul = num('ulTrafficMbps');
+  cfg.ulTrafficMbps = Number.isFinite(Number(ul)) ? Number(ul) : UL_TRAFFIC_DEFAULT_MBPS;
   return cfg;
 }
 
@@ -179,6 +189,8 @@ function validateTemplateConfig(c: Record<string, string>): string | null {
     const nPrb = Number(c.nPrb);
     if (c.nPrb === undefined || c.nPrb === '' || !Number.isFinite(nPrb)) return 'N_PRB is required';
   }
+  const ul = Number(c.ulTrafficMbps ?? UL_TRAFFIC_DEFAULT_MBPS);
+  if (!Number.isFinite(ul) || ul < 0) return 'UL Traffic Saturation (Mbps) must be ≥ 0';
   return null;
 }
 

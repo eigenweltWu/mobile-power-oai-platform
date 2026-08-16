@@ -30,9 +30,15 @@ data class ExperimentPlan(
     val startDelaySeconds: Double,
     val idleSeconds: Double = 15.0,
     val collectionSeconds: Double = 120.0,
+    /** UL traffic target from the PC template (Mbps). >= SATURATION threshold
+     *  switches the workload engine to UL saturation; 0 = use local settings. */
+    val ulTrafficMbps: Double = 0.0,
     val phases: List<Phase>
 ) {
     companion object {
+        /** At/above this rate the phone blasts UL UDP instead of pacing CBR. */
+        const val UL_SATURATION_THRESHOLD_MBPS = 100.0
+
         fun fromJson(json: JSONObject): ExperimentPlan {
             val phases = mutableListOf<Phase>()
             val arr: JSONArray = json.optJSONArray("phases") ?: JSONArray()
@@ -50,6 +56,7 @@ data class ExperimentPlan(
                 startDelaySeconds = json.optDouble("startDelaySeconds", 0.0),
                 idleSeconds = idleSeconds,
                 collectionSeconds = collectionSeconds,
+                ulTrafficMbps = json.optDouble("ulTrafficMbps", 0.0),
                 phases = phases.ifEmpty {
                     listOf(Phase("idle", idleSeconds), Phase("loaded", collectionSeconds), Phase("idle", 0.0))
                 }

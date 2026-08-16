@@ -15,6 +15,7 @@ from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
 from .phone_channel import PhoneAgent
+from .templates import UL_TRAFFIC_DEFAULT_MBPS
 
 # Default phase plan handed to the phone at sync-confirm.
 # Flow: idle(idle_seconds) → loaded(collection_seconds) → idle(continuous until
@@ -446,6 +447,13 @@ class TaskFlow:
         # it (RunEntity) so later data exchange can match on it.
         run_id = f"{experiment_id}_r{int(time.time() * 1000)}"
         condition_id = f"{experiment_id}_default"
+        # UL traffic setting from the selected template (default 999 → the
+        # phone workload engine runs UL saturation; lower values pace CBR).
+        ul_mbps = initial.get("ulTrafficMbps") if initial else None
+        try:
+            ul_mbps = float(ul_mbps) if ul_mbps is not None else UL_TRAFFIC_DEFAULT_MBPS
+        except (TypeError, ValueError):
+            ul_mbps = UL_TRAFFIC_DEFAULT_MBPS
         plan = {
             "experimentId": experiment_id,
             "runId": run_id,
@@ -455,6 +463,7 @@ class TaskFlow:
             "startDelaySeconds": 0.0,
             "idleSeconds": idle_s,
             "collectionSeconds": collection_s,
+            "ulTrafficMbps": ul_mbps,
             "phases": build_phases(idle_s, collection_s),
         }
 

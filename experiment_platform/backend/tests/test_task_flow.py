@@ -83,7 +83,8 @@ def test_downlink_ack_records_sync_anchor(tmp_path):
     """Each downlink ACK writes a PC sync_anchors row for fusion/offset reuse."""
     loop, db, oai = _make_loop(tmp_path)
     agent = MagicMock()
-    agent.downlink.return_value = {"phoneRecvMs": 1000, "phoneSendMs": 1001,
+    agent.downlink.return_value = {"ok": True, "monitoring": True,
+                                   "phoneRecvMs": 1000, "phoneSendMs": 1001,
                                    "phoneElapsedNs": 1_000_000}
     agent.sync_confirm.return_value = {"ok": True, "phone_timestamp_ms": 1002, "delay_ms": 2.0}
 
@@ -100,4 +101,56 @@ def test_downlink_ack_records_sync_anchor(tmp_path):
     rows = db.query("SELECT * FROM sync_anchors WHERE run_id='R1' AND direction='before'")
     assert len(rows) == 1
     assert rows[0]["t2_utc_ms"] == 1000.5
+    db.close()
+
+
+def test_downlink_not_monitoring_skips_ack(tmp_path):
+    """When the phone returns monitoring=false (user hasn't clicked 开始任务),
+    the loop must NOT record an ACK or trigger sync-confirm. This ensures the
+    handshake cannot complete until BOTH sides have started."""
+    loop, db, oai = _make_loop(tmp_path)
+    agent = MagicMock()
+    agent.downlink.return_value = {"ok": True, "monitoring": False, "seq": 1}
+    agent.sync_confirm.return_value = {"ok": True, "phone_timestamp_ms": 1002, "delay_ms": 2.0}
+
+    # Patch _resolve_agent to return our mock without touching detect_phone.
+    loop._resolve_agent = lambda: (agent, None)
+
+    # Run the loop for a few iterations (interval_s=0.01 so this is fast).
+    loop.start()
+    import time as _t
+    _t.sleep(0.1)
+    loop.stop()
+
+    # No downlink ACKs should have been recorded.
+    rows = db.query("SELECT direction FROM experiment_acks WHERE direction='downlink'")
+    assert rows == []
+    # sync_confirm must NOT have been called.
+    agent.sync_confirm.assert_not_called()
+    assert loop.sync_confirmed is False
+    db.close()
+
+
+def test_downlink_monitoring_true_records_ack(tmp_path):
+    """When the phone returns monitoring=true, the loop records the ACK and
+    triggers sync-confirm normally."""
+    loop, db, oai = _make_loop(tmp_path)
+    agent = MagicMock()
+    agent.downlink.return_value = {"ok": True, "monitoring": True,
+                                   "phoneRecvMs": 1000, "phoneSendMs": 1001,
+                                   "phoneElapsedNs": 1_000_000}
+    agent.sync_confirm.return_value = {"ok": True, "phone_timestamp_ms": 1002, "delay_ms": 2.0}
+
+    loop._resolve_agent = lambda: (agent, None)
+    loop.start()
+    import time as _t
+    _t.sleep(0.1)
+    loop.stop()
+
+    # At least one downlink ACK should have been recorded.
+    rows = db.query("SELECT direction FROM experiment_acks WHERE direction='downlink'")
+    assert len(rows) >= 1
+    # sync_confirm should have been called (exactly once due to idempotency).
+    agent.sync_confirm.assert_called_once()
+    assert loop.sync_confirmed is True
     db.close()

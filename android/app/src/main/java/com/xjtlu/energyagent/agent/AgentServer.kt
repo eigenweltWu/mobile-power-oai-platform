@@ -57,6 +57,9 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
         put("phase", AgentState.runEngine.currentPhase ?: JSONObject.NULL)
         put("samplingHz", AgentState.samplingHz)
         put("serverStarted", AgentState.serverStarted)
+        put("monitoring", AgentState.monitoringExperimentId != null)
+        put("monitoringExperimentId", AgentState.monitoringExperimentId ?: JSONObject.NULL)
+        put("syncDelayMs", AgentState.syncDelayMs ?: JSONObject.NULL)
     }
 
     /** t2 timestamp for NTP-style sync: reply as fast as possible. */
@@ -142,11 +145,28 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
         return JSONObject().apply { put("ok", true); put("state", "STOPPED"); put("stopUtcMs", System.currentTimeMillis()) }
     }
 
-    /** Downlink ping: reply with phone recv/send timestamps (the uplink ACK). */
+    /**
+     * Downlink ping: reply with phone recv/send timestamps (the uplink ACK).
+     *
+     * ONLY responds as a valid ACK when the phone is in monitoring mode (user
+     * has clicked "开始任务"). Otherwise returns monitoring=false so the PC keeps
+     * probing without recording an ACK or triggering sync-confirm. This ensures
+     * the handshake cannot complete until BOTH sides have started — regardless
+     * of which side clicked first.
+     */
     private fun downlink(session: IHTTPSession): JSONObject {
         val body = JSONObject(readBody(session))
         val seq = body.optInt("seq")
         val pcSendMs = body.optLong("pcSendMs")
+        val monitoring = AgentState.monitoringExperimentId != null
+        if (!monitoring) {
+            // Phone alive but not ready — tell the PC to keep waiting.
+            return JSONObject().apply {
+                put("ok", true)
+                put("monitoring", false)
+                put("seq", seq)
+            }
+        }
         val recv = System.currentTimeMillis()
         val recvElapsed = SystemClock.elapsedRealtimeNanos()
         val send = System.currentTimeMillis()
@@ -154,6 +174,7 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
         AgentState.service?.recordDownlinkAck(seq, pcSendMs, recv, send, recvElapsed)
         return JSONObject().apply {
             put("ok", true)
+            put("monitoring", true)
             put("seq", seq)
             put("phoneRecvMs", recv)
             put("phoneSendMs", send)
@@ -165,6 +186,10 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
      * PC sync-confirm: the PC received the first uplink ACK, captured the gNB
      * data timestamp, and now hands the phone both clocks. The phone computes
      * the communication delay and auto-arms the run (full baseline→active→tail).
+     *
+     * Guard: rejects arming if the phone is NOT in monitoring mode (user hasn't
+     * clicked "开始任务" yet). This prevents the PC from arming the phone before
+     * the user is ready — the handshake only completes when BOTH sides started.
      * Idempotent: a duplicate confirm while already armed is a no-op.
      */
     private fun syncConfirm(session: IHTTPSession): JSONObject {
@@ -182,6 +207,17 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
                 put("already_armed", true)
                 put("phone_timestamp_ms", phoneTs)
                 put("delay_ms", delay)
+            }
+        }
+
+        // Guard: the phone must be in monitoring mode (user clicked "开始任务").
+        // Without this the PC could arm the phone before the user is ready.
+        if (AgentState.monitoringExperimentId == null) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("reason", "not_monitoring")
+                put("monitoring", false)
+                put("phone_timestamp_ms", phoneTs)
             }
         }
 

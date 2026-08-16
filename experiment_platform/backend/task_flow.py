@@ -94,6 +94,15 @@ class DownlinkLoop:
                 self.seq += 1
                 resp = agent.downlink(self.seq, t_send)
                 t_recv = time.time() * 1000.0
+
+                # The phone only returns a valid ACK when it is in monitoring mode
+                # (user clicked "开始任务"). If monitoring=false the phone is alive
+                # but not ready — skip recording and keep probing. This ensures the
+                # handshake cannot complete until BOTH sides have started.
+                if not resp.get("monitoring", True):
+                    self._stop.wait(self.interval_s)
+                    continue
+
                 phone_recv = resp.get("phoneRecvMs")
                 phone_send = resp.get("phoneSendMs")
                 phone_elapsed = resp.get("phoneElapsedNs")

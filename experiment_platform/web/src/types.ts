@@ -91,7 +91,7 @@ export interface PlatformStatus {
     bandwidth_mhz: number | null;
     research_stale: boolean | null;
   };
-  clock: { offset_ms: number | null; state: string };
+  clock: { offset_ms: number | null; state: string; delay_ms?: number | null; rtt_min_ms?: number | null };
   experiment: { latest_run: LatestRun | null };
   storage: { n_files: number; bytes: number };
 }

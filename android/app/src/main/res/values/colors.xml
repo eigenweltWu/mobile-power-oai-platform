@@ -1,0 +1,21 @@
+<resources>
+    <color name="bg_screen">#FFF5F7FA</color>
+    <color name="card_bg">#FFFFFFFF</color>
+    <color name="card_stroke">#FFE0E6EA</color>
+
+    <color name="text_primary">#FF1F2937</color>
+    <color name="text_secondary">#FF6B7280</color>
+    <color name="text_tertiary">#FF9CA3AF</color>
+
+    <color name="accent">#FF2F5D8F</color>
+    <color name="accent_light">#FF5B8BBF</color>
+
+    <color name="status_pending">#FF9CA3AF</color>
+    <color name="status_armed">#FF6366F1</color>
+    <color name="status_running">#FF10B981</color>
+    <color name="status_complete">#FF3B82F6</color>
+    <color name="status_aborted">#FFEF4444</color>
+
+    <color name="phase_progress">#FF2F5D8F</color>
+    <color name="chart_bg">#FFFFFFFF</color>
+</resources>

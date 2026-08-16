@@ -372,7 +372,7 @@ export default function Experiments({ nav }: { nav: (p: string) => void }) {
       }
 
       setOverlay((o) => (o ? { ...o, active: 4 } : o));
-      await api.post(`/api/experiments/${encodeURIComponent(x.experiment_id)}/start`, { serial: PHONE_SERIAL });
+      await api.post(`/api/experiments/${encodeURIComponent(x.experiment_id)}/start`, { serial: PHONE_SERIAL, run_id: runId });
 
       toast('ok', `run ${runId} started`);
       reload();

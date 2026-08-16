@@ -6,6 +6,16 @@ import org.json.JSONObject
 /** One phase in the offline plan. */
 data class Phase(val name: String, val durationSeconds: Double)
 
+/** Snapshot of the current phase progress, for UI display. */
+data class PhaseProgress(
+    val name: String,
+    val index: Int,          // 0-based index of the current phase
+    val total: Int,          // total number of phases in the plan
+    val elapsedSeconds: Double,
+    val durationSeconds: Double,
+    val remainingSeconds: Double
+)
+
 /** Preloaded experiment plan (from the PC over the USB control channel). */
 data class ExperimentPlan(
     val experimentId: String,
@@ -56,6 +66,35 @@ class RunEngine {
 
     val currentPhase: String?
         get() = if (currentPhaseIndex in phaseNames.indices) phaseNames[currentPhaseIndex] else null
+
+    /** 0-based index of the current phase, or -1 if not in a phase yet. */
+    val phaseIndex: Int
+        get() = if (currentPhaseIndex in phaseNames.indices) currentPhaseIndex else -1
+
+    /** Total number of phases in the armed plan (0 if not armed). */
+    val phaseCount: Int
+        get() = phaseNames.size
+
+    /**
+     * Snapshot of the current phase progress for UI display. Returns null when
+     * the engine is not RUNNING/COMPLETE or no phase is active.
+     */
+    fun phaseProgress(nowElapsedNs: Long): PhaseProgress? {
+        if (state == State.IDLE || state == State.ARMED) return null
+        if (currentPhaseIndex !in phaseNames.indices) return null
+        val start = phaseStartsNs[currentPhaseIndex]
+        val dur = plan?.phases?.get(currentPhaseIndex)?.durationSeconds ?: 0.0
+        val elapsedSec = ((nowElapsedNs - start) / 1e9).coerceAtLeast(0.0)
+        val remainingSec = (dur - elapsedSec).coerceAtLeast(0.0)
+        return PhaseProgress(
+            name = phaseNames[currentPhaseIndex],
+            index = currentPhaseIndex,
+            total = phaseNames.size,
+            elapsedSeconds = elapsedSec,
+            durationSeconds = dur,
+            remainingSeconds = remainingSec
+        )
+    }
 
     fun arm(plan: ExperimentPlan, nowElapsedNs: Long, onMarker: (String) -> Unit) {
         this.plan = plan

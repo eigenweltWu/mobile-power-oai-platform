@@ -1,9 +1,110 @@
 # 红米 K30i 暗室无线功耗监控
 
-> **新增（2026-08-15）**：本仓库现已包含完整的 **5G Smartphone Energy Experiment System**。
-> 设计文档见 `SYSTEM_DESIGN.md` / `DATA_SCHEMA.md` / `EXPERIMENT_WORKFLOW.md`；
-> PC 实验平台在 `experiment_platform/`（Python 后端 + React 前端，见 `experiment_platform/README.md`）；
-> Android 采集 App 在 `android/`。下面内容为旧版 ADB 监控工具（`monitor.py`）说明。
+> **核心系统（2026-08-16）**：本仓库包含完整的 **5G Smartphone Energy Experiment System**，
+> 采用 PC 控制平台 + Android 采集 App 的端到端架构，含**对时握手**、**三阶段采集**、
+> **无信号自动刷新**、**USB 历史数据采集**、**时间轴可视化与剪辑**功能。
+>
+> 子目录：
+> - `experiment_platform/`：PC 控制平台（Python FastAPI 后端 + React TS 前端，见 `experiment_platform/README.md`）
+> - `android/`：5G Energy Experiment Agent（Kotlin 采集 App，见 `android/README.md`）
+> - 设计文档：`SYSTEM_DESIGN.md` / `DATA_SCHEMA.md` / `EXPERIMENT_WORKFLOW.md`
+>
+> 以下先给出整体端到端实验流程，再保留旧版 ADB 监控工具（`monitor.py`）说明。
+
+---
+
+## 端到端实验流程（PC ↔ 手机）
+
+### 一、实验准备（PC 端）
+
+1. 在控制平台的「实验（Experiment）」页面建立实验：填写目的 (`purpose`)、流程 (`flow`)、环境 (`environment`)。
+2. **OAI 模板管理**：编辑任务时可按 `+` 增加任意多套 OAI 配置模板（命名 + JSON），支持删除；
+   这些模板会随任务下发到手机，供实验中快速切换。
+3. **下发任务**：选择已连接的手机（USB ATTACHED / 5G CONNECTED），将实验信息（含模板）推送到手机端；
+   手机端主页（TaskListActivity）会显示该实验卡片。
+
+### 二、启动实验（双端「开始实验」）
+
+**PC 端点击「开始实验」→**
+- 使用实验的 `initial_oai_config` 启动 gNB，并检测是否正常运行（`ensure_gnb_running` + `status`）。
+- gNB 就绪后启动 **DownlinkLoop**（每 2s 一次）：持续向手机 `/agent/downlink` 发送下行探测包，
+  记录 `pc_send_ms / phone_recv_ms / phone_send_ms / pc_recv_ms / rtt_ms` 到 `experiment_acks` 表，
+  同时写 `sync_anchors` 表（NTP 式四时间戳，供端时钟融合对齐）。
+
+**手机端点击任务卡片 → 详情页 →「开始任务」→**
+- 仅发送 `ACTION_START_SERVICE`，进入**环境监测模式**：
+  - `RunEngine` 仍为 `IDLE`，不开始正式采集；
+  - 采集遥测（功率 / SS-RSRP / 温度等）并显示在实时图表上，便于确认环境；
+  - UI 状态提示「等待对时中…」。
+
+### 三、对时握手（核心：下行 ACK → Sync-Confirm → 手机自动 ARM）
+
+```
+    PC (DownlinkLoop)                          Phone (AgentServer)
+    ──────────────────                          ──────────────────
+    1. downlink(seq, pc_send_ms)  ──────────▶  recordDownlinkAck(...)
+    2.                                         ▼ 回包: {phoneRecvMs, phoneSendMs, phoneElapsedNs}
+       pc_recv_ms, rtt_ms  ◀────────────────
+       │ 写入 experiment_acks + sync_anchors
+       ▼
+    3. 首次收到 ACK 后触发 sync-confirm：
+       capture gNB ts (research_ues.timestampEpochNs)
+       sync_confirm(pc_ts_ms, gnb_ts_ms, plan)  ──────────▶
+                                                         ├─ 计算 delay = phone_now − pc_send_ms
+                                                         ├─ 存入 SyncAnchorEntity (before)
+                                                         ├─ 写 SYNC_CONFIRM marker
+                                                         └─ 调用 RunEngine.arm(plan)
+       ◀────────────────  {ok, ARMING, delay_ms}
+       │ sync_confirmed = True
+       │ 写入 sync_confirm ack (含 gNB_data_timestamp_ms)
+       ▼
+    4. run 状态机：CREATED → ARMED → RUNNING
+```
+
+> **关键安全保证**：手机必须收到 PC 的 `sync_confirm` 才会 `arm()`；在此之前只做环境监测，
+> 绝不会提前进入基线 / 活动阶段的正式采集。
+
+### 四、三阶段采集（RunEngine → baseline → active → tail）
+
+ARM 后经历 `startDelaySeconds`（默认 30s）倒计时 → `BASELINE_START`：
+
+| 阶段 | 默认时长 | 说明 |
+|------|---------|------|
+| **baseline** | 30s | 空闲 / 轻负载，采集对照的基准功耗与信号 |
+| **active**   | 120s | 启动 `UL_CBR` 5Mbps 大流量上行（绑定蜂窝，`TrafficStats` 核验），确保高资源占用率 — 核心测量期 |
+| **tail**     | 60s   | 停止负载后，采集功耗 / 信号的衰减回落过程 |
+
+阶段切换由单调时钟 `elapsedRealtimeNanos()` 触发，并写入 `BASELINE_START / ACTIVE_END / TAIL_START / RUN_COMPLETE` 等
+marker（EventMarkerEntity 表）。阶段进度在手机详情页顶部显示：「阶段 i/N: 名称 已用 Xs / Ys（百分比）」。
+
+**阶段时长配置**：PC 端权威来源为 `task_flow.py:DEFAULT_PHASES`；手机端 `RunEngine.kt:fromJson`
+在 `phases` 为空时兜底使用 `baseline(30)/active(120)/tail(60)`。
+
+### 五、无信号自动刷新（飞行模式切换）
+
+`ExperimentService.monitorSignal()` 每 1 个采样检查：
+- 若持续 `no_signal_seconds`（默认 **60s**，可在手机详情页点设置按钮修改，最小 5s）无 SS-RSRP 且 `network_type == OTHER`，
+  → 开飞行模式 → 延迟 3s → 关飞行模式，
+  → 分别记录 `AIRPLANE_MODE_ON` / `AIRPLANE_MODE_OFF` marker；
+  仍无信号则在刷新后继续计时等待，下一次再触发。
+
+### 六、停止实验（双端分别按停止）
+
+- **PC 端**：点「停止实验」→ `experiment_acks` 写 `direction='pc_stop'`，run 转 `STOPPED`。
+- **手机端**：点「停止任务」→ 写 `PHONE_STOP` marker（含 `stop_utc_ms` 与 `stop_elapsed_ns`），
+  双锚点供后续时间轴融合对齐。
+
+### 七、历史数据采集 + 可视化
+
+手机与电脑 USB 相连时，PC 端 `phone_inventory()` 按 experiment uuid 列出手机端实验列表，
+显示「本机是否采集过」与「已采集 N 次」：
+1. 点「采集」→ `collect_from_phone()`：
+   - 从手机导出 CSV 到 `raw/phone/<experiment_id>/`；
+   - 向手机 `mark_collected(time, hostname)`，记录采集时间 / 主机名 / 已采集次数；
+   - `collections` 表写入采集记录。
+2. **时间轴可视化**（`timeline` API + 前端 Timeline 组件）：
+   像剪辑影片一样左右拖动查看完整时间，`experiment_acks` / `event_markers` 用不同颜色竖线标出关键时间戳，
+   支持框选区间 `clip()` 保存为 CSV（`processed/clips/`）。
 
 这是一个完全在本机运行的监控工具。Python 通过 ADB 读取手机数据并记录 CSV，HTML/JavaScript 页面使用 SSE 实时更新，不需要安装 Python 第三方包。
 

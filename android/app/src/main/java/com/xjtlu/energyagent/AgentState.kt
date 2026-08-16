@@ -24,6 +24,13 @@ object AgentState {
 
     @Volatile var currentPlan: ExperimentPlan? = null
 
+    /** ExperimentId the phone is currently monitoring (env monitoring, before
+     *  sync-confirm). Set on ACTION_START_SERVICE; cleared on stop. */
+    @Volatile var monitoringExperimentId: String? = null
+
+    /** Communication delay (ms) measured at sync-confirm (phone_now - pc_ts). */
+    @Volatile var syncDelayMs: Double? = null
+
     @Volatile var serverStarted = false
 
     private const val MAX_DISPLAY = 360  // ~1 min at 5 Hz plus margin
@@ -37,5 +44,10 @@ object AgentState {
             displayBuffer.addLast(s)
             while (displayBuffer.size > MAX_DISPLAY) displayBuffer.removeFirst()
         }
+    }
+
+    /** Drop the on-screen rolling buffer (e.g. when a new task is started). */
+    fun clearDisplay() {
+        synchronized(displayBuffer) { displayBuffer.clear() }
     }
 }

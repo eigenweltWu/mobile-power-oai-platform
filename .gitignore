@@ -23,10 +23,12 @@ android/.idea/
 *.apk
 *.jks
 *.keystore
+# 注意：gradle-wrapper.jar / gradlew / gradlew.bat 随仓库提交，便于自举构建
 
-# 通用
+# IDE / 编辑器
 .idea/
 .vscode/
+.trae/
 *.log
 .DS_Store
 Thumbs.db

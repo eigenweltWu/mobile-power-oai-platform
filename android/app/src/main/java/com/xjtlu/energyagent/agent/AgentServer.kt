@@ -7,9 +7,12 @@ import com.xjtlu.energyagent.AgentState
 import com.xjtlu.energyagent.TaskStore
 import com.xjtlu.energyagent.db.AppDatabase
 import com.xjtlu.energyagent.export.CsvExporter
+import com.xjtlu.energyagent.run.ExperimentPlan
+import com.xjtlu.energyagent.run.RunEngine
 import com.xjtlu.energyagent.service.ExperimentService
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -35,6 +38,7 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
                 session.method == Method.POST && uri == "/agent/task/start" -> json(ok(taskStart(session)))
                 session.method == Method.POST && uri == "/agent/task/stop" -> json(ok(taskStop()))
                 session.method == Method.POST && uri == "/agent/downlink" -> json(ok(downlink(session)))
+                session.method == Method.POST && uri == "/agent/sync/confirm" -> json(ok(syncConfirm(session)))
                 session.method == Method.POST && uri == "/agent/collected" -> json(ok(collected(session)))
                 else -> json(error(404, "not found"))
             }
@@ -77,24 +81,27 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
         val plan = AgentState.currentPlan
         if (plan == null) {
             val body = readBody(session)
-            AgentState.currentPlan = com.xjtlu.energyagent.run.ExperimentPlan.fromJson(JSONObject(body))
+            AgentState.currentPlan = ExperimentPlan.fromJson(JSONObject(body))
         }
         val p = AgentState.currentPlan ?: throw IllegalStateException("no plan loaded")
         val intent = Intent(context, ExperimentService::class.java)
             .setAction(ExperimentService.ACTION_ARM)
-            .putExtra(ExperimentService.EXTRA_PLAN_JSON, JSONObject().apply {
-                put("experimentId", p.experimentId)
-                put("runId", p.runId)
-                put("conditionId", p.conditionId)
-                put("environment", p.environment)
-                put("startDelaySeconds", p.startDelaySeconds)
-                val arr = org.json.JSONArray()
-                for (ph in p.phases) arr.put(JSONObject().put("name", ph.name).put("durationSeconds", ph.durationSeconds))
-                put("phases", arr)
-            }.toString())
+            .putExtra(ExperimentService.EXTRA_PLAN_JSON, planToJson(p))
         context.startForegroundService(intent)
         return JSONObject().apply { put("ok", true); put("state", "ARMED"); put("runId", p.runId) }
     }
+
+    /** Serialise a plan to the JSON wire format ExperimentPlan.fromJson expects. */
+    private fun planToJson(plan: ExperimentPlan): String = JSONObject().apply {
+        put("experimentId", plan.experimentId)
+        put("runId", plan.runId)
+        put("conditionId", plan.conditionId)
+        put("environment", plan.environment)
+        put("startDelaySeconds", plan.startDelaySeconds)
+        val arr = JSONArray()
+        for (ph in plan.phases) arr.put(JSONObject().put("name", ph.name).put("durationSeconds", ph.durationSeconds))
+        put("phases", arr)
+    }.toString()
 
     private fun abort(): JSONObject {
         val intent = Intent(context, ExperimentService::class.java).setAction(ExperimentService.ACTION_STOP)
@@ -119,9 +126,11 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
     private fun taskStart(session: IHTTPSession): JSONObject {
         val eid = JSONObject(readBody(session)).optString("experimentId")
         // begin environment monitoring (the ExperimentService monitors signal and
-        // records airplane-mode toggles); record the start timestamp.
+        // records airplane-mode toggles); record the start timestamp. The phase
+        // machine stays IDLE until the PC completes the sync handshake.
         val intent = Intent(context, ExperimentService::class.java)
             .setAction(ExperimentService.ACTION_START_SERVICE)
+            .putExtra(ExperimentService.EXTRA_EXPERIMENT_ID, eid)
         context.startForegroundService(intent)
         TaskStore.recordCollection(context, "start_$eid", "phone")
         return JSONObject().apply { put("ok", true); put("experimentId", eid); put("state", "MONITORING") }
@@ -136,12 +145,69 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
     /** Downlink ping: reply with phone recv/send timestamps (the uplink ACK). */
     private fun downlink(session: IHTTPSession): JSONObject {
         val body = JSONObject(readBody(session))
+        val seq = body.optInt("seq")
+        val pcSendMs = body.optLong("pcSendMs")
         val recv = System.currentTimeMillis()
+        val recvElapsed = SystemClock.elapsedRealtimeNanos()
+        val send = System.currentTimeMillis()
+        // Persist the ACK asynchronously; never block the reply (latency-sensitive).
+        AgentState.service?.recordDownlinkAck(seq, pcSendMs, recv, send, recvElapsed)
         return JSONObject().apply {
             put("ok", true)
-            put("seq", body.optInt("seq"))
+            put("seq", seq)
             put("phoneRecvMs", recv)
-            put("phoneSendMs", System.currentTimeMillis())
+            put("phoneSendMs", send)
+            put("phoneElapsedNs", recvElapsed)
+        }
+    }
+
+    /**
+     * PC sync-confirm: the PC received the first uplink ACK, captured the gNB
+     * data timestamp, and now hands the phone both clocks. The phone computes
+     * the communication delay and auto-arms the run (full baseline→active→tail).
+     * Idempotent: a duplicate confirm while already armed is a no-op.
+     */
+    private fun syncConfirm(session: IHTTPSession): JSONObject {
+        val body = JSONObject(readBody(session))
+        val pcTs = body.optLong("pc_timestamp_ms")
+        val gnbTs = body.optLong("gnb_data_timestamp_ms")
+        val phoneTs = System.currentTimeMillis()
+        val phoneElapsed = SystemClock.elapsedRealtimeNanos()
+        val delay = (phoneTs - pcTs).toDouble()
+
+        // Idempotency: if the engine already left IDLE, don't re-arm.
+        if (AgentState.runEngine.state != RunEngine.State.IDLE) {
+            return JSONObject().apply {
+                put("ok", true)
+                put("already_armed", true)
+                put("phone_timestamp_ms", phoneTs)
+                put("delay_ms", delay)
+            }
+        }
+
+        // Resolve the plan: body.plan (primary) or the already-loaded plan (fallback).
+        val planObj = body.optJSONObject("plan")
+        if (planObj != null) {
+            AgentState.currentPlan = ExperimentPlan.fromJson(planObj)
+        }
+        val plan = AgentState.currentPlan
+            ?: throw IllegalStateException("no plan for sync-confirm (push+start the task first)")
+
+        val intent = Intent(context, ExperimentService::class.java)
+            .setAction(ExperimentService.ACTION_SYNC_CONFIRM)
+            .putExtra(ExperimentService.EXTRA_PC_TS, pcTs)
+            .putExtra(ExperimentService.EXTRA_GNB_TS, gnbTs)
+            .putExtra(ExperimentService.EXTRA_PHONE_TS, phoneTs)
+            .putExtra(ExperimentService.EXTRA_PHONE_ELAPSED, phoneElapsed)
+            .putExtra(ExperimentService.EXTRA_DELAY, delay)
+            .putExtra(ExperimentService.EXTRA_PLAN_JSON, planToJson(plan))
+        context.startForegroundService(intent)
+        return JSONObject().apply {
+            put("ok", true)
+            put("state", "ARMING")
+            put("phone_timestamp_ms", phoneTs)
+            put("delay_ms", delay)
+            put("gnb_data_timestamp_ms", gnbTs)
         }
     }
 

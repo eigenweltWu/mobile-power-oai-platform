@@ -21,7 +21,7 @@
         android:theme="@style/Theme.EnergyAgent">
 
         <activity
-            android:name=".MainActivity"
+            android:name=".TaskListActivity"
             android:exported="true"
             android:launchMode="singleTop">
             <intent-filter>
@@ -29,6 +29,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:parentActivityName=".TaskListActivity" />
 
         <service
             android:name=".service.ExperimentService"

@@ -1,3 +1,30 @@
 <resources>
     <string name="app_name">5G Energy Experiment Agent</string>
+
+    <!-- Task list (home) -->
+    <string name="title_task_list">实验任务</string>
+    <string name="empty_tasks">暂无任务\n请通过 USB 从 PC 下发实验 plan</string>
+    <string name="task_card_phases_label">阶段</string>
+    <string name="task_status_pending">待开始</string>
+    <string name="task_status_running">运行中</string>
+    <string name="task_status_complete">已完成</string>
+    <string name="task_status_aborted">已中止</string>
+    <string name="task_status_armed">已就绪</string>
+
+    <!-- Task detail -->
+    <string name="title_task_detail">任务详情</string>
+    <string name="btn_start_task">开始实验</string>
+    <string name="btn_stop_task">停止实验</string>
+    <string name="btn_export">导出数据</string>
+    <string name="btn_back">返回</string>
+    <string name="btn_settings">设置</string>
+    <string name="task_phase_label">阶段进度</string>
+    <string name="task_not_started_hint">点击「开始实验」进入环境监测，等待 PC 对时后自动开始采集</string>
+    <string name="task_monitoring_hint">环境监测中·等待 PC 对时</string>
+    <string name="task_synced_hint">对时完成·delay=%1$.1fms·采集中</string>
+    <string name="task_complete_hint">实验已完成，可导出数据</string>
+    <string name="task_busy_hint">另一个任务正在运行，请先停止</string>
+    <string name="task_load_failed">任务加载失败</string>
+    <string name="settings_no_signal_title">无信号刷新阈值（秒）</string>
+    <string name="settings_no_signal_msg">持续无信号多少秒后开启飞行模式刷新（默认 60）</string>
 </resources>

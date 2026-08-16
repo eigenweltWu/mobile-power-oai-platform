@@ -14,11 +14,12 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.xjtlu.energyagent.AgentState
-import com.xjtlu.energyagent.MainActivity
 import com.xjtlu.energyagent.R
+import com.xjtlu.energyagent.TaskListActivity
 import com.xjtlu.energyagent.db.AppDatabase
 import com.xjtlu.energyagent.db.EventMarkerEntity
 import com.xjtlu.energyagent.db.PhoneSampleEntity
+import com.xjtlu.energyagent.db.SyncAnchorEntity
 import com.xjtlu.energyagent.run.ExperimentPlan
 import com.xjtlu.energyagent.run.WorkloadEngine
 import com.xjtlu.energyagent.telemetry.TelemetryCollector
@@ -30,6 +31,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 /**
  * Foreground service that runs the offline experiment: samples telemetry at a
@@ -61,14 +63,21 @@ class ExperimentService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "onStartCommand action=" + intent?.action)
         when (intent?.action) {
-            ACTION_START_SERVICE -> ensureRunning()
+            ACTION_START_SERVICE -> {
+                // Environment monitoring only — sampling runs, but the phase
+                // machine stays IDLE until the PC completes the sync handshake.
+                val eid = intent?.getStringExtra(EXTRA_EXPERIMENT_ID)
+                if (eid != null) AgentState.monitoringExperimentId = eid
+                ensureRunning()
+            }
             ACTION_ARM -> {
                 val planJson = intent.getStringExtra(EXTRA_PLAN_JSON)
                 if (planJson != null) {
-                    val plan = ExperimentPlan.fromJson(org.json.JSONObject(planJson))
+                    val plan = ExperimentPlan.fromJson(JSONObject(planJson))
                     arm(plan)
                 }
             }
+            ACTION_SYNC_CONFIRM -> handleSyncConfirm(intent)
             ACTION_STOP -> stopExperiment()
         }
         return START_STICKY
@@ -219,20 +228,131 @@ class ExperimentService : Service() {
         scope.launch { db.samples().insertAll(batch) }
     }
 
-    private fun recordMarker(plan: ExperimentPlan?, marker: String) {
-        if (plan == null) return
+    private fun recordMarker(plan: ExperimentPlan?, marker: String, payloadJson: String? = null) {
+        // Fall back to the monitored experiment during the pre-sync monitoring
+        // window (plan is null until sync-confirm arms the engine).
+        val eid = plan?.experimentId ?: AgentState.monitoringExperimentId ?: return
+        val rid = plan?.runId
+        val cid = plan?.conditionId
         scope.launch {
             db.markers().insert(
                 EventMarkerEntity(
                     utcEpochMs = System.currentTimeMillis(),
                     elapsedRealtimeNs = SystemClock.elapsedRealtimeNanos(),
-                    experimentId = plan.experimentId,
-                    runId = plan.runId,
-                    conditionId = plan.conditionId,
+                    experimentId = eid,
+                    runId = rid,
+                    conditionId = cid,
                     markerType = marker,
-                    payloadJson = null
+                    payloadJson = payloadJson
                 )
             )
+        }
+    }
+
+    /**
+     * Handle the PC sync-confirm handshake: the PC received the first uplink ACK,
+     * recorded the gNB data timestamp, and now tells the phone the two clocks so
+     * the phone can compute the communication delay and auto-arm the run.
+     *
+     * Idempotent: a duplicate confirm while already armed just records a marker.
+     */
+    private fun handleSyncConfirm(intent: Intent) {
+        val pcTs = intent.getLongExtra(EXTRA_PC_TS, 0L)
+        val gnbTs = intent.getLongExtra(EXTRA_GNB_TS, 0L)
+        val phoneTs = intent.getLongExtra(EXTRA_PHONE_TS, System.currentTimeMillis())
+        val phoneElapsed = intent.getLongExtra(EXTRA_PHONE_ELAPSED, SystemClock.elapsedRealtimeNanos())
+        val delay = intent.getDoubleExtra(EXTRA_DELAY, (phoneTs - pcTs).toDouble())
+        val planJson = intent.getStringExtra(EXTRA_PLAN_JSON)
+
+        ensureRunning()
+
+        // Double idempotency: if the engine already left IDLE (a prior confirm
+        // armed it), just record a duplicate marker and return.
+        if (AgentState.runEngine.state != com.xjtlu.energyagent.run.RunEngine.State.IDLE) {
+            val dup = payloadOf(pcTs, gnbTs, phoneTs, phoneElapsed, delay)
+            recordMarker(AgentState.currentPlan, "SYNC_CONFIRM_DUP", dup.toString())
+            Log.i(TAG, "handleSyncConfirm dup (state=${AgentState.runEngine.state})")
+            return
+        }
+
+        val plan = if (planJson != null) ExperimentPlan.fromJson(JSONObject(planJson)) else AgentState.currentPlan
+        if (plan == null) {
+            Log.e(TAG, "handleSyncConfirm: no plan available, ignoring")
+            return
+        }
+        AgentState.currentPlan = plan
+        AgentState.syncDelayMs = delay
+        AgentState.monitoringExperimentId = plan.experimentId
+
+        val payload = payloadOf(pcTs, gnbTs, phoneTs, phoneElapsed, delay)
+        scope.launch {
+            try {
+                db.sync().insert(
+                    SyncAnchorEntity(
+                        direction = "before", attemptIndex = 0,
+                        t1Ms = pcTs, t2UtcMs = phoneTs, t2ElapsedNs = phoneElapsed, t3Ms = null
+                    )
+                )
+                db.markers().insert(
+                    EventMarkerEntity(
+                        utcEpochMs = System.currentTimeMillis(),
+                        elapsedRealtimeNs = SystemClock.elapsedRealtimeNanos(),
+                        experimentId = plan.experimentId,
+                        runId = plan.runId,
+                        conditionId = plan.conditionId,
+                        markerType = "SYNC_CONFIRM",
+                        payloadJson = payload.toString()
+                    )
+                )
+                Log.i(TAG, "handleSyncConfirm: anchor+marker stored delay=${delay}ms")
+            } catch (e: Exception) {
+                Log.e(TAG, "handleSyncConfirm db error", e)
+            }
+        }
+        Log.i(TAG, "handleSyncConfirm: auto-arming runId=${plan.runId} delay=${delay}ms")
+        arm(plan)
+    }
+
+    private fun payloadOf(pcTs: Long, gnbTs: Long, phoneTs: Long, phoneElapsed: Long, delay: Double): JSONObject =
+        JSONObject().apply {
+            put("pc_ts_ms", pcTs)
+            put("gnb_data_timestamp_ms", gnbTs)
+            put("phone_ts_ms", phoneTs)
+            put("phone_elapsed_ns", phoneElapsed)
+            put("delay_ms", delay)
+        }
+
+    /**
+     * Record a DOWNLINK_ACK marker for every downlink ping the PC sends, so the
+     * timeline shows the ACK/train even before sync-confirm arms the run. Uses
+     * the current plan, falling back to the monitored experiment id.
+     */
+    fun recordDownlinkAck(seq: Int, pcSendMs: Long, phoneRecvMs: Long, phoneSendMs: Long, phoneElapsedNs: Long) {
+        val plan = AgentState.currentPlan
+        val eid = plan?.experimentId ?: AgentState.monitoringExperimentId ?: return
+        val payload = JSONObject().apply {
+            put("seq", seq)
+            put("pc_send_ms", pcSendMs)
+            put("phone_recv_ms", phoneRecvMs)
+            put("phone_send_ms", phoneSendMs)
+            put("phone_elapsed_ns", phoneElapsedNs)
+        }
+        scope.launch {
+            try {
+                db.markers().insert(
+                    EventMarkerEntity(
+                        utcEpochMs = phoneRecvMs,
+                        elapsedRealtimeNs = phoneElapsedNs,
+                        experimentId = eid,
+                        runId = plan?.runId,
+                        conditionId = plan?.conditionId,
+                        markerType = "DOWNLINK_ACK",
+                        payloadJson = payload.toString()
+                    )
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "recordDownlinkAck error", e)
+            }
         }
     }
 
@@ -291,11 +411,23 @@ class ExperimentService : Service() {
     }
 
     fun stopExperiment() {
+        // Record the phone-side stop timestamp before tearing down, so both the
+        // PC stop and the phone stop anchors exist for timeline alignment.
+        val plan = AgentState.currentPlan
+        if (plan != null || AgentState.monitoringExperimentId != null) {
+            val payload = JSONObject().apply {
+                put("stop_utc_ms", System.currentTimeMillis())
+                put("stop_elapsed_ns", SystemClock.elapsedRealtimeNanos())
+            }
+            recordMarker(plan, "PHONE_STOP", payload.toString())
+        }
         AgentState.runEngine.abort { recordMarker(AgentState.currentPlan, it) }
         workload?.stop()
         flushBuffer()
         wakeLock?.let { if (it.isHeld) it.release() }
         AgentState.currentPlan = null
+        AgentState.monitoringExperimentId = null
+        AgentState.syncDelayMs = null
     }
 
     private fun buildNotification(): Notification {
@@ -307,7 +439,7 @@ class ExperimentService : Service() {
             )
         }
         val pi = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
+            this, 0, Intent(this, TaskListActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         return NotificationCompat.Builder(this, channelId)
@@ -333,7 +465,14 @@ class ExperimentService : Service() {
         const val TAG = "EnergyAgent"
         const val ACTION_START_SERVICE = "com.xjtlu.energyagent.START"
         const val ACTION_ARM = "com.xjtlu.energyagent.ARM"
+        const val ACTION_SYNC_CONFIRM = "com.xjtlu.energyagent.SYNC_CONFIRM"
         const val ACTION_STOP = "com.xjtlu.energyagent.STOP"
         const val EXTRA_PLAN_JSON = "plan_json"
+        const val EXTRA_EXPERIMENT_ID = "experiment_id"
+        const val EXTRA_PC_TS = "pc_ts_ms"
+        const val EXTRA_GNB_TS = "gnb_ts_ms"
+        const val EXTRA_PHONE_TS = "phone_ts_ms"
+        const val EXTRA_PHONE_ELAPSED = "phone_elapsed_ns"
+        const val EXTRA_DELAY = "delay_ms"
     }
 }

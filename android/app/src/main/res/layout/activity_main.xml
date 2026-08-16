@@ -1,24 +1,46 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:padding="10dp">
+    android:background="@color/bg_screen">
 
-    <!-- top bar: title + help -->
+    <!-- top bar: back + title + help -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:gravity="center_vertical">
+        android:gravity="center_vertical"
+        android:padding="14dp"
+        android:background="@color/card_bg">
+
+        <Button
+            android:id="@+id/btn_back"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:text="‹"
+            android:textSize="22sp"
+            android:padding="0dp" />
 
         <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="5G Energy Experiment Agent"
+            android:gravity="center"
+            android:text="@string/title_task_detail"
             android:textSize="18sp"
-            android:textStyle="bold" />
+            android:textStyle="bold"
+            android:textColor="@color/text_primary" />
+
+        <Button
+            android:id="@+id/btn_settings"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:text="⚙"
+            android:textSize="18sp"
+            android:padding="0dp" />
 
         <Button
             android:id="@+id/btn_help"
@@ -29,12 +51,123 @@
             android:padding="0dp" />
     </LinearLayout>
 
-    <!-- metric selector -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="@color/card_stroke" />
+
+    <!-- task info card (always visible) -->
+    <com.google.android.material.card.MaterialCardView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_margin="10dp"
+        app:cardCornerRadius="12dp"
+        app:cardElevation="1dp"
+        app:strokeColor="@color/card_stroke"
+        app:strokeWidth="1dp"
+        app:cardBackgroundColor="@color/card_bg">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:id="@+id/task_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="@color/text_primary"
+                tools:text="exp-20260816-01" />
+
+            <TextView
+                android:id="@+id/task_meta"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textSize="12sp"
+                android:textColor="@color/text_secondary"
+                android:fontFamily="monospace"
+                tools:text="run: run-001   cond: c1   env: AC" />
+
+            <TextView
+                android:id="@+id/task_phases"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textSize="12sp"
+                android:textColor="@color/text_tertiary"
+                tools:text="阶段: baseline 30s → active 120s → tail 60s" />
+
+            <TextView
+                android:id="@+id/task_hint"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:textSize="13sp"
+                android:textColor="@color/accent"
+                android:text="@string/task_not_started_hint" />
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- phase progress (visible only after the task starts) -->
     <LinearLayout
+        android:id="@+id/phase_section"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="10dp"
+        android:orientation="vertical"
+        android:padding="12dp"
+        android:background="@color/card_bg"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/phase_label"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:textColor="@color/text_primary"
+                tools:text="阶段 2/3: ACTIVE" />
+
+            <TextView
+                android:id="@+id/phase_time"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="12sp"
+                android:textColor="@color/text_secondary"
+                android:fontFamily="monospace"
+                tools:text="已用 45s / 120s" />
+        </LinearLayout>
+
+        <ProgressBar
+            android:id="@+id/phase_progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="8dp"
+            android:layout_marginTop="8dp"
+            android:max="100"
+            android:progress="0"
+            android:progressTint="@color/phase_progress" />
+    </LinearLayout>
+
+    <!-- metric selector (visible only after the task starts) -->
+    <LinearLayout
+        android:id="@+id/metric_buttons"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:layout_marginTop="6dp">
+        android:layout_marginTop="8dp"
+        android:layout_marginHorizontal="10dp"
+        android:visibility="gone">
 
         <Button android:id="@+id/btn_metric_power" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="功率" android:textSize="11sp" android:minWidth="0dp" />
         <Button android:id="@+id/btn_metric_current" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="电流" android:textSize="11sp" android:minWidth="0dp" />
@@ -43,30 +176,37 @@
         <Button android:id="@+id/btn_metric_temp" android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content" android:text="温度" android:textSize="11sp" android:minWidth="0dp" />
     </LinearLayout>
 
-    <!-- live chart -->
+    <!-- live chart (visible only after the task starts) -->
     <com.xjtlu.energyagent.TelemetryChart
         android:id="@+id/chart"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
         android:layout_marginTop="6dp"
-        android:background="#FFFFFF" />
+        android:layout_marginHorizontal="10dp"
+        android:background="@color/chart_bg"
+        android:visibility="gone" />
 
-    <!-- status -->
+    <!-- status (visible only after the task starts) -->
     <TextView
         android:id="@+id/status"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="6dp"
+        android:layout_marginHorizontal="10dp"
         android:fontFamily="monospace"
         android:textSize="12sp"
-        android:text="loading…" />
+        android:textColor="@color/text_secondary"
+        android:visibility="gone"
+        tools:text="power 12.3 mW | RSRP -85 dBm" />
 
     <!-- actions -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
+        android:layout_marginHorizontal="10dp"
+        android:layout_marginBottom="10dp"
         android:orientation="horizontal">
 
         <Button
@@ -74,20 +214,22 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Start" />
+            android:text="@string/btn_start_task" />
 
         <Button
             android:id="@+id/btn_stop"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Stop" />
+            android:text="@string/btn_stop_task"
+            android:visibility="gone" />
 
         <Button
             android:id="@+id/btn_export"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="Export" />
+            android:text="@string/btn_export"
+            android:visibility="gone" />
     </LinearLayout>
 </LinearLayout>

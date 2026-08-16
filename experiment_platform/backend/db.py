@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS experiment_acks (
     phone_recv_ms INTEGER,
     phone_send_ms INTEGER,
     pc_recv_ms INTEGER,
-    rtt_ms REAL
+    rtt_ms REAL,
+    gnb_data_timestamp_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -211,6 +212,11 @@ class Database:
                     self._conn.execute(f"ALTER TABLE experiments ADD COLUMN {col} {typ}")
                 except Exception:
                     pass
+            # migration: add gNB data timestamp to pre-existing experiment_acks table
+            try:
+                self._conn.execute("ALTER TABLE experiment_acks ADD COLUMN gnb_data_timestamp_ms INTEGER")
+            except Exception:
+                pass
             self._conn.commit()
 
     # -- low level --------------------------------------------------------- #

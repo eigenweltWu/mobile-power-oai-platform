@@ -29,6 +29,41 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _compute_clock_status(db: Database) -> dict:
+    """Derive the PC↔phone clock offset from recorded downlink ACKs.
+
+    Maps recent downlink ACKs into NTP-style exchanges and reuses
+    ``sync.compute_sync`` (which raises ValueError when there are no valid
+    samples). Returns a ``not_synced`` stub when no ACKs exist yet, so the
+    dashboard reflects the real handshake state instead of a hardcoded value.
+    """
+    from .sync import compute_sync
+    rows = db.query(
+        "SELECT pc_send_ms, phone_recv_ms, phone_send_ms, pc_recv_ms "
+        "FROM experiment_acks WHERE direction='downlink' AND pc_recv_ms IS NOT NULL "
+        "ORDER BY id DESC LIMIT 30")
+    exchanges = []
+    for r in rows:
+        if not (r["phone_recv_ms"] and r["phone_send_ms"]):
+            continue
+        t2_utc = (r["phone_recv_ms"] + r["phone_send_ms"]) / 2.0
+        exchanges.append({"t1_ms": r["pc_send_ms"], "t3_ms": r["pc_recv_ms"],
+                          "t2": {"utcEpochMs": t2_utc}})
+    try:
+        res = compute_sync(exchanges, "before")
+    except ValueError:
+        return {"offset_ms": None, "state": "not_synced", "delay_ms": None, "rtt_min_ms": None}
+    # communication delay = phone_now - pc_ts, recorded at the last sync-confirm
+    delay_row = db.query_one(
+        "SELECT pc_send_ms, phone_recv_ms FROM experiment_acks WHERE direction='sync_confirm' "
+        "ORDER BY id DESC LIMIT 1")
+    delay_ms = None
+    if delay_row and delay_row["phone_recv_ms"] is not None and delay_row["pc_send_ms"] is not None:
+        delay_ms = delay_row["phone_recv_ms"] - delay_row["pc_send_ms"]
+    return {"offset_ms": res.offset_ms, "state": "synced" if res.n_kept >= 1 else "not_synced",
+            "delay_ms": delay_ms, "rtt_min_ms": res.rtt_min_ms}
+
+
 # --------------------------------------------------------------------------- #
 # Platform status / dashboard
 # --------------------------------------------------------------------------- #
@@ -82,7 +117,7 @@ def platform_status():
             "bandwidth_mhz": status.radio.bandwidthMHz if status and status.radio else None,
             "research_stale": coll.stale if coll else None,
         },
-        "clock": {"offset_ms": None, "state": "not_synced"},
+        "clock": _compute_clock_status(_db),
         "experiment": {"latest_run": latest_run},
         "storage": {"n_files": files[0]["n"] if files else 0, "bytes": files[0]["bytes"] if files else 0},
     }
@@ -441,7 +476,10 @@ def phone_tasks(serial: str = Query(...), pc_port: int = 8420):
 @app.post("/api/experiments/{experiment_id}/start")
 def start_experiment(experiment_id: str, payload: dict = Body(...)):
     try:
-        return _flow().start_experiment(experiment_id, payload.get("serial", ""), int(payload.get("pc_port", 8420)))
+        return _flow().start_experiment(experiment_id, payload.get("serial", ""),
+                                        int(payload.get("pc_port", 8420)),
+                                        run_id=payload.get("run_id"),
+                                        plan=payload.get("plan"))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
 

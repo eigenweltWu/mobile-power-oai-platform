@@ -116,6 +116,16 @@ class PhoneAgent:
         """One downlink ping; the phone replies with its recv/send timestamps (uplink ACK)."""
         return self._post("/agent/downlink", {"seq": seq, "pcSendMs": pc_send_ms})
 
+    def sync_confirm(self, pc_timestamp_ms: float, gnb_data_timestamp_ms: float,
+                     plan: Optional[dict] = None) -> dict:
+        """Tell the phone the handshake completed: hand it the PC + gNB timestamps
+        and the run plan. The phone computes the comm delay and auto-arms the run."""
+        payload = {"pc_timestamp_ms": pc_timestamp_ms,
+                   "gnb_data_timestamp_ms": gnb_data_timestamp_ms}
+        if plan is not None:
+            payload["plan"] = plan
+        return self._post("/agent/sync/confirm", payload)
+
     def list_tasks(self) -> dict:
         return self._get("/agent/tasks")
 

@@ -202,7 +202,10 @@ class ExperimentService : Service() {
         val sample = PhoneSampleEntity(
             utcEpochMs = utcMs,
             elapsedRealtimeNs = elapsedNs,
-            experimentId = plan?.experimentId,
+            // Monitoring-phase samples (before sync-confirm) fall back to the
+            // monitoring experiment id so the whole session stays attributable
+            // — and can be discarded as a unit if no run id ever arrives.
+            experimentId = plan?.experimentId ?: AgentState.monitoringExperimentId,
             runId = plan?.runId,
             conditionId = plan?.conditionId,
             sessionId = plan?.runId,
@@ -254,11 +257,25 @@ class ExperimentService : Service() {
         )
     }
 
-    private fun flushBuffer() {
-        if (sampleBuffer.isEmpty()) return
+    private fun flushBuffer(discardUnarmedEid: String? = null) {
         val batch = sampleBuffer.toList()
         sampleBuffer.clear()
-        scope.launch { db.samples().insertAll(batch) }
+        if (batch.isEmpty() && discardUnarmedEid == null) return
+        scope.launch {
+            try {
+                if (batch.isNotEmpty()) db.samples().insertAll(batch)
+                if (discardUnarmedEid != null) {
+                    // The session never received a platform run id — discard
+                    // the whole monitoring record (insert first, then delete,
+                    // inside one coroutine so nothing races back in).
+                    val s = db.samples().deleteUnarmed(discardUnarmedEid)
+                    val m = db.markers().deleteUnarmed(discardUnarmedEid)
+                    Log.w(TAG, "Discarded run-less record for $discardUnarmedEid (samples=$s markers=$m)")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "flushBuffer(discard=${discardUnarmedEid})", e)
+            }
+        }
     }
 
     private fun recordMarker(plan: ExperimentPlan?, marker: String, payloadJson: String? = null) {
@@ -516,7 +533,12 @@ class ExperimentService : Service() {
         // Record the phone-side stop timestamp before tearing down, so both the
         // PC stop and the phone stop anchors exist for timeline alignment.
         val plan = AgentState.currentPlan
-        if (plan != null || AgentState.monitoringExperimentId != null) {
+        // If the session NEVER received a run id from the platform (no
+        // sync-confirm ever armed the engine), discard the whole record —
+        // run-less monitoring data cannot be matched on the PC side anyway.
+        val neverArmed = plan?.runId.isNullOrBlank()
+        val discardEid = if (neverArmed) (plan?.experimentId ?: AgentState.monitoringExperimentId) else null
+        if (!neverArmed && (plan != null || AgentState.monitoringExperimentId != null)) {
             val payload = JSONObject().apply {
                 put("stop_utc_ms", System.currentTimeMillis())
                 put("stop_elapsed_ns", SystemClock.elapsedRealtimeNanos())
@@ -525,7 +547,7 @@ class ExperimentService : Service() {
         }
         AgentState.runEngine.abort { recordMarker(AgentState.currentPlan, it) }
         workload?.stop()
-        flushBuffer()
+        flushBuffer(discardEid)
         wakeLock?.let { if (it.isHeld) it.release() }
         AgentState.currentPlan = null
         AgentState.monitoringExperimentId = null

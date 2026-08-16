@@ -176,6 +176,10 @@ interface SampleDao {
 
     @Query("DELETE FROM phone_samples WHERE runId = :runId")
     suspend fun deleteRun(runId: String)
+
+    /** Discard a monitoring session that never received a platform run id. */
+    @Query("DELETE FROM phone_samples WHERE experimentId = :eid AND runId IS NULL")
+    suspend fun deleteUnarmed(eid: String): Int
 }
 
 @Dao
@@ -185,6 +189,10 @@ interface MarkerDao {
 
     @Query("SELECT * FROM event_markers WHERE runId = :runId ORDER BY elapsedRealtimeNs ASC")
     suspend fun byRun(runId: String): List<EventMarkerEntity>
+
+    /** Discard a monitoring session that never received a platform run id. */
+    @Query("DELETE FROM event_markers WHERE experimentId = :eid AND runId IS NULL")
+    suspend fun deleteUnarmed(eid: String): Int
 }
 
 @Dao

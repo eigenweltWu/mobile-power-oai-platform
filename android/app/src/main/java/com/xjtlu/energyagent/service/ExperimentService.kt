@@ -525,6 +525,10 @@ class ExperimentService : Service() {
         AgentState.currentPlan = null
         AgentState.monitoringExperimentId = null
         AgentState.syncDelayMs = null
+        // Back to a fresh IDLE so the NEXT experiment can enter monitoring and
+        // arm via sync-confirm again (ABORTED would block both — the run is
+        // already fully torn down and its markers recorded at this point).
+        AgentState.runEngine.reset()
     }
 
     private fun buildNotification(): Notification {

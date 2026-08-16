@@ -326,11 +326,16 @@ export default function Dashboard() {
     setApplying(true);
     try {
       const ph = (status?.phone ?? null) as Record<string, unknown> | null;
-      await api.post(
+      const r = await api.post(
         `/api/experiments/${encodeURIComponent(selectedExperimentId)}/templates/${selectedTemplate}/apply`,
         { serial: (ph?.serial as string) || '53616213', pc_port: (ph?.pc_port as number) || 8420 },
-      );
-      toast('ok', 'Template 已应用·gNB 重启后将重新触发 idle→loaded→idle');
+      ) as unknown as Record<string, any>;
+      const res = (r?.result ?? {}) as Record<string, any>;
+      const sa = res.startedAt as { before?: string; after?: string } | undefined;
+      const ver = res.restart_verified === true
+        ? `gNB 已真重启（进程启动时间 ${sa?.before ?? '?'} → ${sa?.after ?? '?'}）`
+        : 'gNB 重启（未返回验证信息）';
+      toast('ok', `Template 已应用·${ver}·重新触发 idle→loaded→idle`);
       loadOai(); loadStatus();
     } catch (e) {
       toast('err', e instanceof Error ? e.message : String(e));

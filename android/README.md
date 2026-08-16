@@ -164,3 +164,20 @@ AgentServer 绑定 `0.0.0.0:8420`，因此既能被 `adb forward`（USB）访问
   `https://mirrors.aliyun.com/ubuntu-releases/24.04/ubuntu-24.04.1-desktop-amd64.iso`，
   `Network.openConnection` 强制走蜂窝。
 - 字节计数用 `TrafficStats`（app UID TX/RX）核验，并记录 `workload_target_mbps / workload_actual_mbps`。
+
+### 测试站服务器（OAI 主机 `192.168.70.129`）
+
+手机 Loaded 阶段发的是**裸 UDP 数据报**，因此 OAI 主机上需要两个并存的服务（同端口、不同协议，
+均开机自启，systemd 托管）：
+
+| 服务 | 协议 | 端口 | 用途 |
+| --- | --- | --- | --- |
+| `iperf3.service` | TCP | 5201 | 手机"测试连通"TCP 探测 + 手动 iperf3 吞吐测试 |
+| `udp-sink.service` | UDP | 5201 | 接收并统计手机 UL UDP 打流，打印实测上行 goodput |
+
+- `udp-sink` 脚本：`.tools/udp_sink.py`，unit：`.tools/udp-sink.service`；每 2 s 向 journald
+  打印 `rate=X.XX Mbps / pkt/s`。
+- 验证命令（OAI 主机上）：`journalctl -u udp-sink.service -f`，跑一次 Loaded 阶段即可看到
+  真实空口上行吞吐；这是与手机端 `TrafficStats` 相互独立的 ground truth。
+- 手机端 `workload_actual_mbps` 依赖 `TrafficStats.getUidTxBytes`，部分机型（如 MIUI）该接口
+  可能返回 0/异常，此时应以 `udp-sink` 的实测速率为准。

@@ -314,6 +314,8 @@ def test_apply_template_idle_applies_and_rearms(tmp_path, monkeypatch):
 
     res = flow.apply_template("EXP3", tid)
     oai.apply_condition.assert_called_once()
+    # the switch must force a REAL gNB restart, not just persist parameters
+    assert oai.apply_condition.call_args.kwargs.get("force_restart") is True
     agent.rearm.assert_called_once()
     assert res["rearm"]["attempted"] is True
     assert res["rearm"]["ok"] is True

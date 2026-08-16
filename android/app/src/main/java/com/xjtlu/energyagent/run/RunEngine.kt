@@ -176,4 +176,21 @@ class RunEngine {
         }
         state = State.ABORTED
     }
+
+    /**
+     * Return to a fresh IDLE state — called after the run is fully torn down
+     * (markers recorded, workload stopped). Without this the engine would sit
+     * in ABORTED forever, which blocks BOTH the second experiment's monitoring
+     * UI (isMonitoring requires IDLE) and the new sync-confirm arm
+     * (handleSyncConfirm ignores non-IDLE states as duplicates).
+     */
+    fun reset() {
+        state = State.IDLE
+        plan = null
+        currentPhaseIndex = -1
+        phaseStartsNs = LongArray(0)
+        phaseNames = arrayOf()
+        armElapsedNs = 0
+        startElapsedNs = 0
+    }
 }

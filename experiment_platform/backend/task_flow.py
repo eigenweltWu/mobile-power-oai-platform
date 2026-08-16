@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
+from .collectors import EventCollector, SnapshotCollector, save_config_provenance
 from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
@@ -197,6 +198,9 @@ class TaskFlow:
         self.db = db
         self.oai = oai
         self.downlinks: dict[str, DownlinkLoop] = {}
+        # OAI research collectors per experiment (SnapshotCollector writes
+        # ul/dl_goodput_mbps + PUSCH stats into oai_snapshots every second).
+        self.collectors: dict[str, list] = {}
 
     # ---- phone connection (detected before every phone operation) ---------- #
     @contextmanager
@@ -212,6 +216,30 @@ class TaskFlow:
             yield PhoneAgent(base_url=f"http://{pdu}:{AGENT_PORT}"), ph
         else:
             raise RuntimeError("phone unreachable: no 5G PDU link (USB is not used during experiments)")
+
+    # ---- OAI research collectors (goodput / PUSCH recording) ---------------- #
+    def _start_collectors(self, run_id: Optional[str], experiment_id: str) -> None:
+        """Start the per-run research collectors (replacing any leftover ones).
+
+        SnapshotCollector persists ul/dl_goodput_mbps into oai_snapshots every
+        second — without it the platform never records the gNB-side goodput."""
+        self._stop_collectors(experiment_id)
+        if not run_id:
+            return
+        try:
+            save_config_provenance(run_id, "before", self.s, self.db, self.oai)
+        except Exception:
+            pass  # provenance is best-effort; the run itself may proceed
+        snap = SnapshotCollector(run_id, self.s, self.db, self.oai, interval_s=1.0)
+        ev = EventCollector(run_id, self.s, self.db, self.oai, interval_s=2.0)
+        snap.start()
+        ev.start()
+        self.collectors[experiment_id] = [snap, ev]
+
+    def _stop_collectors(self, experiment_id: str) -> None:
+        for c in self.collectors.pop(experiment_id, []):
+            c.stop()
+            c.join(timeout=5)
 
     # ---- OAI templates ----------------------------------------------------- #
     def list_templates(self, experiment_id: str) -> list[dict]:
@@ -258,7 +286,9 @@ class TaskFlow:
                 raise TemplateSwitchNotAllowed(
                     f"template switch allowed only in idle phase (current: {phase or 'unknown'})")
 
-        result = self.oai.apply_condition(cfg)
+        # force_restart: the template's RF conditions only take effect on a
+        # REAL gNB restart — the phone then re-runs idle → loaded → idle.
+        result = self.oai.apply_condition(cfg, force_restart=True)
 
         # The gNB restarted with new RF conditions — re-trigger the phone's
         # phase machine (idle → loaded → idle) over the 5G PDU link.
@@ -365,6 +395,12 @@ class TaskFlow:
         loop = DownlinkLoop(experiment_id, serial, pc_port, self.db, self.s, self.oai, plan, run_id)
         loop.start()
         self.downlinks[experiment_id] = loop
+
+        # 5. OAI research collectors — record per-UE ul/dl_goodput_mbps, PUSCH
+        #    SNR/MCS/PRB into oai_snapshots (1 s) and scheduler events into
+        #    oai_events (2 s) for THIS run, so the platform stores the gNB-side
+        #    goodput alongside the phone telemetry.
+        self._start_collectors(run_id, experiment_id)
         return {"ok": ready and in_sync, "gnb_started": gnb_ready, "gnb_running": ready,
                 "ue_in_sync": in_sync, "config_applied": initial, "downlink_started": True,
                 "sync_pending": True, "run_id": run_id}
@@ -382,6 +418,9 @@ class TaskFlow:
         run_id = loop.run_id if loop else None
         if loop:
             loop.stop()
+        # Stop the OAI research collectors FIRST (before the gNB goes down) so
+        # the last goodput samples are flushed with a reachable API.
+        self._stop_collectors(experiment_id)
         if run_id is None:
             # Loop lost (e.g. backend restarted mid-run): fall back to the
             # experiment's active run row so the run still gets marked STOPPED
@@ -392,6 +431,12 @@ class TaskFlow:
                 (experiment_id,))
             run_id = row["run_id"] if row else None
         stop_ms = int(time.time() * 1000)
+        # Post-state provenance (config snapshot after the run).
+        if run_id:
+            try:
+                save_config_provenance(run_id, "after", self.s, self.db, self.oai)
+            except Exception:
+                pass
 
         # 1. PC stop ACK row
         self.db.execute(
@@ -485,7 +530,16 @@ class TaskFlow:
         for a in acks:
             markers.append({"kind": "ack", "ms": a["pc_send_ms"], "rtt_ms": a["rtt_ms"]})
         clips = self.db.query("SELECT * FROM clips WHERE experiment_id=?", (experiment_id,))
-        return {"samples": rows, "acks": acks, "clips": clips, "runs": runs}
+        # gNB-side research snapshots (ul/dl_goodput_mbps recorded by the
+        # SnapshotCollector during the run), UTC-stamped for alignment with
+        # the phone samples (phone_samples.utc_epoch_ms).
+        gnb = []
+        for rid in run_ids:
+            gnb += self.db.query(
+                "SELECT run_id, fetched_utc_ms, ts_utc, rnti, ul_goodput_mbps, dl_goodput_mbps,"
+                " pusch_snr_db, ul_mcs, n_prb, collection_stale"
+                " FROM oai_snapshots WHERE run_id=? ORDER BY fetched_utc_ms", (rid,))
+        return {"samples": rows, "acks": acks, "clips": clips, "runs": runs, "gnb": gnb}
 
     def clip(self, experiment_id: str, run_id: Optional[str], start_ms: float, end_ms: float,
              label: str) -> dict:

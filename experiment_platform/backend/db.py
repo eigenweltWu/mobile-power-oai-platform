@@ -201,6 +201,30 @@ CREATE TABLE IF NOT EXISTS phone_samples (
     sample_quality_flags TEXT
 );
 
+-- Reverberation-chamber sampled acquisition: one row per stirrer step
+-- (contrast with AC experiments, which record continuously and clip later).
+CREATE TABLE IF NOT EXISTS rc_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL,
+    run_id TEXT,
+    sample_index INTEGER NOT NULL,
+    environment TEXT DEFAULT 'RC',
+    stirrer_angle_deg REAL,
+    stirrer_step_deg REAL,
+    pusch_target_snr_x10 INTEGER,
+    rssp_db REAL, target_rssp_db REAL, rssp_error_db REAL,
+    noise_floor_db REAL, noise_margin_db REAL,
+    tap_count INTEGER, tap_count_filtered INTEGER,
+    rms_delay_ns REAL, rms_delay_ns_filtered REAL,
+    mean_delay_ns REAL, k_factor_db REAL,
+    peak_db REAL, peak_db_filtered REAL,
+    started_utc_ms INTEGER, ended_utc_ms INTEGER,
+    servo_iters INTEGER, servo_log TEXT,
+    gnb_summary TEXT, raw_json_path TEXT,
+    created_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rc_samples_exp ON rc_samples(experiment_id, sample_index);
+
 CREATE INDEX IF NOT EXISTS idx_phone_samples_run ON phone_samples(run_id);
 CREATE INDEX IF NOT EXISTS idx_oai_snapshots_run ON oai_snapshots(run_id, ts_epoch_ns);
 CREATE INDEX IF NOT EXISTS idx_oai_events_run ON oai_events(run_id, ts_epoch_ns);

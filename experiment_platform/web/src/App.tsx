@@ -4,12 +4,14 @@ import Experiments from './pages/Experiments';
 import Timeline from './pages/Timeline';
 import Settings from './pages/Settings';
 import PhoneSync from './pages/PhoneSync';
+import Chamber from './pages/Chamber';
 import { Icon, ToastHost } from './components/ui';
 
 const NAV: { path: string; label: string; icon: string }[] = [
   { path: '/dashboard', label: 'Dashboard', icon: 'grid' },
   { path: '/experiments', label: 'Experiments', icon: 'flask' },
   { path: '/sync', label: 'Phone Sync', icon: 'download' },
+  { path: '/chamber', label: 'Chamber RC', icon: 'compare' },
   { path: '/settings', label: 'Settings', icon: 'settings' },
 ];
 
@@ -18,6 +20,7 @@ const TITLES: Record<string, string> = {
   experiments: 'Experiments',
   timeline: 'Timeline',
   sync: 'Phone Sync',
+  chamber: 'Chamber RC',
   settings: 'Settings',
 };
 
@@ -57,6 +60,9 @@ export default function App() {
       break;
     case 'sync':
       page = <PhoneSync />;
+      break;
+    case 'chamber':
+      page = <Chamber />;
       break;
     case 'settings':
       page = <Settings />;

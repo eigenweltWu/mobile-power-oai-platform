@@ -610,6 +610,124 @@ def download_clip(clip_id: int):
 
 
 # --------------------------------------------------------------------------- #
+# Reverberation chamber (RC): stirrer control + sampled acquisition campaigns
+# --------------------------------------------------------------------------- #
+import threading as _threading
+
+from . import rc_flow as _rc
+from .stirrer import StirrerAgent, StirrerError
+
+_stirrer_lock = _threading.Lock()
+_stirrer_agents: dict[str, StirrerAgent] = {}
+
+
+def _stirrer(simulate: bool = False) -> StirrerAgent:
+    key = "sim" if simulate else "usb"
+    with _stirrer_lock:
+        if key not in _stirrer_agents:
+            _stirrer_agents[key] = StirrerAgent(_settings, simulate=simulate)
+        return _stirrer_agents[key]
+
+
+def _runner() -> _rc.RcRunner:
+    return _rc.get_runner(_settings, _db, _oai)
+
+
+@app.get("/api/stirrer/status")
+def stirrer_status(simulate: bool = False):
+    return _stirrer(simulate).status()
+
+
+@app.post("/api/stirrer/connect")
+def stirrer_connect(payload: dict = Body(default={})):
+    """Open the USB link to the stirrer controller (or start the virtual motor)."""
+    agent = _stirrer(bool(payload.get("simulate")))
+    try:
+        agent.ensure_helper()
+    except StirrerError as e:
+        raise HTTPException(502, str(e))
+    r = agent.open()
+    if not r.get("ok"):
+        raise HTTPException(502, f"stirrer open failed: {r.get('error')}")
+    return agent.status()
+
+
+@app.post("/api/stirrer/disconnect")
+def stirrer_disconnect(payload: dict = Body(default={})):
+    agent = _stirrer(bool(payload.get("simulate")))
+    agent.close()
+    return agent.status()
+
+
+@app.post("/api/stirrer/move")
+def stirrer_move(payload: dict = Body(...)):
+    """Manual jog: {"deg": 5} relative move (blocks until standstill)."""
+    agent = _stirrer(bool(payload.get("simulate")))
+    if not agent._opened:
+        raise HTTPException(409, "stirrer not connected")
+    try:
+        return agent.move_rel_and_wait(float(payload.get("deg", 0.0)))
+    except StirrerError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/stirrer/stop")
+def stirrer_stop(payload: dict = Body(default={})):
+    agent = _stirrer(bool(payload.get("simulate")))
+    if not agent._opened:
+        raise HTTPException(409, "stirrer not connected")
+    return agent.stop()
+
+
+@app.post("/api/rc/campaign/start")
+def rc_campaign_start(payload: dict = Body(...)):
+    """Launch a sampled RC acquisition for a RUNNING experiment.
+
+    Requires the experiment to have been started first (gNB up, phone armed);
+    the campaign then walks the stirrer, servos puschTargetSnrX10 to hold the
+    receiver RSSP, and triggers one timed phone record window per step.
+    """
+    try:
+        return _runner().start(
+            _flow(), payload["experimentId"],
+            payload.get("serial", "53616213"), int(payload.get("pc_port", 8420)),
+            {k: v for k, v in payload.items()
+             if k not in ("experimentId", "serial", "pc_port")})
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except StirrerError as e:
+        raise HTTPException(502, str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/rc/campaign/stop")
+def rc_campaign_stop(payload: dict = Body(...)):
+    try:
+        return _runner().stop(payload["experimentId"])
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/rc/campaign/status")
+def rc_campaign_status(experiment_id: str):
+    return _runner().status(experiment_id)
+
+
+@app.get("/api/rc/samples")
+def rc_samples(experiment_id: str):
+    rows = _runner().samples(experiment_id)
+    for r in rows:
+        for col in ("servo_log", "gnb_summary"):
+            if r.get(col):
+                try:
+                    r[col] = json.loads(r[col])
+                except Exception:
+                    pass
+    return {"ok": True, "experiment_id": experiment_id, "samples": rows}
+
+
+# --------------------------------------------------------------------------- #
 # Frontend static (built React, if present)
 # --------------------------------------------------------------------------- #
 # Windows mimetypes maps .js -> text/plain, which breaks ES-module scripts

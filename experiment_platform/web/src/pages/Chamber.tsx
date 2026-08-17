@@ -81,9 +81,12 @@ const STATE_TONE: Record<string, 'good' | 'warn' | 'bad' | 'muted' | 'accent'> =
   preparing: 'warn', finalizing: 'warn',
 };
 
-export default function Chamber() {
+export default function Chamber({ initialExperimentId = '', onBack }: {
+  initialExperimentId?: string;
+  onBack?: () => void;
+}) {
   const [exps, setExps] = useState<Exp[]>([]);
-  const [expId, setExpId] = useState('');
+  const [expId, setExpId] = useState(initialExperimentId);
   const [cfg, setCfg] = useState({ ...DEFAULT_CFG });
   const [stirrer, setStirrer] = useState<StirrerStatus | null>(null);
   const [simMode, setSimMode] = useState(false);
@@ -103,11 +106,12 @@ export default function Chamber() {
       const r = await api.get<Exp[] | { experiments: Exp[] }>('/api/experiments');
       if (!mounted.current) return;
       const experiments = Array.isArray(r) ? r : (r.experiments || []);
-      setExps(experiments);
-      const rc = experiments.find((e) => e.environment === 'RC');
+      const rcExperiments = experiments.filter((e) => e.environment === 'RC');
+      setExps(rcExperiments);
+      const rc = rcExperiments.find((e) => e.experiment_id === initialExperimentId) ?? rcExperiments[0];
       if (rc && !expId) setExpId(rc.experiment_id);
     } catch (e) { setError(e); }
-  }, [expId]);
+  }, [expId, initialExperimentId]);
 
   const loadStirrer = useCallback(async () => {
     try {
@@ -199,6 +203,13 @@ export default function Chamber() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div className="page-head">
+        <div>
+          <div className="title">RC Setup · {expId}</div>
+          <div className="subtitle">reverberation-chamber stirrer and sampled acquisition</div>
+        </div>
+        {onBack && <button className="btn" onClick={onBack}>← Experiments</button>}
+      </div>
       {error ? <ErrorBox error={error} /> : null}
 
       <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>

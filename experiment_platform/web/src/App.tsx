@@ -11,7 +11,6 @@ const NAV: { path: string; label: string; icon: string }[] = [
   { path: '/dashboard', label: 'Dashboard', icon: 'grid' },
   { path: '/experiments', label: 'Experiments', icon: 'flask' },
   { path: '/sync', label: 'Phone Sync', icon: 'download' },
-  { path: '/chamber', label: 'Chamber RC', icon: 'compare' },
   { path: '/settings', label: 'Settings', icon: 'settings' },
 ];
 
@@ -20,7 +19,6 @@ const TITLES: Record<string, string> = {
   experiments: 'Experiments',
   timeline: 'Timeline',
   sync: 'Phone Sync',
-  chamber: 'Chamber RC',
   settings: 'Settings',
 };
 
@@ -53,16 +51,16 @@ export default function App() {
       page = <Dashboard />;
       break;
     case 'experiments':
-      page = <Experiments nav={nav} />;
+      page = segments[1] && segments[2] === 'rc'
+        ? <Chamber initialExperimentId={decodeURIComponent(segments[1])} onBack={() => nav('/experiments')} />
+        : <Experiments nav={nav} />;
       break;
     case 'timeline':
-      page = <Timeline experimentId={decodeURIComponent(segments[1] || '')} />;
+      page = <Timeline experimentId={decodeURIComponent(segments[1] || '')}
+        initialRunId={decodeURIComponent(segments[2] || '')} onBack={() => nav('/experiments')} />;
       break;
     case 'sync':
       page = <PhoneSync />;
-      break;
-    case 'chamber':
-      page = <Chamber />;
       break;
     case 'settings':
       page = <Settings />;

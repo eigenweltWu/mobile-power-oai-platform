@@ -803,12 +803,16 @@ class TaskFlow:
                 "imported": imported}
 
     # ---- timeline / clip --------------------------------------------------- #
-    def clip_t0(self, experiment_id: str) -> dict:
+    def clip_t0(self, experiment_id: str, run_id: Optional[str] = None) -> dict:
         """Time origin for the fused timeline: the FIRST pre-run clock sync
         (task 5: “把首次开始对时的时间设为 0”). Falls back to the earliest
         phone sample, then the earliest run start, all on the PC/UTC axis."""
-        runs = self.db.query("SELECT run_id, started_utc_ms FROM runs WHERE experiment_id=?",
-                             (experiment_id,))
+        sql = "SELECT run_id, started_utc_ms FROM runs WHERE experiment_id=?"
+        args: tuple = (experiment_id,)
+        if run_id:
+            sql += " AND run_id=?"
+            args += (run_id,)
+        runs = self.db.query(sql + " ORDER BY run_id", args)
         run_ids = [r["run_id"] for r in runs]
         ph = ",".join("?" for _ in run_ids)
         cands: list[tuple[int, str]] = []
@@ -831,19 +835,32 @@ class TaskFlow:
         t0, src = min(cands, key=lambda c: c[0])
         return {"t0_utc_ms": t0, "t0_source": src}
 
-    def timeline(self, experiment_id: str) -> dict:
-        runs = self.db.query(
-            "SELECT run_id, state, started_utc_ms, ended_utc_ms FROM runs WHERE experiment_id=?",
-            (experiment_id,))
+    def timeline(self, experiment_id: str, run_id: Optional[str] = None) -> dict:
+        sql = "SELECT run_id, state, started_utc_ms, ended_utc_ms FROM runs WHERE experiment_id=?"
+        args: tuple = (experiment_id,)
+        if run_id:
+            sql += " AND run_id=?"
+            args += (run_id,)
+        runs = self.db.query(sql + " ORDER BY run_id", args)
         run_ids = [r["run_id"] for r in runs]
         rows = []
         for rid in run_ids:
             rows += self.db.query("SELECT * FROM phone_samples WHERE run_id=? ORDER BY elapsed_realtime_ns", (rid,))
-        acks = self.db.query("SELECT * FROM experiment_acks WHERE experiment_id=? ORDER BY id", (experiment_id,))
+        ack_sql = "SELECT * FROM experiment_acks WHERE experiment_id=?"
+        ack_args: tuple = (experiment_id,)
+        if run_id:
+            ack_sql += " AND run_id=?"
+            ack_args += (run_id,)
+        acks = self.db.query(ack_sql + " ORDER BY id", ack_args)
         markers = []
         for a in acks:
             markers.append({"kind": "ack", "ms": a["pc_send_ms"], "rtt_ms": a["rtt_ms"]})
-        clips = self.db.query("SELECT * FROM clips WHERE experiment_id=?", (experiment_id,))
+        clip_sql = "SELECT * FROM clips WHERE experiment_id=?"
+        clip_args: tuple = (experiment_id,)
+        if run_id:
+            clip_sql += " AND run_id=?"
+            clip_args += (run_id,)
+        clips = self.db.query(clip_sql + " ORDER BY id DESC", clip_args)
         # gNB-side research snapshots (ul/dl_goodput_mbps recorded by the
         # SnapshotCollector during the run), UTC-stamped for alignment with
         # the phone samples (phone_samples.utc_epoch_ms).
@@ -865,7 +882,7 @@ class TaskFlow:
         if run_ids:
             latest = self.db.query_one(
                 "SELECT raw_json_path, dt_ns FROM oai_channel WHERE run_id=?"
-                " ORDER BY fetched_utc_ms DESC LIMIT 1", (run_ids[0],))
+                " ORDER BY fetched_utc_ms DESC LIMIT 1", (run_ids[-1],))
             if latest and latest.get("raw_json_path"):
                 p = Path(latest["raw_json_path"])
                 if p.exists():
@@ -885,7 +902,7 @@ class TaskFlow:
                     except Exception:
                         cir = None
         try:
-            origin = self.clip_t0(experiment_id)
+            origin = self.clip_t0(experiment_id, run_id)
         except ValueError:
             origin = {"t0_utc_ms": None, "t0_source": None}
         return {"samples": rows, "acks": acks, "clips": clips, "runs": runs,
@@ -903,21 +920,25 @@ class TaskFlow:
         """
         import pandas as pd
         from datetime import datetime, timezone
-        t0 = self.clip_t0(experiment_id)["t0_utc_ms"]
+        t0 = self.clip_t0(experiment_id, run_id)["t0_utc_ms"]
         lo, hi = t0 + float(start_ms), t0 + float(end_ms)
+        run_sql = " AND run_id=?" if run_id else ""
+        window_args: tuple = (lo, hi, run_id) if run_id else (lo, hi)
         phone = self.db.query(
             "SELECT utc_epoch_ms AS ts, run_id, phase, battery_power_w, battery_current_now_ua,"
             " battery_voltage_mv, soc_percent, ss_rsrp_dbm, ss_sinr_db, workload_actual_mbps"
             " FROM phone_samples WHERE utc_epoch_ms IS NOT NULL AND utc_epoch_ms BETWEEN ? AND ?"
-            " ORDER BY utc_epoch_ms", (lo, hi))
+            + run_sql + " ORDER BY utc_epoch_ms", window_args)
         gnb = self.db.query(
             "SELECT fetched_utc_ms AS ts, run_id, ul_goodput_mbps, dl_goodput_mbps, pusch_snr_db,"
             " ul_mcs, n_prb FROM oai_snapshots WHERE fetched_utc_ms IS NOT NULL"
-            " AND fetched_utc_ms BETWEEN ? AND ? ORDER BY fetched_utc_ms", (lo, hi))
+            " AND fetched_utc_ms BETWEEN ? AND ?" + run_sql + " ORDER BY fetched_utc_ms",
+            window_args)
         channel = self.db.query(
             "SELECT fetched_utc_ms AS ts, run_id, rms_delay_ns, k_factor_db, tap_count, peak_db,"
             " noise_db FROM oai_channel WHERE fetched_utc_ms IS NOT NULL"
-            " AND fetched_utc_ms BETWEEN ? AND ? ORDER BY fetched_utc_ms", (lo, hi))
+            " AND fetched_utc_ms BETWEEN ? AND ?" + run_sql + " ORDER BY fetched_utc_ms",
+            window_args)
 
         def _frame(rows: list[dict], source: str):
             if not rows:

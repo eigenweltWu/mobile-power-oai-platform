@@ -583,8 +583,8 @@ def collect_experiment(experiment_id: str, payload: dict = Body(...)):
 
 
 @app.get("/api/experiments/{experiment_id}/timeline")
-def experiment_timeline(experiment_id: str):
-    return _flow().timeline(experiment_id)
+def experiment_timeline(experiment_id: str, run_id: Optional[str] = None):
+    return _flow().timeline(experiment_id, run_id)
 
 
 @app.post("/api/experiments/{experiment_id}/clip")

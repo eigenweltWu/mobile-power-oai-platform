@@ -16,14 +16,35 @@ type Segment = { id: number; start: number; end: number; label: string };
 
 const SEG_COLORS = ['#3b5bdb', '#2e9e5b', '#e67e22', '#8e44ad', '#c0392b'];
 
-export default function Timeline({ experimentId }: { experimentId: string }) {
-  const { data, error, loading, reload } = useLoad<any>(() => api.get(`/api/experiments/${encodeURIComponent(experimentId)}/timeline`), [experimentId]);
+export default function Timeline({ experimentId, initialRunId = '', onBack }: {
+  experimentId: string;
+  initialRunId?: string;
+  onBack?: () => void;
+}) {
+  const [runId, setRunId] = useState(initialRunId);
+  const { data: availableRuns } = useLoad<Run[]>(
+    () => api.get(`/api/experiments/${encodeURIComponent(experimentId)}/runs`), [experimentId]);
+
+  useEffect(() => {
+    if (!availableRuns?.length) return;
+    if (!availableRuns.some((r) => r.run_id === runId)) {
+      const sorted = [...availableRuns].sort((a, b) => a.run_id.localeCompare(b.run_id));
+      setRunId(sorted[sorted.length - 1]?.run_id ?? '');
+    }
+  }, [availableRuns, runId]);
+
+  const { data, error, loading, reload } = useLoad<any>(
+    () => runId
+      ? api.get(`/api/experiments/${encodeURIComponent(experimentId)}/timeline?run_id=${encodeURIComponent(runId)}`)
+      : Promise.resolve(null),
+    [experimentId, runId]);
 
   const samples: Sample[] = data?.samples ?? [];
   const acks: Ack[] = data?.acks ?? [];
   const gnb: GnbSnapshot[] = data?.gnb ?? [];
   const runs: Run[] = data?.runs ?? [];
   const savedClips: ClipRow[] = data?.clips ?? [];
+  const selectedRun = availableRuns?.find((r) => r.run_id === runId);
 
   // ---- fused time axis: t=0 is the FIRST pre-run clock sync (task 5) ----
   const t0: number | null = data?.t0_utc_ms ?? samples.find((s) => s.utc_epoch_ms != null)?.utc_epoch_ms ?? null;
@@ -91,7 +112,26 @@ export default function Timeline({ experimentId }: { experimentId: string }) {
             fused timeline — t=0 = 首次对时{data?.t0_source ? `（${data.t0_source}）` : ''}，单位秒，手机/gNB 关键时间戳已标注
           </div>
         </div>
+        <div className="row gap-sm">
+          <Field label="Run record">
+            <select className="mono" value={runId} onChange={(e) => setRunId(e.target.value)}>
+              {(availableRuns ?? []).map((r) => <option key={r.run_id} value={r.run_id}>{r.run_id}</option>)}
+            </select>
+          </Field>
+          {onBack && <button className="btn" onClick={onBack}>← Experiments</button>}
+        </div>
       </div>
+
+      <Card title="Run record" sub={runId || 'No run selected'}>
+        {selectedRun ? (
+          <div className="row gap-sm">
+            <Badge tone={selectedRun.state === 'STOPPED' || selectedRun.state === 'COMPLETE' ? 'good' : 'muted'}>{selectedRun.state ?? '—'}</Badge>
+            <span className="mono">phone {samples.length}</span>
+            <span className="mono">gNB {gnb.length}</span>
+            <span className="mono">CIR {channel.length}</span>
+          </div>
+        ) : <EmptyState>该实验暂无 run 记录。</EmptyState>}
+      </Card>
 
       <Card title="Timeline">
         {loading ? <Spinner /> : error ? <ErrorBox error={error} /> : rows.length === 0 ? (
@@ -126,6 +166,7 @@ export default function Timeline({ experimentId }: { experimentId: string }) {
 
       <ClipWorkbench
         experimentId={experimentId}
+        runId={runId}
         duration={Math.max(duration, 1)}
         markers={markers}
         savedClips={savedClips}
@@ -222,8 +263,9 @@ export default function Timeline({ experimentId }: { experimentId: string }) {
 /* Video-style clip workbench: draggable segments on the fused time axis      */
 /* ------------------------------------------------------------------------- */
 
-function ClipWorkbench({ experimentId, duration, markers, savedClips, onSaved }: {
+function ClipWorkbench({ experimentId, runId, duration, markers, savedClips, onSaved }: {
   experimentId: string;
+  runId: string;
   duration: number;
   markers: { t: number; kind: string; label: string }[];
   savedClips: ClipRow[];
@@ -292,7 +334,7 @@ function ClipWorkbench({ experimentId, duration, markers, savedClips, onSaved }:
     setSaving(seg.id);
     try {
       const r = await api.post<any>(`/api/experiments/${encodeURIComponent(experimentId)}/clip`, {
-        run_id: null, start_ms: seg.start * 1000, end_ms: seg.end * 1000, label: seg.label,
+        run_id: runId, start_ms: seg.start * 1000, end_ms: seg.end * 1000, label: seg.label,
       });
       toast('ok', `已另存副本 #${r.clip_id}：${r.n_rows} 行 (${seg.start.toFixed(1)}s–${seg.end.toFixed(1)}s)`);
       onSaved();

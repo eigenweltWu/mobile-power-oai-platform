@@ -18,7 +18,8 @@
 - 并存压力实测：4 路 ADB 临时 UDP 发送把当前无线链路压到约 **12.8–13.1 Mbps**（该链路的实际饱和点），同时 CIR 每 5 秒更新、手机公网 ping 25/25（0% 丢包）；结束时 UL BLER≈5.8%，上述故障计数均为 0。饱和时平均 RTT≈574 ms 是队列拥塞，不是 CIR 中断。
 - 平台防护：普通模板默认由 999 Mbps 饱和改为 **5 Mbps CBR**；只有显式配置 `ulTrafficMbps >= 100` 才请求饱和。手机计划序列化补齐 `idleSeconds`、`collectionSeconds`、`ulTrafficMbps`，UL CBR 改为 10 ms 有界突发节拍，解除旧实现约 8 Mbps 的单包延时上限。
 - RC E2E 已完成：首轮 2 个样本、修复后复核轮 1 个样本；后者在 gNB 不重启的情况下把 PUSCH 20→19 dB、完成 CIR/手机/gNB 联合采样后恢复 auto/20 dB。复核 run `RC_E2E_20260817_r1786941202535` 回拉 674 个手机样本，Timeline 同时包含 674 phone、143 gNB、139 channel 记录；Chamber 与 Timeline 页面已用浏览器验证。
-- 最终测试：后端 `53 passed`；前端生产构建与 Android `assembleDebug` 成功；Android 已覆盖部署并启动，前后端已由 `deploy.ps1` 重部署。最终 gNB running、UE in-sync；手机通过 5G 解析并 ping `www.baidu.com` 2/2（0% 丢包，平均约 89 ms）。
+- 页面已统一到 **Experiments**：AC/RC 都由 Create Experiment 创建并以蓝/橙卡片区分；RC Setup 从 RC 卡片进入，侧栏不再单列 Chamber。每张卡片都有 **Records & Clips**，按 run 查看融合记录并剪辑，剪辑接口会真实按 `run_id` 过滤。
+- 最终测试：后端 `54 passed`；前端生产构建与 Android `assembleDebug` 成功；Android 已覆盖部署并启动，前后端已由 `deploy.ps1` 重部署。最终 gNB running、UE in-sync；手机通过 5G 解析并 ping `www.baidu.com` 2/2（0% 丢包，平均约 89 ms）。
 - 手机操作约束：只允许通过 ADB 启动 App、读状态、临时发测试流量，以及开关飞行模式；不得改 APN/DNS/路由或其他手机设置。本轮没有修改手机网络设置。
 
 ---
@@ -62,6 +63,7 @@
 ### 2.5 时间戳融合 + 视频剪辑式 UI ✅ `0fcf399`
 - `manager.py`：`clip_t0()`（t=0 = 首次对时 sync_anchor，回退最早手机样本/run start）；`clip()` 融合 phone_samples + oai_snapshots + oai_channel → 单 CSV（`t_s` 秒轴），clips 表另存副本。
 - `Timeline.tsx`：`ClipWorkbench` — 拖动色块手柄调起止、多片段、关键时间戳标注、另存副本。
+- 本轮补齐可发现性和 run 级语义：Experiments 卡片的 **Records & Clips** 打开记录页，顶部选择 run；Timeline/clip 后端按所选 `run_id` 计算独立 t=0、过滤 phone/gNB/CIR/ACK 和已保存剪辑。浏览器 E2E 已保存 `ui-e2e` 剪辑并核对 CSV 仅含所选 run。
 
 ### 2.6 混响室（RC）采样采集 ✅ `117c0e1` + E2E/热更新修复 `5701fff`
 
@@ -73,7 +75,7 @@
 | `backend/rc_flow.py` | `RcCampaign`（后台线程）完整流程：①**底噪标定**（N 帧 CIR 逐 tap 中值，剔除最强 10% 信号 tap → floor）→ 循环每样本：②Stirrer `move_rel_and_wait`（等静止）+ 机械稳定 → ③**puschTargetSnrX10 微调伺服**（`gnb_pusch_target_snr(restart=False)`，CIR 峰值 tap 功率作 RSSP，误差>容差按 ±step 调，最多 N 次）→ ④**手机定时记录窗**（`/agent/session` 下发 per-sample plan[settle, dwell, 0] + `/agent/rearm`，轮询 phase 精确卡 LOADED 边界；同 runId 汇入同一 run）→ ⑤窗口结束立即抓 CIR，**按 floor+margin 过滤 taps**，算 RMS/平均延迟、tap 数、峰值 + 窗口内 gNB 汇总（goodput/BLER）→ 写 `rc_samples` 表 + 原始 JSON（`raw/rc/<run>/sample_XXX.json`，含 servo_log）。 |
 | `backend/db.py` | 新表 `rc_samples`（stirrer 角度、pusch_x10、RSSP/误差、底噪、原始/过滤 tap 数与延迟、窗口时间戳、servo_log、gnb_summary）。 |
 | `backend/api.py` | `GET /api/stirrer/status`、`POST /api/stirrer/{connect,disconnect,move,stop}`、`POST /api/rc/campaign/{start,stop}`、`GET /api/rc/campaign/status`、`GET /api/rc/samples`。 |
-| `web/src/pages/Chamber.tsx` + `App.tsx` | 新导航页 **Chamber RC**：搅拌器连接/手动步进（真实/模拟切换）、采集配置面板（步进角/样本数/dwell/目标 RSSP/容差/伺服参数/底噪帧数与余量）、实时日志轮询、样本历史表（含 gNB UL/BLER 列）。 |
+| `web/src/pages/Chamber.tsx` + `App.tsx` | **Experiments → RC 卡片 → RC Setup**：搅拌器连接/手动步进（真实/模拟切换）、采集配置面板（步进角/样本数/dwell/目标 RSSP/容差/伺服参数/底噪帧数与余量）、实时日志轮询、样本历史表（含 gNB UL/BLER 列）。 |
 
 **AC/RC 区分**：实验 `environment` 字段（前端已有 AC/RC 徽章）；RC 数据在 `rc_samples` 表（采样式），AC 数据在 phone_samples/clips（连续式）。
 
@@ -99,7 +101,9 @@
 | gNB | running ✅（192.168.31.119） |
 | CIR + 通信饱和并存 | ✅ 12.8–13.1 Mbps 实际饱和、4096 点 CIR 连续刷新、公网 0% 丢包、无 RLF/LCID4/max RETX |
 | RC campaign E2E | ✅ 2-step 首跑 + 1-step 热更新复核；原始 JSON、手机回拉、Chamber、Timeline 均通过 |
-| 自动测试 | ✅ 后端 53 passed；前端 tsc + Vite build；Android assembleDebug |
+| 页面分配 | ✅ AC/RC 统一在 Experiments；不同颜色卡片；统一 Create Experiment；RC Setup 仅从 RC 卡片进入 |
+| 记录与剪辑 | ✅ run 选择、独立时间轴、按 run 融合剪辑、保存列表和 CSV 下载；浏览器 E2E 已验证 |
+| 自动测试 | ✅ 后端 54 passed；前端 tsc + Vite build；Android assembleDebug |
 
 ---
 
@@ -123,6 +127,7 @@
 8. oai_channel_daemon(8091) 会缓存最后一帧 CIR；gNB scope 断开后 `ok:false`，graph 重新注册后自动恢复——排查先看 `graphs:[]`。
 9. 不得自动修改手机网络配置；只允许 ADB 启动/读取/临时测试流量和开关飞行模式。Android 后续只覆盖安装，不备份、不卸载、不走系统安装器。实验中拔 USB（开始监控前手机会提示）。
 10. Kotlin 编译用 `./gradlew.bat compileDebugKotlin -Dkotlin.compiler.execution.strategy=in-process`（沙箱限制 daemon 临时文件）。
+11. Timeline 与 clip 必须携带同一个 `run_id`；否则会把同一实验的多次 run 拼成超长时间轴，并可能把其他 run 的记录写进剪辑 CSV。
 
 ---
 
@@ -147,4 +152,5 @@ python -c "from experiment_platform.backend.stirrer import StirrerAgent; from ex
 - `POST /api/rc/campaign/start`（body: experimentId + §2.6 配置面板全部字段）
 - `GET /api/rc/campaign/status?experiment_id=` / `GET /api/rc/samples?experiment_id=`
 - `POST /api/phone/pull`（body: experimentId/runId/serial）· `GET /api/phone/tasks?serial=`
+- `GET /api/experiments/{id}/timeline?run_id=`（查看单次 run 记录）
 - `POST /api/experiments/{id}/clip`（start_ms/end_ms 相对 t0）

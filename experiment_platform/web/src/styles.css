@@ -154,6 +154,9 @@ a { color: var(--accent); }
 .card .card-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .card .card-header h2 { margin: 0; font-size: 15.5px; font-weight: 700; }
 .card .card-header .card-sub { color: var(--faint); font-size: 12px; margin-top: 2px; }
+.experiment-card { box-shadow: var(--shadow-sm); border-top-width: 4px; }
+.experiment-card.ac { border-top-color: var(--accent); background: linear-gradient(180deg, var(--accent-soft), var(--panel) 42%); }
+.experiment-card.rc { border-top-color: var(--warn); background: linear-gradient(180deg, var(--warn-soft), var(--panel) 42%); }
 
 /* ---- page hero / header ---- */
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }

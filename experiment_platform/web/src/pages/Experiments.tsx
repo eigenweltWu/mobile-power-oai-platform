@@ -556,7 +556,7 @@ export default function Experiments({ nav }: { nav: (p: string) => void }) {
       <div className="page-head">
         <div>
           <div className="title">Experiments</div>
-          <div className="subtitle">create tasks, push them to the phone and run the downlink loop</div>
+          <div className="subtitle">create and manage AC / RC experiments, records and clips</div>
         </div>
         <div className="row gap-sm">
           <button className="btn" onClick={detectPhone}>Check Phone</button>
@@ -589,13 +589,13 @@ export default function Experiments({ nav }: { nav: (p: string) => void }) {
         ) : (
           <div className="grid cols-2">
             {data?.map((x) => (
-              <div key={x.experiment_id} className="card" style={{ boxShadow: 'var(--shadow-sm)' }}>
+              <div key={x.experiment_id} className={`card experiment-card ${x.environment === 'RC' ? 'rc' : 'ac'}`}>
                 <div className="card-header">
                   <div>
                     <h2 className="mono" style={{ fontSize: 14 }}>{x.experiment_id}</h2>
                     <div className="card-sub">{fmtIso(x.created_utc)}</div>
                   </div>
-                  <Badge tone={x.environment === 'AC' || x.environment === 'RC' ? 'accent' : 'muted'}>{x.environment ?? '—'}</Badge>
+                  <Badge tone={x.environment === 'RC' ? 'warn' : x.environment === 'AC' ? 'accent' : 'muted'}>{x.environment ?? '—'}</Badge>
                 </div>
                 <div className="kv" style={{ fontSize: 13 }}>
                   <dt>purpose</dt>
@@ -609,7 +609,11 @@ export default function Experiments({ nav }: { nav: (p: string) => void }) {
                   <button className="btn sm" disabled={busy !== null} onClick={() => openEditor(x)}>Edit</button>
                   <button className="btn sm" disabled={busy !== null} onClick={() => push(x)}>Push</button>
                   <button className="btn sm primary" disabled={busy !== null} onClick={() => runExperiment(x)}>Run</button>
-                  <button className="btn sm" disabled={busy !== null} onClick={() => openResult(x)}>Result</button>
+                  {x.environment === 'RC' && (
+                    <button className="btn sm" disabled={busy !== null}
+                      onClick={() => nav(`/experiments/${encodeURIComponent(x.experiment_id)}/rc`)}>RC Setup</button>
+                  )}
+                  <button className="btn sm" disabled={busy !== null} onClick={() => openResult(x)}>Records & Clips</button>
                   <button className="btn sm" disabled={busy !== null} onClick={() => doExport(x)}>Export</button>
                   <button className="btn sm danger" disabled={busy !== null} onClick={() => setDeleteTarget(x)}>Delete</button>
                 </div>
@@ -791,8 +795,9 @@ export default function Experiments({ nav }: { nav: (p: string) => void }) {
                           </Badge>
                         )}
                       </div>
-                      <button className="btn sm" style={{ marginTop: 8 }} onClick={() => nav(`/timeline/${encodeURIComponent(r.experiment_id)}`)}>
-                        View detail →
+                      <button className="btn sm" style={{ marginTop: 8 }}
+                        onClick={() => nav(`/timeline/${encodeURIComponent(r.experiment_id)}/${encodeURIComponent(r.run_id)}`)}>
+                        View records & clip →
                       </button>
                     </div>
                   ))}

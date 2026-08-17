@@ -1,4 +1,5 @@
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -60,3 +61,24 @@ def test_campaign_restores_initial_target_without_restart():
     campaign.oai.gnb_pusch_target_snr.assert_called_once_with(
         "auto", None, restart=False)
     assert campaign.pusch_x10 == 200
+
+
+def test_phone_window_waits_for_idle_before_rearm(monkeypatch):
+    campaign = RcCampaign.__new__(RcCampaign)
+    campaign.cfg = RcConfig({"settle_s": 0, "dwell_s": 0})
+    campaign._stop = threading.Event()
+    campaign.log = []
+    agent = Mock()
+    agent.status.side_effect = [
+        {"phase": "LOADED"}, {"phase": "IDLE"},
+        {"phase": "LOADED"}, {"phase": "IDLE"},
+    ]
+    agent.rearm.return_value = {"ok": True}
+    campaign._phone = lambda: nullcontext((agent, None))
+    monkeypatch.setattr("experiment_platform.backend.rc_flow.time.sleep", lambda _: None)
+
+    result = campaign.trigger_phone_window({"runId": "rc-run"})
+
+    assert result is not None
+    assert agent.status.call_count == 4
+    agent.rearm.assert_called_once()

@@ -65,6 +65,31 @@ def _insert_config(db: Database, run_id: str):
                (run_id, "after", "MOCK/after.json", "abc"))
 
 
+def test_clear_history_files_is_scoped_and_requires_empty_database(tmp_path):
+    mgr, db, s = _make_manager(tmp_path)
+    for directory in (s.raw_dir, s.processed_dir, s.data_dir / "staging", s.data_dir / "phone_backup"):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "old.txt").write_text("old", encoding="utf-8")
+    tools_file = s.data_dir / "tools" / "keep.txt"
+    tools_file.parent.mkdir()
+    tools_file.write_text("keep", encoding="utf-8")
+
+    mgr.create_experiment("still-present", "AC")
+    try:
+        mgr.clear_history_files()
+        assert False, "history cleanup must reject a non-empty database"
+    except ValueError:
+        pass
+    mgr.delete_experiment("still-present")
+
+    result = mgr.clear_history_files()
+    assert result == {"ok": True, "removed_files": 4}
+    assert tools_file.read_text(encoding="utf-8") == "keep"
+    assert s.raw_dir.is_dir() and s.processed_dir.is_dir()
+    assert not (s.data_dir / "staging").exists()
+    assert not (s.data_dir / "phone_backup").exists()
+
+
 def test_full_synthetic_dry_run(tmp_path):
     mgr, db, s = _make_manager(tmp_path)
 

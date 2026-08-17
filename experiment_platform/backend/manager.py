@@ -339,6 +339,36 @@ class ExperimentManager:
         return {"ok": True, "experiment_id": experiment_id,
                 "deleted_runs": len(run_ids), "removed_files": removed}
 
+    def clear_history_files(self) -> dict:
+        """Remove orphaned experiment artifacts after the database is empty."""
+        import shutil
+
+        if self.db.query_one("SELECT 1 FROM experiments LIMIT 1") or \
+                self.db.query_one("SELECT 1 FROM runs LIMIT 1"):
+            raise ValueError("delete all experiments before clearing history files")
+
+        data_root = self.settings.data_dir.resolve()
+        targets = (
+            self.settings.raw_dir,
+            self.settings.processed_dir,
+            self.settings.data_dir / "staging",
+            self.settings.data_dir / "phone_backup",
+        )
+        removed_files = 0
+        for target in targets:
+            resolved = target.resolve()
+            try:
+                resolved.relative_to(data_root)
+            except ValueError as exc:
+                raise ValueError(f"history path escapes data directory: {resolved}") from exc
+            if resolved.exists():
+                removed_files += sum(1 for path in resolved.rglob("*") if path.is_file())
+                shutil.rmtree(resolved)
+
+        self.db.execute("DELETE FROM files")
+        self.settings.ensure_dirs()
+        return {"ok": True, "removed_files": removed_files}
+
     # ------------------------------------------------------------------ utils
     def _transition(self, run_id: str, to: str, note: str = "") -> None:
         cur = self.db.get_run(run_id)

@@ -347,10 +347,23 @@ def delete_experiment(experiment_id: str):
     loop = flow.downlinks.pop(experiment_id, None)
     if loop:
         loop.stop()
+    flow._stop_collectors(experiment_id)
+    # Reuse the complete Run cleanup so deleting an Experiment also removes
+    # raw gNB/CIR/RC files instead of leaving unindexed history on disk.
+    for row in _db.query("SELECT run_id FROM runs WHERE experiment_id=?", (experiment_id,)):
+        flow.discard_run(row["run_id"])
     try:
         return _manager.delete_experiment(experiment_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+
+@app.delete("/api/history")
+def clear_history():
+    try:
+        return _manager.clear_history_files()
+    except ValueError as e:
+        raise HTTPException(409, str(e))
 
 
 # --------------------------------------------------------------------------- #

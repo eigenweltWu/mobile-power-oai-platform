@@ -289,6 +289,18 @@ class RcCampaign(threading.Thread):
         sample_plan["collectionSeconds"] = self.cfg.dwell_s
         try:
             with self._phone() as (agent, _ph):
+                # The normal experiment plan may still be in its initial
+                # LOADED phase while noise calibration and the first stirrer
+                # move finish. Rearm is valid only from IDLE, so wait instead
+                # of silently dropping the first RC sample.
+                idle_deadline = time.monotonic() + 150.0
+                while time.monotonic() < idle_deadline and not self._stop.is_set():
+                    if agent.status().get("phase") == "IDLE":
+                        break
+                    time.sleep(0.4)
+                else:
+                    self._say("phone", "phone never returned to IDLE — sample window lost")
+                    return None
                 agent.session(sample_plan)
                 r = agent.rearm()
                 if not r.get("ok"):
@@ -462,7 +474,7 @@ class RcCampaign(threading.Thread):
 
                 self.state = "finalizing"
                 self.finalize_sample(i + 1, angle, window, servo_log, noise)
-                self.samples_done = i + 1
+                self.samples_done += 1
                 self._say("campaign", f"sample {i + 1} stored @ {angle:.1f}°")
         finally:
             try:
@@ -470,7 +482,8 @@ class RcCampaign(threading.Thread):
             except Exception:
                 pass
             self.restore_pusch_target()
-        self.state = "stopped" if self._stop.is_set() else "completed"
+        self.state = ("stopped" if self._stop.is_set() else
+                      ("completed" if self.samples_done == self.cfg.n_steps else "incomplete"))
         self._say("campaign", f"campaign {self.state} — {self.samples_done} samples")
 
     def stop(self) -> None:

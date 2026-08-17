@@ -187,6 +187,8 @@ class DownlinkLoop:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=12)
 
     def _resolve_agent(self):
         """Return (PhoneAgent, None) when a 5G PDU IP is known, else (None, None).
@@ -294,13 +296,13 @@ class DownlinkLoop:
             r = agent.sync_confirm(pc_ts, gnb_ts, self.plan)
             if not r.get("ok"):
                 return
-            self.sync_confirmed = True
-            self.last_sync_confirm = r
             # record the sync_confirm ack row (carries the gNB data timestamp)
             self.db.execute(
                 "INSERT INTO experiment_acks(experiment_id,run_id,seq,direction,pc_send_ms,phone_recv_ms,phone_send_ms,pc_recv_ms,rtt_ms,gnb_data_timestamp_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (self.experiment_id, self.run_id, -1, "sync_confirm", pc_ts,
                  r.get("phone_timestamp_ms"), None, None, None, gnb_ts))
+            self.sync_confirmed = True
+            self.last_sync_confirm = r
             if self.run_id:
                 self.db.transition(self.run_id, "ARMED", "phone sync-confirm received")
                 self.db.transition(self.run_id, "RUNNING", "phone armed after handshake")
@@ -363,6 +365,51 @@ class TaskFlow:
         for c in self.collectors.pop(experiment_id, []):
             c.stop()
             c.join(timeout=5)
+
+    def discard_run(self, run_id: str) -> dict:
+        """Delete a Run that never reached the phone, including its indexed data."""
+        path_columns = (
+            ("oai_snapshots", "raw_json_path"), ("oai_events", "raw_json_path"),
+            ("oai_channel", "raw_json_path"), ("oai_config", "config_json_path"),
+            ("clips", "output_path"), ("rc_samples", "raw_json_path"),
+        )
+        paths: set[str] = set()
+        for table, column in path_columns:
+            paths.update(r[column] for r in self.db.query(
+                f"SELECT {column} FROM {table} WHERE run_id=? AND {column} IS NOT NULL", (run_id,)))
+        # Imported/processed phone files are indexed separately and include
+        # the Run ID in their path even though the files table has no run_id.
+        paths.update(r["file_path"] for r in self.db.query("SELECT file_path FROM files")
+                     if run_id in Path(r["file_path"]).parts or run_id in Path(r["file_path"]).name)
+
+        for table in ("phone_samples", "oai_snapshots", "oai_events", "oai_channel", "oai_config",
+                      "sync_anchors", "run_transitions", "clips", "rc_samples"):
+            self.db.execute(f"DELETE FROM {table} WHERE run_id=?", (run_id,))
+        self.db.execute("DELETE FROM experiment_acks WHERE run_id=?", (run_id,))
+        self.db.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
+
+        root = self.s.data_dir.resolve()
+        removed_files = 0
+        for value in paths:
+            still_referenced = any(self.db.query_one(
+                f"SELECT 1 FROM {table} WHERE {column}=? LIMIT 1", (value,))
+                for table, column in path_columns)
+            if still_referenced:
+                continue
+            self.db.execute("DELETE FROM files WHERE file_path=?", (value,))
+            try:
+                path = Path(value).resolve()
+                path.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed_files += 1
+            except OSError:
+                pass
+        return {"discarded": True, "discard_reason": "sync_confirm not completed",
+                "removed_files": removed_files}
 
     # ---- OAI templates ----------------------------------------------------- #
     def list_templates(self, experiment_id: str) -> list[dict]:
@@ -676,16 +723,16 @@ class TaskFlow:
                 "sync_pending": True, "run_id": run_id, "shake": shake}
 
     def stop_experiment(self, experiment_id: str, serial: str = "53616213",
-                        pc_port: int = 8420) -> dict:
+                        pc_port: int = 8420, requested_run_id: Optional[str] = None) -> dict:
         """Complete stop: downlink loop + phone stop_task + gNB stop + run transition.
 
-        Mirrors the /api/runs/{run_id}/stop flow so both stop entry points
-        (by experiment_id and by run_id) do the full teardown — the phone
+        Both stop entry points (by experiment_id and by run_id) route here
+        for the full teardown — the phone
         receives the stop command (records its stop timestamp) and the gNB
         is shut down, not just the downlink loop.
         """
         loop = self.downlinks.pop(experiment_id, None)
-        run_id = loop.run_id if loop else None
+        run_id = loop.run_id if loop else requested_run_id
         if loop:
             loop.stop()
         # Stop the OAI research collectors FIRST (before the gNB goes down) so
@@ -697,21 +744,28 @@ class TaskFlow:
             # and the dashboard switches back to the start button.
             row = self.db.query_one(
                 "SELECT run_id FROM runs WHERE experiment_id=? "
-                "AND state IN ('PREPARING','ARMED','RUNNING') ORDER BY rowid DESC LIMIT 1",
+                "AND state IN ('PREPARING','WAITING_GNB','SYNCING_PHONE','ARMED','PHONE_OFFLINE',"
+                "'RUNNING','WAITING_PHONE_RETURN','IMPORTING','ALIGNING') "
+                "ORDER BY rowid DESC LIMIT 1",
                 (experiment_id,))
             run_id = row["run_id"] if row else None
+        synchronized = bool(run_id and self.db.query_one(
+            "SELECT 1 FROM experiment_acks WHERE run_id=? AND direction='sync_confirm' "
+            "UNION SELECT 1 FROM run_transitions WHERE run_id=? AND to_state='ARMED' LIMIT 1",
+            (run_id, run_id)))
         stop_ms = int(time.time() * 1000)
         # Post-state provenance (config snapshot after the run).
-        if run_id:
+        if run_id and synchronized:
             try:
                 save_config_provenance(run_id, "after", self.s, self.db, self.oai)
             except Exception:
                 pass
 
         # 1. PC stop ACK row
-        self.db.execute(
-            "INSERT INTO experiment_acks(experiment_id,run_id,seq,direction,pc_send_ms,phone_recv_ms,phone_send_ms,pc_recv_ms,rtt_ms) VALUES(?,?,?,?,?,?,?,?,?)",
-            (experiment_id, run_id, -1, "pc_stop", stop_ms, None, None, None, None))
+        if synchronized:
+            self.db.execute(
+                "INSERT INTO experiment_acks(experiment_id,run_id,seq,direction,pc_send_ms,phone_recv_ms,phone_send_ms,pc_recv_ms,rtt_ms) VALUES(?,?,?,?,?,?,?,?,?)",
+                (experiment_id, run_id, -1, "pc_stop", stop_ms, None, None, None, None))
 
         # 2. Tell the phone to stop (records the phone-side stop timestamp)
         phone_stop_ms = None
@@ -729,10 +783,20 @@ class TaskFlow:
             pass
 
         # 4. Mark the run STOPPED
-        if run_id:
+        discarded = False
+        discard_reason = None
+        removed_files = 0
+        if run_id and synchronized:
             self.db.execute("UPDATE runs SET ended_utc_ms=? WHERE run_id=?", (stop_ms, run_id))
             self.db.transition(run_id, "STOPPED", "stopped by user", utc_ms=stop_ms)
-        return {"ok": True, "pc_stop_ms": stop_ms, "phone_stop_ms": phone_stop_ms, "run_id": run_id}
+        elif run_id:
+            result = self.discard_run(run_id)
+            discarded = True
+            discard_reason = result["discard_reason"]
+            removed_files = result["removed_files"]
+        return {"ok": True, "pc_stop_ms": stop_ms, "phone_stop_ms": phone_stop_ms,
+                "run_id": run_id, "discarded": discarded, "discard_reason": discard_reason,
+                "removed_files": removed_files}
 
     # ---- push / phone inventory ------------------------------------------- #
     def push_task(self, experiment_id: str, serial: str, pc_port: int = 8420) -> dict:

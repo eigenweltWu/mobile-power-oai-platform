@@ -7,6 +7,13 @@
 
 ## 0. 2026-08-17 本轮续作结果
 
+### 0.2 未完成对时的 Run 自动舍弃（最新）
+
+- 平台历史保留逻辑现与手机一致：Run 停止时只有存在持久化 `sync_confirm`（兼容旧流程时为已进入 `ARMED`）才保留为 `STOPPED`；普通 downlink ACK、shake 时间样本或仅创建了平台 Run 均不算完成对时，因为手机此时尚未接收 Run ID。
+- 未完成对时即停止时返回 `discarded=true` / `discard_reason=sync_confirm not completed`，并删除 Run、transitions、ACK/sync anchors、phone/gNB/CIR、配置 provenance、RC samples、saved clips，以及 data 目录内不再被其他 Run 引用的索引文件。Dashboard 明确提示“未完成对时，本次实验已舍弃”，且不会伪显示为 STOPPED 历史。
+- `/api/experiments/{id}/stop` 与 `/api/runs/{id}/stop` 已统一进入同一个停止实现，删除了后者原有的重复逻辑，避免旧入口绕过舍弃规则。停止前会等待 DownlinkLoop 退出，`sync_confirm` 证据也改为先落库再设置内存状态，避免停止与握手并发时误删。
+- 验证：后端 **58 passed**；新增覆盖未对时清理、已对时保留、指定 Run 停止不可绕过三种场景；前端 TypeScript + Vite production build 通过。
+
 ### 0.1 Experiments UX / 信息架构重构（最新）
 
 - Experiments 列表已缩为配置/回顾入口：AC/RC 颜色区分卡片、搜索、环境筛选、排序、12 条分页；卡片仅展示身份、用途、人员、创建时间、Configuration/Run 数、最近结果/活动，主操作只有 **Manage Experiment**，导出/删除收进 More。
@@ -115,7 +122,7 @@
 | RC campaign E2E | ✅ 2-step 首跑 + 1-step 热更新复核；原始 JSON、手机回拉、Chamber、Timeline 均通过 |
 | 页面分配 | ✅ AC/RC 统一在 Experiments；不同颜色卡片；统一 Create Experiment；RC Setup 仅从 RC 卡片进入 |
 | 记录与剪辑 | ✅ run 选择、独立时间轴、按 run 融合剪辑、保存列表和 CSV 下载；浏览器 E2E 已验证 |
-| 自动测试 | ✅ 后端 56 passed；前端 tsc + Vite build；Android assembleDebug（本轮无 Android 改动，未重装） |
+| 自动测试 | ✅ 后端 58 passed；前端 tsc + Vite build；Android assembleDebug（本轮无 Android 改动，未重装） |
 
 ---
 

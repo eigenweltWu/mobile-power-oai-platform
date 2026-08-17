@@ -303,16 +303,16 @@ export default function Dashboard() {
     if (!eid) { toast('err', '没有可停止的实验'); return; }
     setStopping(true);
     try {
-      const r = await api.post<{ pc_stop_ms?: number; phone_stop_ms?: number }>(
+      const r = await api.post<{ pc_stop_ms?: number; phone_stop_ms?: number; discarded?: boolean }>(
         `/api/experiments/${encodeURIComponent(eid)}/stop`, {});
       const parts: string[] = [];
       if (r.pc_stop_ms) parts.push(`PC ${new Date(r.pc_stop_ms).toLocaleTimeString()}`);
       if (r.phone_stop_ms) parts.push(`手机 ${new Date(r.phone_stop_ms).toLocaleTimeString()}`);
-      toast('ok', parts.length ? `已停止·${parts.join('，')}` : '已停止');
+      toast('ok', r.discarded ? '未完成对时，本次实验已舍弃' : (parts.length ? `已停止·${parts.join('，')}` : '已停止'));
       // Optimistic update: flip to the start button immediately (the stop
       // request itself may take seconds while the backend probes the phone).
       setStatus((prev) => (prev && prev.experiment.latest_run
-        ? { ...prev, experiment: { latest_run: { ...prev.experiment.latest_run, state: 'STOPPED' } } }
+        ? { ...prev, experiment: { latest_run: r.discarded ? null : { ...prev.experiment.latest_run, state: 'STOPPED' } } }
         : prev));
       setThpHistory([]);
       loadStatus();

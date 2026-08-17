@@ -405,42 +405,10 @@ def stop_run(run_id: str):
     run = _db.get_run(run_id)
     if not run:
         raise HTTPException(404, "run not found")
-    experiment_id = run["experiment_id"]
-    serial = run.get("device_id") or "53616213"
-    stop_ms = int(time.time() * 1000)
-    res = {"ok": True, "pc_stop_ms": stop_ms}
-
-    # 1. Stop the downlink loop + record pc_stop ACK
-    try:
-        _flow().stop_experiment(experiment_id)
-        res["downlink_stopped"] = True
-    except Exception as e:
-        res["downlink_stopped"] = False
-        res["downlink_error"] = str(e)
-
-    # 2. Stop OAI collectors
     _manager.stop_collectors(run_id)
-    res["collectors_stopped"] = True
-
-    # 3. Tell the phone to stop (record phone stop timestamp)
-    try:
-        with _flow()._phone(serial) as (agent, _ph):
-            pr = agent.stop_task()
-            res["phone_stop_ms"] = pr.get("stopUtcMs")
-    except Exception as e:
-        res["phone_stop_error"] = str(e)
-
-    # 4. Stop the gNB
-    try:
-        _oai.gnb_service("stop")
-        res["gnb_stopped"] = True
-    except Exception as e:
-        res["gnb_stopped"] = False
-        res["gnb_error"] = str(e)
-
-    # 5. Mark the run STOPPED
-    _db.transition(run_id, "STOPPED", "stopped by user", utc_ms=stop_ms)
-    return res
+    return _flow().stop_experiment(
+        run["experiment_id"], run.get("device_id") or "53616213",
+        requested_run_id=run_id)
 
 
 @app.post("/api/runs/{run_id}/import")

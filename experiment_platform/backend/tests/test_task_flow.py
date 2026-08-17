@@ -115,11 +115,9 @@ def test_start_experiment_no_condition_creates_default(tmp_path):
     db.close()
 
 
-def test_start_then_stop_marks_run_stopped(tmp_path):
-    """Regression: after stop_experiment the run MUST leave the active state
-    (PREPARING/ARMED/RUNNING) — otherwise the dashboard keeps showing the
-    stop button and a stale 'running' badge after reload. Works even when the
-    phone is unreachable (USB unplugged, no 5G PDU link)."""
+def test_start_then_stop_discards_unconfirmed_run(tmp_path):
+    """A Run stopped before sync-confirm never reached the phone and must not
+    survive as platform history. Its indexed/raw platform data is discarded."""
     from experiment_platform.backend.task_flow import TaskFlow
 
     s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
@@ -143,11 +141,21 @@ def test_start_then_stop_marks_run_stopped(tmp_path):
     res = flow.start_experiment("EXP3", "53616213")
     rid = res["run_id"]
     assert db.get_run(rid)["state"] == "PREPARING"
+    raw = s.raw_dir / "oai" / "channel" / f"{rid}__1.json"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    raw.write_text("{}", encoding="utf-8")
+    db.record_file(raw)
+    db.execute(
+        "INSERT INTO oai_channel(run_id,fetched_utc_ms,raw_json_path) VALUES(?,?,?)",
+        (rid, 1, str(raw)))
 
-    # stop with the phone completely unreachable — must still mark STOPPED
-    flow.stop_experiment("EXP3", "53616213")
-    assert db.get_run(rid)["state"] == "STOPPED"
-    # the dashboard's active-run query no longer matches it
+    result = flow.stop_experiment("EXP3", "53616213")
+    assert result["discarded"] is True
+    assert result["discard_reason"] == "sync_confirm not completed"
+    assert db.get_run(rid) is None
+    assert db.query("SELECT * FROM oai_channel WHERE run_id=?", (rid,)) == []
+    assert db.query("SELECT * FROM run_transitions WHERE run_id=?", (rid,)) == []
+    assert not raw.exists()
     active = db.query(
         "SELECT run_id FROM runs WHERE state IN ('PREPARING','ARMED','RUNNING')")
     assert all(r["run_id"] != rid for r in active)
@@ -157,6 +165,38 @@ def test_start_then_stop_marks_run_stopped(tmp_path):
     assert res2["run_id"] != rid
     assert db.get_run(res2["run_id"])["state"] == "PREPARING"
     flow.stop_experiment("EXP3", "53616213")
+    db.close()
+
+
+def test_stop_keeps_run_after_sync_confirm(tmp_path):
+    """Once sync-confirm is durable, stopping retains the Run as history."""
+    flow, db, _oai, _tid = _make_template_flow(tmp_path)
+    result = flow.start_experiment("EXP3", "53616213")
+    rid = result["run_id"]
+    db.execute(
+        "INSERT INTO experiment_acks(experiment_id,run_id,seq,direction,pc_send_ms) "
+        "VALUES(?,?,?,?,?)", ("EXP3", rid, -1, "sync_confirm", 1000))
+
+    stopped = flow.stop_experiment("EXP3", "53616213")
+    assert stopped["discarded"] is False
+    assert db.get_run(rid)["state"] == "STOPPED"
+    assert db.query_one(
+        "SELECT 1 FROM experiment_acks WHERE run_id=? AND direction='pc_stop'", (rid,))
+    db.close()
+
+
+def test_stop_by_run_id_uses_same_discard_rule(tmp_path, monkeypatch):
+    """The legacy /runs/{id}/stop path must not bypass the sync-confirm rule."""
+    flow, db, _oai, _tid = _make_template_flow(tmp_path)
+    db.upsert_run({"run_id": "DRAFT1", "experiment_id": "EXP3", "condition_id": "C1",
+                   "state": "DRAFT"})
+    agent = _patch_phone(flow, {"status": {}}, monkeypatch)
+    agent.stop_task.return_value = {"stopUtcMs": 1234}
+
+    result = flow.stop_experiment("EXP3", requested_run_id="DRAFT1")
+    assert result["discarded"] is True
+    assert result["phone_stop_ms"] == 1234
+    assert db.get_run("DRAFT1") is None
     db.close()
 
 

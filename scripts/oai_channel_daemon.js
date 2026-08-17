@@ -13,13 +13,17 @@
 //   - peakDb      : strongest tap power (dB, |h|^2)
 //   - noiseDb     : estimated noise floor (median of |h|^2)
 const http = require('http');
+const net = require('net');
 
 const CTRL = 'http://127.0.0.1:8090/oaisoftmodem/scopectrl/';
 const WS = 'ws://127.0.0.1:8090/softscope';
 const LISTEN_PORT = parseInt(process.env.OAI_CHANNEL_PORT || '8091', 10);
 const LISTEN_HOST = process.env.OAI_CHANNEL_HOST || '0.0.0.0';
+const WEBSRV_WARMUP_MS = parseInt(process.env.OAI_WEBSRV_WARMUP_MS || '10000', 10);
+// OAI's raw `refrate` value counts 100 ms scope-manager ticks.
+const SCOPE_REFRESH_TICKS = Math.max(10, parseInt(process.env.OAI_SCOPE_REFRESH_TICKS || '50', 10));
 
-const NFFT = 4096;       // ofdm_symbol_size for 106 PRB @ 30 kHz
+const NFFT = 4096;       // ofdm_symbol_size for 273 PRB @ 30 kHz
 const SCS_HZ = 30000;    // subcarrier spacing
 const DT_NS = 1e9 / (NFFT * SCS_HZ); // ~8.138 ns per time-domain sample
 
@@ -101,9 +105,38 @@ async function ctrlPost(name, value, graphid = 0) {
 
 let ws = null;
 let restartTimer = null;
+let websrvReachableSince = 0;
+
+function probeWebsrv() {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port: 8090 });
+    const finish = (ok) => { socket.destroy(); resolve(ok); };
+    socket.setTimeout(1000);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
 
 async function connect() {
   try {
+    // OAI starts listening before its websrv routes and module tables finish
+    // registering. An HTTP request in that short window falls through to the
+    // generic commands callback and can segfault nr-softmodem. Probe TCP only,
+    // then give websrv a quiet warm-up period before the first HTTP request.
+    if (!(await probeWebsrv())) {
+      websrvReachableSince = 0;
+      latest = { ...latest, ok: false, error: 'gNB websrv unavailable' };
+      scheduleRestart();
+      return;
+    }
+    if (!websrvReachableSince) websrvReachableSince = Date.now();
+    const warmupRemaining = WEBSRV_WARMUP_MS - (Date.now() - websrvReachableSince);
+    if (warmupRemaining > 0) {
+      latest = { ...latest, ok: false, error: `gNB websrv warming up (${warmupRemaining} ms)` };
+      scheduleRestart();
+      return;
+    }
     const desc = await (await fetch(CTRL)).json();
     const graphs = desc.graphs || [];
     const cir = graphs.filter((g) => (g.title || '').includes('Impulse Response'));
@@ -120,7 +153,7 @@ async function connect() {
     ws.onopen = async () => {
       try {
         const cmds = [
-          ['TargetSelect', '0'], ['refrate', '10'], ['DataAck', 'false'],
+          ['TargetSelect', '0'], ['refrate', String(SCOPE_REFRESH_TICKS)], ['DataAck', 'false'],
           ['xmin', '-32767'], ['xmax', '32767'], ['ymin', '-32767'], ['ymax', '32767'],
           ['llrythresh', '5'], ['llrxmin', '0'], ['llrxmax', '200000'],
         ];
@@ -167,8 +200,13 @@ async function connect() {
     };
 
     ws.onerror = () => { latest = { ...latest, ok: false, error: 'ws error' }; };
-    ws.onclose = () => { latest = { ...latest, ok: false }; scheduleRestart(); };
+    ws.onclose = () => {
+      websrvReachableSince = 0;
+      latest = { ...latest, ok: false };
+      scheduleRestart();
+    };
   } catch (e) {
+    websrvReachableSince = 0;
     latest = { ...latest, ok: false, error: String(e && e.message) };
     scheduleRestart();
   }

@@ -37,6 +37,33 @@ class TemplateSwitchNotAllowed(ValueError):
     """Template switch rejected: the active run is not in an IDLE phase."""
 
 
+def quiesce_phone(serial: str, on: bool) -> bool:
+    """Best-effort airplane toggle over USB adb AROUND a forced gNB restart.
+
+    The OAI build asserts and the gNB container dies (exit 134,
+    get_searchspace()) whenever a UE performs RRC re-establishment with stale
+    modem context — exactly what a phone does when its gNB goes away for a
+    restart and comes back before the phone has cycled its radio. Toggling
+    airplane mode first clears the modem context so the post-restart attach
+    is a FRESH registration (RRC Setup) instead of re-establishment. In real
+    over-the-air experiments USB is unplugged, quiesce is skipped and the
+    phone's own 60 s no-signal airplane recovery covers the gap.
+    """
+    try:
+        from .phone_channel import AdbTransport
+        transport = AdbTransport()
+        if serial not in transport.devices():
+            return False
+        val = "1" if on else "0"
+        state = "true" if on else "false"
+        transport.shell(serial, f"settings put global airplane_mode_on {val}")
+        transport.shell(
+            serial, f"am broadcast -a android.intent.action.AIRPLANE_MODE_CHANGED --ez state {state}")
+        return True
+    except Exception:
+        return False
+
+
 def build_phases(idle_seconds: float = DEFAULT_IDLE_SECONDS,
                  collection_seconds: float = DEFAULT_COLLECTION_SECONDS) -> list[dict]:
     """Compose the idle→loaded→idle plan for the phone."""
@@ -382,7 +409,17 @@ class TaskFlow:
 
         # force_restart: the template's RF conditions only take effect on a
         # REAL gNB restart — the phone then re-runs idle → loaded → idle.
-        result = self.oai.apply_condition(cfg, force_restart=True)
+        # Quiesce the phone first: a stale-context re-establishment against
+        # the returning gNB crashes it (see quiesce_phone).
+        quiesced = quiesce_phone(serial, True)
+        if quiesced:
+            time.sleep(2.0)
+        try:
+            result = self.oai.apply_condition(cfg, force_restart=True)
+        finally:
+            if quiesced:
+                quiesce_phone(serial, False)
+                time.sleep(8.0)
 
         # The gNB just restarted — the UE re-registers (usually with a NEW
         # PDU address). Re-resolve it via /shake and sync clocks before the
@@ -502,12 +539,22 @@ class TaskFlow:
         #    replaced. The UE re-registers on its own afterwards — we never
         #    block waiting for it here.
         gnb_ready = False
+        # Clear the phone modem's context BEFORE the restart (see
+        # quiesce_phone) — otherwise its RRC re-establishment against the
+        # returning gNB trips the get_searchspace() assert and kills the gNB.
+        quiesced = quiesce_phone(serial, True)
+        if quiesced:
+            time.sleep(2.0)  # let the modem release the PDU session
         try:
             result = self.oai.apply_condition(initial or {}, force_restart=True)
             gnb_ready = True
         except Exception as e:
             self.db.transition(run_id, "ERROR", f"start_experiment: gNB restart failed: {e}")
             raise
+        finally:
+            if quiesced:
+                quiesce_phone(serial, False)
+                time.sleep(8.0)  # fresh registration + PDU session before shake
 
         # 3. Verify gNB + UE in-sync
         st = self.oai.status()

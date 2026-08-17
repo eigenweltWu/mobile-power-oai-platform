@@ -22,6 +22,51 @@ function Write-Step([string]$msg) {
     Write-Host "=== $msg ===" -ForegroundColor Cyan
 }
 
+# ---- 0. 定位 Java ----------------------------------------------------------
+# 优先使用现有 JAVA_HOME；否则查找仓库内免安装 JDK（.tools/jdk-*）和常见
+# 系统安装位置。这样新机器无需管理员权限也能通过 Gradle wrapper 自举。
+function Find-JavaHome {
+    $cands = @()
+    if ($env:JAVA_HOME) { $cands += $env:JAVA_HOME }
+    $cands += Get-ChildItem (Join-Path $ROOT '.tools') -Directory -Filter 'jdk-*' -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        Select-Object -ExpandProperty FullName
+    $cands += Get-ChildItem 'C:\Program Files\Microsoft' -Directory -Filter 'jdk-*' -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        Select-Object -ExpandProperty FullName
+    $cands += Get-ChildItem 'C:\Program Files\Java' -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        Select-Object -ExpandProperty FullName
+    foreach ($c in $cands) {
+        if ($c -and (Test-Path (Join-Path $c 'bin\java.exe'))) { return $c }
+    }
+    return $null
+}
+
+$javaHome = Find-JavaHome
+if ($javaHome) {
+    $env:JAVA_HOME = $javaHome
+    $env:Path = "$(Join-Path $javaHome 'bin');$env:Path"
+}
+
+function Find-AndroidSdk {
+    $cands = @()
+    if ($env:ANDROID_SDK_ROOT) { $cands += $env:ANDROID_SDK_ROOT }
+    if ($env:ANDROID_HOME) { $cands += $env:ANDROID_HOME }
+    $cands += Join-Path $ROOT '.tools\android-sdk'
+    $cands += "$env:LOCALAPPDATA\Android\Sdk"
+    foreach ($c in $cands) {
+        if ($c -and (Test-Path (Join-Path $c 'platforms'))) { return $c }
+    }
+    return $null
+}
+
+$androidSdk = Find-AndroidSdk
+if ($androidSdk) {
+    $env:ANDROID_HOME = $androidSdk
+    $env:ANDROID_SDK_ROOT = $androidSdk
+}
+
 # ---- 0. 定位 adb -----------------------------------------------------------
 function Find-Adb {
     $cands = @()
@@ -59,13 +104,20 @@ function Invoke-Gradle([string[]]$GradleArgs) {
         & gradle @GradleArgs
         return
     }
-    throw "未找到 gradle；请安装或用 Android Studio 打开 android/"
+    $wrapper = Join-Path $ROOT 'android\gradlew.bat'
+    if (Test-Path $wrapper) {
+        & $wrapper @GradleArgs
+        return
+    }
+    throw "未找到 gradle/gradle wrapper；请安装 Gradle 或用 Android Studio 打开 android/"
 }
 
 $adb = Find-Adb
 $gradleLib = Find-GradleLib
 
 Write-Host "adb       : $adb" -ForegroundColor DarkGray
+Write-Host "java home : $javaHome" -ForegroundColor DarkGray
+Write-Host "android sdk: $androidSdk" -ForegroundColor DarkGray
 Write-Host "gradle lib: $gradleLib" -ForegroundColor DarkGray
 
 # ---- 2. 构建前端 -----------------------------------------------------------
@@ -103,6 +155,9 @@ if (-not $NoInstall -and -not $SkipAndroid) {
         if ($serial) {
             Write-Step "安装 APK 到 $serial"
             & $adb -s $serial install -r $apk
+            if ($LASTEXITCODE -ne 0) {
+                throw "APK 安装失败（exit=$LASTEXITCODE）；如果是签名不匹配，请先导出手机数据，再手动卸载旧 App"
+            }
             # 运行时权限
             & $adb -s $serial shell pm grant com.xjtlu.energyagent android.permission.READ_PHONE_STATE 2>$null | Out-Null
             & $adb -s $serial shell pm grant com.xjtlu.energyagent android.permission.WRITE_SECURE_SETTINGS 2>$null | Out-Null
@@ -126,11 +181,25 @@ if (-not $NoBackendRestart) {
         Select-Object -ExpandProperty OwningProcess -Unique
     foreach ($p in $pids) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2
-    Start-Process powershell -ArgumentList @(
-        '-NoExit', '-Command',
-        "cd '$ROOT'; python -m uvicorn experiment_platform.backend.api:app --host 127.0.0.1 --port 8900 --log-level warning"
-    )
-    Write-Host "后端已在新窗口启动: http://127.0.0.1:8900" -ForegroundColor Green
+    $logDir = Join-Path $ROOT 'experiment_platform\data\logs'
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $backend = Start-Process -FilePath 'python' -ArgumentList @(
+        '-m', 'uvicorn', 'experiment_platform.backend.api:app',
+        '--host', '127.0.0.1', '--port', '8900', '--log-level', 'warning'
+    ) -WorkingDirectory $ROOT -WindowStyle Hidden -PassThru `
+      -RedirectStandardOutput (Join-Path $logDir 'backend.stdout.log') `
+      -RedirectStandardError (Join-Path $logDir 'backend.stderr.log')
+    $ready = $false
+    foreach ($i in 1..30) {
+        Start-Sleep -Milliseconds 500
+        if (Get-NetTCPConnection -LocalPort 8900 -State Listen -ErrorAction SilentlyContinue) {
+            $ready = $true
+            break
+        }
+        if ($backend.HasExited) { break }
+    }
+    if (-not $ready) { throw "后端未在端口 8900 就绪，请查看 $logDir" }
+    Write-Host "后端已在后台启动: http://127.0.0.1:8900 (PID $($backend.Id))" -ForegroundColor Green
 }
 
 Write-Host ""

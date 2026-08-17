@@ -24,6 +24,8 @@ def run(cli, cmd: str, timeout: int = 60) -> str:
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     cli = connect()
     try:
         cmds = Path(sys.argv[1]).read_text(encoding="utf-8") if len(sys.argv) > 1 else None

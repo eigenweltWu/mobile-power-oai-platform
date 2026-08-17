@@ -27,13 +27,13 @@ const OAI_FIELDS: OaiFieldDef[] = [
   { key: 'mcs', label: 'MCS', type: 'number' },
   { key: 'qm', label: 'Qm', type: 'number' },
   { key: 'nPrb', label: 'N_PRB', type: 'number' },
-  { key: 'ulTrafficMbps', label: 'UL Traffic Saturation (Mbps)', type: 'number' },
+  { key: 'ulTrafficMbps', label: 'UL Traffic (Mbps; ≥100 = saturation)', type: 'number' },
 ];
 
 /** UL Mbps at or above this threshold means "saturate the link" (the phone
  *  switches its workload engine from UL_CBR to UL_SATURATION). */
 const UL_SATURATION_THRESHOLD_MBPS = 100;
-const UL_TRAFFIC_DEFAULT_MBPS = 999;
+const UL_TRAFFIC_DEFAULT_MBPS = 5;
 
 function emptyOaiConfig(): Record<string, string> {
   const c: Record<string, string> = {};
@@ -97,7 +97,7 @@ const DEFAULT_TEMPLATE_CONFIG: Record<string, unknown> = {
   puschTargetMode: 'manual',
   puschTargetSnrX10: 89,
   schedulerMode: 'auto',
-  ulTrafficMbps: UL_TRAFFIC_DEFAULT_MBPS, // ≥100 → phone runs UL saturation
+  ulTrafficMbps: UL_TRAFFIC_DEFAULT_MBPS, // safe CBR default; ≥100 explicitly requests saturation
 };
 
 /** Qm → (modulation, feasible MCS range) for the UL scheduler. */

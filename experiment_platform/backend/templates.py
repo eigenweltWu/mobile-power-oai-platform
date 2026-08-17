@@ -2,12 +2,12 @@
 
 ``ulTrafficMbps`` appears in every template's fixed list: the UL traffic
 setting shipped to the phone inside the sync-confirm plan. Values at or
-above UL_SATURATION_THRESHOLD_MBPS switch the phone workload engine to
-UL saturation (blast); lower values pace UL CBR at that rate."""
+above UL_SATURATION_THRESHOLD_MBPS explicitly request UL saturation
+(blast); the safe default is paced UL CBR."""
 from __future__ import annotations
 
 UL_SATURATION_THRESHOLD_MBPS = 100.0
-UL_TRAFFIC_DEFAULT_MBPS = 999.0  # default = saturation
+UL_TRAFFIC_DEFAULT_MBPS = 5.0  # safe default; saturation is explicit (>= 100)
 
 TEMPLATES = {
     "AC_SIGNAL_SWEEP": {

@@ -91,16 +91,27 @@ class WorkloadEngine(private val context: Context) {
 
         try {
             if (mode == Mode.UL_CBR) {
-                // target bits/sec -> packets/sec
+                // Pace in 10 ms bursts. Coroutine delay has millisecond
+                // granularity, so one-packet sleeps cap the old implementation
+                // near 8 Mbps regardless of a 10/20/50 Mbps request. A bounded
+                // burst preserves the requested average without busy-spinning.
                 val targetBps = targetMbps * 1_000_000.0
-                val pktPerSec = (targetBps / 8.0 / payloadSize).coerceAtLeast(1.0)
-                val intervalMs = (1000.0 / pktPerSec).toLong().coerceAtLeast(1)
+                val windowNs = 10_000_000L
+                val packetsPerWindow =
+                    (targetBps / 8.0 / payloadSize * windowNs / 1e9)
+                        .toInt().coerceIn(1, 512)
+                var nextWindowNs = System.nanoTime()
                 while (true) {
-                    val t0 = System.nanoTime()
-                    socket.send(packet)
-                    val elapsed = (System.nanoTime() - t0) / 1_000_000
-                    val wait = intervalMs - elapsed
-                    if (wait > 0) delay(wait)
+                    repeat(packetsPerWindow) { socket.send(packet) }
+                    nextWindowNs += windowNs
+                    val waitNs = nextWindowNs - System.nanoTime()
+                    if (waitNs > 0) {
+                        delay((waitNs / 1_000_000L).coerceAtLeast(1L))
+                    } else if (waitNs < -10L * windowNs) {
+                        // Do not accumulate an unbounded catch-up burst after
+                        // a scheduler pause or temporary radio stall.
+                        nextWindowNs = System.nanoTime()
+                    }
                 }
             } else {
                 // saturation: send as fast as possible

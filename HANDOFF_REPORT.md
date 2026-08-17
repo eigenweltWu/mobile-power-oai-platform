@@ -10,12 +10,15 @@
 - 已安装/准备 `deploy.ps1` 所需依赖：Python 包、前端 npm 依赖、Microsoft JDK 17、Android command-line tools/platform/build-tools、Gradle wrapper；免安装工具位于被忽略的 `.tools/`。
 - `deploy.ps1` 已支持自动发现仓库内 JDK/Android SDK、Gradle wrapper、自检后台后端启动，以及 APK 安装失败显式退出。本轮因手机已有 APK 签名不同，未卸载、未覆盖手机数据。
 - 平台后端已在 `127.0.0.1:8900` 运行并加载 RC/Stirrer 新端点；模拟搅拌器 connect → +5° move → disconnect API 冒烟通过。
-- OAI 修复提交：`a405868 fix(gNB): stabilize scope and RRC reestablishment`。修复 webscope 启动/并发崩溃、重配置期间 SearchSpace 断言，以及 RRC 重建时因 `lc_config` 排序导致 DRB LCID 4 未恢复的问题。
-- CIR daemon 增加 websrv 10 秒安静预热和 TCP 探测，并将采样刷新默认设为 50 个 100 ms tick（约 5 秒）。进一步改为按需采集：服务保持 active，但空闲时不连 webscope；`GET /channel` 激活采集，无请求 15 秒后自动断开；`GET /status` 只读且不激活。
-- 当前 OAI 验证：清理历史 UE 上下文后，gNB running、核心网 10/10、UE in-sync；AMF `5GMM-REGISTERED`、SMF `PDU_SESSION_ACTIVE`、UE IPv4 `10.0.1.8`。按需 daemon 空闲状态下 RLF/RRC 重建/LCID4 ignore/assert/exit 均为 0；手机此前已由操作者确认可正常上网。
-- 最终测试：后端 `50 passed`；前端生产构建成功；Android `assembleDebug` 成功。
-- 手机操作约束：除开关飞行模式外不得修改手机。本轮确认网络恢复后没有执行任何手机端命令；ADB 枚举状态曾为 `offline`，不影响当前 OAI 用户面验证。
-- 尚未完成：RC campaign 的手机端完整 E2E。需要操作者在手机 App 主动进入监控模式后才能验证；当前约束下自动化端不得启动 App、授权、清数据或改其他设置。
+- `a405868 fix(gNB): stabilize scope and RRC reestablishment` 经 Git 对比与日志回放确认引入了 RLC/DRB 恢复回归，已由 `fb7f126` 完整回滚；不要恢复该提交。未验证的第一次 CIR 草案保留在远端 `stash@{0}`，仅供审计，不应应用。
+- OAI 新修复 `6c9e006 fix(scope): snapshot UL CIR outside the PUSCH hot path`：为 Web CIR 预分配双缓冲，Web 刷新周期原子请求一次，下一次 antenna-0 PUSCH 只做一次有界 `memcpy` 后原子发布；不再在每个 PUSCH 上分配、加锁和轮换通用 scope buffer，原生 XForms scope 行为保持不变。
+- CIR daemon 保持约 5 秒刷新和按需连接：`GET /channel` 激活采集，无请求 15 秒后断开；`GET /status` 只读。服务空闲不占用 webscope，激活后连续返回新鲜的 4096 点复数 CIR。
+- 当前 OAI：gNB running、核心网 10/10、UE in-sync；AMF `5GMM-REGISTERED`、SMF `PDU_SESSION_ACTIVE`、UE IPv4 `10.0.1.13`；scheduler=auto、PUSCH target=auto/20 dB。最近 5 分钟 RLF、RRC 重建、LCID4 ignore、SRB/DRB max RETX、assert/exit 均为 0。
+- 并存压力实测：4 路 ADB 临时 UDP 发送把当前无线链路压到约 **12.8–13.1 Mbps**（该链路的实际饱和点），同时 CIR 每 5 秒更新、手机公网 ping 25/25（0% 丢包）；结束时 UL BLER≈5.8%，上述故障计数均为 0。饱和时平均 RTT≈574 ms 是队列拥塞，不是 CIR 中断。
+- 平台防护：普通模板默认由 999 Mbps 饱和改为 **5 Mbps CBR**；只有显式配置 `ulTrafficMbps >= 100` 才请求饱和。手机计划序列化补齐 `idleSeconds`、`collectionSeconds`、`ulTrafficMbps`，UL CBR 改为 10 ms 有界突发节拍，解除旧实现约 8 Mbps 的单包延时上限。
+- 最终测试：后端 `50 passed`；前端生产构建与 Android `assembleDebug` 成功；前后端已由 `deploy.ps1 -SkipAndroid` 重部署（后端 PID 26800）。手机公网 ping 4/4、0% 丢包，App HTTP 状态可读且保持 IDLE。
+- 手机操作约束：只允许通过 ADB 启动 App、读状态、临时发测试流量，以及开关飞行模式；不得改 APN/DNS/路由或其他手机设置。本轮没有修改手机网络设置。
+- Android 新 APK 尚未安装：现有 App 与本地 debug keystore 签名不一致，`adb install -r` 返回 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。为保护现有数据没有卸载 App。要部署新 pacing/序列化代码，需找回原签名 keystore，或由操作者明确批准先导出数据再卸载重装。
 
 ---
 
@@ -40,10 +43,10 @@
 ### 2.1 版本管理 ✅
 两端工作文件夹已整理清理并提交；约定**每次修改+测试完成后 commit**。
 
-### 2.2 UDP UL/DL Traffic Saturation ✅ `5256f91`
+### 2.2 UDP UL/DL Traffic Saturation ✅ `5256f91` + 本轮修复
 - **OAI 端**（Linux 主机，独立仓库）：`NetworkTest` 类新增 UDP 协议 + Saturation 模式（尽可能快发包饱和链路），`start` 接收 `protocol`/`rate_mbps`；前端 `app/page.tsx` 增加协议选择与速率输入。
-- **平台端**：`templates.py` 所有模板 fixed 列表加入 `ulTrafficMbps`，默认 **999**（≥100 即触发手机端 UL saturation，低于则按值 CBR pacing）；`Experiments.tsx` 模板编辑增加该输入框。
-- 手机端 workload 引擎读取 plan 中的 `ulTrafficMbps`（SharedPreferences）。
+- **平台端**：`templates.py` 所有模板 fixed 列表加入 `ulTrafficMbps`；本轮将默认值改为安全的 **5 Mbps CBR**，≥100 才显式触发 UL saturation；`Experiments.tsx` 已同步标签与默认值。
+- 手机端 workload 引擎读取 plan 中的 `ulTrafficMbps`（SharedPreferences）。本轮修复 AgentServer 的 plan JSON 字段遗漏，并把 CBR pacing 改为 10 ms 有界 burst；代码已构建，但受签名不匹配阻挡，尚未覆盖安装到手机。
 
 ### 2.3 手机端：无 run_id 记录舍弃 ✅ `69cd7cf`
 - `AppDatabase.kt`：`SampleDao.deleteUnarmed` / `MarkerDao.deleteUnarmed`。
@@ -88,19 +91,20 @@
 | 模拟模式 open/move/position/status | ✅ |
 | 真实 USB 模式 | ⚠️ 本机 `MT_Check=-1`（控制器在混响室，未接本机）；`open()` 已改为 check 失败即干净报错 |
 | 前端 `npm run build`（tsc+vite） | ✅ |
-| **后端进程** | ⚠️ **仍在运行旧代码**（`/api/stirrer/*` 未加载）——需在启动后端的终端 Ctrl+C 重启 `python -m experiment_platform.backend.server`（agent 无法停止用户终端进程） |
-| 手机 | 已接 USB（adb 可见），`monitoring=false` ——需手动点"开始任务" |
+| **后端进程** | ✅ 已重部署新代码，`127.0.0.1:8900`，PID 26800 |
+| 手机 | ✅ USB/ADB online，App server 可读；当前 `IDLE`、`monitoring=false`，公网正常 |
 | gNB | running ✅（192.168.31.119） |
-| RC campaign E2E | ⏳ **未执行**（待上面两项完成后） |
+| CIR + 通信饱和并存 | ✅ 12.8–13.1 Mbps 实际饱和、4096 点 CIR 连续刷新、公网 0% 丢包、无 RLF/LCID4/max RETX |
+| RC campaign E2E | ⏳ **未执行**（需要 App 进入 monitoring；部署新 APK 还需原签名） |
 
 ---
 
 ## 4. 待办事项（迁移后从这里继续）
 
-1. **重启平台后端**加载新端点。
-2. **手机进入监控模式**（点"开始任务"）。
+1. **解决 Android 签名**：优先找回原签名 keystore；否则先完整导出 App 数据，并由操作者明确批准卸载/重装。不要直接卸载现有 App。
+2. **手机进入监控模式**（App 中点“开始任务”）。
 3. **RC 全流程验证并存档**（建议首跑参数）：
-   - 建一个 `environment=RC` 的实验 + 模板（含 `ulTrafficMbps:999`、固定 MCS 的 schedulerMode）；
+   - 建一个 `environment=RC` 的实验 + 模板（先用 `ulTrafficMbps:5`、schedulerMode=auto；需要压力实验时再显式改为 ≥100）；
    - 平台启动实验（gNB 强制重启→UE 回附着→shake 对时→sync-confirm→phone ARMED）；
    - Chamber 页启动采集：`simulate_stirrer=true, n_steps=2, step_deg=5, dwell_s=15~20, settle_s=5, noise_frames=10`；
    - 验证：`rc_samples` 两行（角度递增、RSSP 误差列、过滤 tap 数）、`raw/rc/<run>/sample_00X.json`、手机同 runId 样本含 LOADED 段、campaign status 到 `completed`；
@@ -118,9 +122,9 @@
 4. **实验期所有 live 通道（sync/phase/rearm/throughput）只走 5G PDU，禁 USB 回退**；USB 仅实验后数据同步，且用独立端口 10420。
 5. **每次实验启动强制 gNB 真重启**（apply_condition force_restart=True，校验 startedAt 变化）；重启后 UE 换 PDU IP，靠 `/api/shake` 重解析。
 6. **TaskFlow._phone() yield 元组** `(PhoneAgent, detection)`——`as (agent, ph)` 解包，否则 AttributeError 被吞成 unknown。
-7. 后端改代码后**必须重启进程**才生效；agent 沙箱停不掉用户终端起的进程（Access Denied）。
+7. 后端改代码后**必须重启进程**才生效；本轮 `deploy.ps1 -SkipAndroid` 已能完成重启与自检。
 8. oai_channel_daemon(8091) 会缓存最后一帧 CIR；gNB scope 断开后 `ok:false`，graph 重新注册后自动恢复——排查先看 `graphs:[]`。
-9. 手机 60s 无信号自动飞行模式 3s（可配置）；实验中拔 USB（开始监控前手机会提示）。
+9. 不得自动修改手机网络配置；只允许 ADB 启动/读取/临时测试流量和开关飞行模式。实验中拔 USB（开始监控前手机会提示）。
 10. Kotlin 编译用 `./gradlew.bat compileDebugKotlin -Dkotlin.compiler.execution.strategy=in-process`（沙箱限制 daemon 临时文件）。
 
 ---

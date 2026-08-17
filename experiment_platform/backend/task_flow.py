@@ -351,6 +351,8 @@ class TaskFlow:
         ev = EventCollector(run_id, self.s, self.db, self.oai, interval_s=2.0)
         # ChannelCollector persists complex-CIR multipath metrics + the raw
         # power-delay profile into oai_channel (feeds the Timeline CIR charts).
+        # The OAI producer now snapshots on demand, so continuous polling is
+        # safe for both AC and RC while RcCampaign still stores settled samples.
         ch = ChannelCollector(run_id, self.s, self.db, self.oai, interval_s=1.0)
         snap.start()
         ev.start()
@@ -484,8 +486,9 @@ class TaskFlow:
         # it (RunEntity) so later data exchange can match on it.
         run_id = f"{experiment_id}_r{int(time.time() * 1000)}"
         condition_id = f"{experiment_id}_default"
-        # UL traffic setting from the selected template (default 999 → the
-        # phone workload engine runs UL saturation; lower values pace CBR).
+        # UL traffic setting from the selected template. The default is paced
+        # CBR; saturation remains available only through an explicit >=100
+        # Mbps value so an ordinary experiment cannot destabilize the cell.
         ul_mbps = initial.get("ulTrafficMbps") if initial else None
         try:
             ul_mbps = float(ul_mbps) if ul_mbps is not None else UL_TRAFFIC_DEFAULT_MBPS

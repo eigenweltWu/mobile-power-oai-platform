@@ -119,6 +119,8 @@ class RcCampaign(threading.Thread):
         self.samples_done = 0
         self.current_angle_deg: Optional[float] = None
         self.pusch_x10: Optional[int] = None
+        self.initial_pusch_mode: Optional[str] = None
+        self.initial_pusch_x10: Optional[int] = None
         self.last_rssp_db: Optional[float] = None
         self.noise_floor_db: Optional[float] = None
         self.log: list[dict] = []
@@ -204,9 +206,8 @@ class RcCampaign(threading.Thread):
         # current setting from the OAI controls (authoritative)
         try:
             ctl = self.oai.gnb_controls()
-            cur = getattr(ctl, "pusch_target_snr_x10", None)
-            if cur is None and isinstance(getattr(ctl, "model_extra", None), dict):
-                cur = ctl.model_extra.get("puschTargetSnrX10")  # type: ignore[attr-defined]
+            target = getattr(ctl, "puschTarget", None)
+            cur = getattr(target, "targetSnrX10", None)
             if cur is not None:
                 self.pusch_x10 = int(cur)
         except Exception:
@@ -237,16 +238,38 @@ class RcCampaign(threading.Thread):
                 # restart=false ALWAYS: a per-sample gNB restart (~40 s, UE
                 # re-attach) would destroy the sampled measurement cadence.
                 r = self.oai.gnb_pusch_target_snr("manual", new_x10, restart=False)
+                if not r.get("runtimeApplied"):
+                    raise StirrerError(
+                        "PUSCH target update was not applied to the running gNB; "
+                        "refusing to record an invalid servo sample")
                 self.pusch_x10 = new_x10
                 log[-1]["applied_x10"] = new_x10
                 log[-1]["resp"] = str(r)[:200]
             except Exception as e:
                 log[-1]["apply_error"] = str(e)[:200]
                 self._say("servo", f"pusch apply failed: {e}")
-                return log
+                raise
             time.sleep(self.cfg.servo_settle_s)
         self._say("servo", "servo iterations exhausted — continuing with last setting")
         return log
+
+    def restore_pusch_target(self) -> None:
+        """Restore the campaign's initial power-control policy without restart."""
+        if self.initial_pusch_mode not in {"auto", "manual"}:
+            return
+        value = self.initial_pusch_x10 if self.initial_pusch_mode == "manual" else None
+        result = self.oai.gnb_pusch_target_snr(
+            self.initial_pusch_mode, value, restart=False)
+        changed = bool((result.get("target") or {}).get("effectiveChanged"))
+        if changed and not result.get("runtimeApplied"):
+            raise StirrerError(
+                "failed to restore the initial PUSCH target in the running gNB")
+        self.pusch_x10 = self.initial_pusch_x10
+        self._say(
+            "servo",
+            f"restored PUSCH target {self.initial_pusch_mode} / "
+            f"{(self.initial_pusch_x10 or 0) / 10:.1f} dB",
+        )
 
     def trigger_phone_window(self, plan: dict) -> Optional[dict]:
         """One timed record window: per-sample plan + rearm, then watch phases.
@@ -394,6 +417,16 @@ class RcCampaign(threading.Thread):
         if not plan:
             raise ValueError("downlink loop plan not found — start the experiment first")
 
+        try:
+            controls = self.oai.gnb_controls()
+            target = getattr(controls, "puschTarget", None)
+            self.initial_pusch_mode = getattr(target, "mode", None)
+            initial_x10 = getattr(target, "targetSnrX10", None)
+            self.initial_pusch_x10 = int(initial_x10) if initial_x10 is not None else None
+            self.pusch_x10 = self.initial_pusch_x10
+        except Exception as e:
+            raise StirrerError(f"cannot read initial PUSCH target: {e}") from e
+
         stirrer = StirrerAgent(self.s, simulate=self.cfg.simulate_stirrer,
                                speed_deg_s=self.cfg.stirrer_speed_deg_s)
         opened = stirrer.open()
@@ -402,11 +435,10 @@ class RcCampaign(threading.Thread):
             raise StirrerError(f"stirrer not available: {opened.get('error')} "
                                f"(enable 'simulate' for dry runs)")
 
-        self.state = "noise_calibration"
-        noise = self.calibrate_noise(stirrer)
-
-        angle = stirrer.position_deg() or 0.0
         try:
+            self.state = "noise_calibration"
+            noise = self.calibrate_noise(stirrer)
+            angle = stirrer.position_deg() or 0.0
             for i in range(self.cfg.n_steps):
                 if self._stop.is_set():
                     break
@@ -437,6 +469,7 @@ class RcCampaign(threading.Thread):
                 stirrer.close()
             except Exception:
                 pass
+            self.restore_pusch_target()
         self.state = "stopped" if self._stop.is_set() else "completed"
         self._say("campaign", f"campaign {self.state} — {self.samples_done} samples")
 

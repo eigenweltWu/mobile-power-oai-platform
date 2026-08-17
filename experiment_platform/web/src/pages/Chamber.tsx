@@ -100,10 +100,11 @@ export default function Chamber() {
 
   const loadExps = useCallback(async () => {
     try {
-      const r = await api.get<{ experiments: Exp[] }>('/api/experiments');
+      const r = await api.get<Exp[] | { experiments: Exp[] }>('/api/experiments');
       if (!mounted.current) return;
-      setExps(r.experiments || []);
-      const rc = (r.experiments || []).find((e) => e.environment === 'RC');
+      const experiments = Array.isArray(r) ? r : (r.experiments || []);
+      setExps(experiments);
+      const rc = experiments.find((e) => e.environment === 'RC');
       if (rc && !expId) setExpId(rc.experiment_id);
     } catch (e) { setError(e); }
   }, [expId]);

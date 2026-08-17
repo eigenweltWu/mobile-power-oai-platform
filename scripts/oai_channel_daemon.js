@@ -4,6 +4,8 @@
 // (ws://127.0.0.1:8090/softscope, chartid=5) and serves the latest CIR plus
 // multipath metrics as JSON over HTTP (default 0.0.0.0:8091). The platform
 // backend polls GET /channel and stores the result in the oai_channel table.
+// Scope capture is demand-driven: the websocket stays disconnected while no
+// client is polling, then closes after OAI_CHANNEL_IDLE_MS (default 15 s).
 //
 // The CIR is the complex time-domain channel estimate (gNBulDelay), so
 // metrics are the power-delay-profile derived:
@@ -20,6 +22,7 @@ const WS = 'ws://127.0.0.1:8090/softscope';
 const LISTEN_PORT = parseInt(process.env.OAI_CHANNEL_PORT || '8091', 10);
 const LISTEN_HOST = process.env.OAI_CHANNEL_HOST || '0.0.0.0';
 const WEBSRV_WARMUP_MS = parseInt(process.env.OAI_WEBSRV_WARMUP_MS || '10000', 10);
+const DEMAND_IDLE_MS = parseInt(process.env.OAI_CHANNEL_IDLE_MS || '15000', 10);
 // OAI's raw `refrate` value counts 100 ms scope-manager ticks.
 const SCOPE_REFRESH_TICKS = Math.max(10, parseInt(process.env.OAI_SCOPE_REFRESH_TICKS || '50', 10));
 
@@ -106,6 +109,13 @@ async function ctrlPost(name, value, graphid = 0) {
 let ws = null;
 let restartTimer = null;
 let websrvReachableSince = 0;
+let demandUntil = 0;
+let probeRunning = false;
+let connecting = false;
+
+function demanded() {
+  return Date.now() < demandUntil;
+}
 
 function probeWebsrv() {
   return new Promise((resolve) => {
@@ -119,6 +129,8 @@ function probeWebsrv() {
 }
 
 async function connect() {
+  if (!demanded() || ws || connecting) return;
+  connecting = true;
   try {
     // OAI starts listening before its websrv routes and module tables finish
     // registering. An HTTP request in that short window falls through to the
@@ -162,7 +174,9 @@ async function connect() {
         for (const g of graphs) {
           await ctrlPost('enabled', g.srvidx === cirIdx ? 'true' : 'false', g.srvidx);
         }
-        latest = { ...latest, ok: true, error: '', cirIdx };
+        // Do not report ok until a fresh CIR frame arrives. This prevents a
+        // new experiment from consuming a cached frame from an older run.
+        latest = { ...latest, ok: false, error: 'waiting for fresh CIR', cirIdx };
       } catch (e) {
         latest = { ...latest, ok: false, error: String(e && e.message) };
         scheduleRestart();
@@ -201,7 +215,7 @@ async function connect() {
 
     ws.onerror = () => { latest = { ...latest, ok: false, error: 'ws error' }; };
     ws.onclose = () => {
-      websrvReachableSince = 0;
+      ws = null;
       latest = { ...latest, ok: false };
       scheduleRestart();
     };
@@ -209,22 +223,77 @@ async function connect() {
     websrvReachableSince = 0;
     latest = { ...latest, ok: false, error: String(e && e.message) };
     scheduleRestart();
+  } finally {
+    connecting = false;
   }
 }
 
 function scheduleRestart() {
-  if (restartTimer) return;
+  if (restartTimer || !demanded()) return;
   restartTimer = setTimeout(() => {
     restartTimer = null;
     try { if (ws) ws.close(); } catch (_) { /* ignore */ }
+    ws = null;
     connect();
   }, 3000);
 }
 
+async function trackWebsrvReadiness() {
+  if (probeRunning) return;
+  probeRunning = true;
+  try {
+    if (await probeWebsrv()) {
+      if (!websrvReachableSince) websrvReachableSince = Date.now();
+    } else {
+      websrvReachableSince = 0;
+    }
+  } finally {
+    probeRunning = false;
+  }
+}
+
+function requestChannel() {
+  const wasIdle = !demanded();
+  demandUntil = Date.now() + DEMAND_IDLE_MS;
+  if (wasIdle) {
+    latest = {
+      ok: false, tsUtc: null, nSamples: 0, metrics: null,
+      cir: null, error: 'channel capture starting',
+    };
+  }
+  connect();
+}
+
+setInterval(() => {
+  trackWebsrvReadiness();
+  if (!demanded() && ws) {
+    if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
+    latest = { ...latest, ok: false, error: 'idle; request /channel to capture' };
+    const closing = ws;
+    ws = null;
+    try { closing.close(); } catch (_) { /* ignore */ }
+  }
+}, 1000);
+
 const server = http.createServer((req, res) => {
-  if (req.url === '/channel' || req.url === '/') {
+  const path = (req.url || '').split('?', 1)[0];
+  if (path === '/channel' || path === '/') {
+    requestChannel();
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify(latest));
+    return;
+  }
+  if (path === '/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      ok: true,
+      captureActive: demanded(),
+      websocketOpen: Boolean(ws),
+      websrvReady: websrvReachableSince > 0 && Date.now() - websrvReachableSince >= WEBSRV_WARMUP_MS,
+      latestTsUtc: latest.tsUtc,
+      latestOk: latest.ok,
+      latestError: latest.error,
+    }));
     return;
   }
   res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -233,5 +302,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.log(`oai_channel_daemon listening on http://${LISTEN_HOST}:${LISTEN_PORT}/channel`);
-  connect();
+  trackWebsrvReadiness();
 });

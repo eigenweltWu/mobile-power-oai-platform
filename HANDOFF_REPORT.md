@@ -11,8 +11,8 @@
 - `deploy.ps1` 已支持自动发现仓库内 JDK/Android SDK、Gradle wrapper、自检后台后端启动，以及 APK 安装失败显式退出。本轮因手机已有 APK 签名不同，未卸载、未覆盖手机数据。
 - 平台后端已在 `127.0.0.1:8900` 运行并加载 RC/Stirrer 新端点；模拟搅拌器 connect → +5° move → disconnect API 冒烟通过。
 - OAI 修复提交：`a405868 fix(gNB): stabilize scope and RRC reestablishment`。修复 webscope 启动/并发崩溃、重配置期间 SearchSpace 断言，以及 RRC 重建时因 `lc_config` 排序导致 DRB LCID 4 未恢复的问题。
-- CIR daemon 增加 websrv 10 秒安静预热和 TCP 探测，并将采样刷新默认设为 50 个 100 ms tick（约 5 秒）。当前服务 active，`/channel` 返回 4096 点 CIR。
-- 当前 OAI 验证：gNB running、核心网 10/10、UE in-sync；AMF `5GMM-REGISTERED`、SMF `PDU_SESSION_ACTIVE`、UE IPv4 `10.0.1.5`。最近 30 秒 RLF/RRC 重建/LCID4 ignore/assert/exit 均为 0；20 秒内 UPF SNAT 计数 529 → 592，手机已由操作者确认可正常上网。
+- CIR daemon 增加 websrv 10 秒安静预热和 TCP 探测，并将采样刷新默认设为 50 个 100 ms tick（约 5 秒）。进一步改为按需采集：服务保持 active，但空闲时不连 webscope；`GET /channel` 激活采集，无请求 15 秒后自动断开；`GET /status` 只读且不激活。
+- 当前 OAI 验证：清理历史 UE 上下文后，gNB running、核心网 10/10、UE in-sync；AMF `5GMM-REGISTERED`、SMF `PDU_SESSION_ACTIVE`、UE IPv4 `10.0.1.8`。按需 daemon 空闲状态下 RLF/RRC 重建/LCID4 ignore/assert/exit 均为 0；手机此前已由操作者确认可正常上网。
 - 最终测试：后端 `50 passed`；前端生产构建成功；Android `assembleDebug` 成功。
 - 手机操作约束：除开关飞行模式外不得修改手机。本轮确认网络恢复后没有执行任何手机端命令；ADB 枚举状态曾为 `offline`，不影响当前 OAI 用户面验证。
 - 尚未完成：RC campaign 的手机端完整 E2E。需要操作者在手机 App 主动进入监控模式后才能验证；当前约束下自动化端不得启动 App、授权、清数据或改其他设置。

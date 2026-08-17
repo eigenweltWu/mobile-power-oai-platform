@@ -233,22 +233,45 @@ def put_settings(payload: dict = Body(...)):
 # --------------------------------------------------------------------------- #
 @app.get("/api/experiments")
 def list_experiments():
-    return _db.query("SELECT * FROM experiments ORDER BY created_utc DESC")
+    return _db.query(
+        "SELECT e.*, "
+        "(SELECT COUNT(*) FROM oai_templates t WHERE t.experiment_id=e.experiment_id AND t.archived_utc IS NULL) AS configuration_count, "
+        "(SELECT COUNT(*) FROM runs r WHERE r.experiment_id=e.experiment_id) AS run_count, "
+        "(SELECT r.state FROM runs r WHERE r.experiment_id=e.experiment_id ORDER BY COALESCE(r.started_utc_ms,0) DESC,r.rowid DESC LIMIT 1) AS last_run_state, "
+        "(SELECT r.quality_status FROM runs r WHERE r.experiment_id=e.experiment_id ORDER BY COALESCE(r.started_utc_ms,0) DESC,r.rowid DESC LIMIT 1) AS last_quality_status, "
+        "(SELECT COALESCE(r.ended_utc_ms,r.started_utc_ms) FROM runs r WHERE r.experiment_id=e.experiment_id ORDER BY COALESCE(r.started_utc_ms,0) DESC,r.rowid DESC LIMIT 1) AS last_activity_utc_ms "
+        "FROM experiments e ORDER BY e.created_utc DESC")
 
 
 @app.post("/api/experiments")
 def create_experiment(payload: dict = Body(...)):
+    experiment_id = str(payload.get("experiment_id") or "").strip()
+    if not experiment_id:
+        raise HTTPException(422, "experiment_id is required")
+    if _db.query_one("SELECT 1 FROM experiments WHERE experiment_id=?", (experiment_id,)):
+        raise HTTPException(409, "experiment already exists")
     exp = _manager.create_experiment(
-        payload["experiment_id"], payload.get("environment", "AC"),
+        experiment_id, payload.get("environment", "AC"),
         payload.get("operator_name", ""), payload.get("notes", ""),
         payload.get("purpose", ""), payload.get("flow", ""),
         json.dumps(payload.get("initial_oai_config"), ensure_ascii=False) if payload.get("initial_oai_config") else None)
+    try:
+        config = payload.get("initial_oai_config") or templates.DEFAULT_OAI_CONFIGURATION
+        row = _flow().add_template(exp["experiment_id"], "Default", config)
+        _flow().set_default_template(exp["experiment_id"], row["id"])
+        exp = _db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (exp["experiment_id"],))
+        exp["default_configuration"] = row
+    except Exception as e:  # experiment exists; surface the partial failure explicitly
+        exp["configuration_error"] = str(e)
     return exp
 
 
 @app.get("/api/experiments/{experiment_id}/runs")
 def list_experiment_runs(experiment_id: str):
-    return _db.query("SELECT * FROM runs WHERE experiment_id=? ORDER BY planned_order", (experiment_id,))
+    return _db.query(
+        "SELECT * FROM runs WHERE experiment_id=? "
+        "ORDER BY COALESCE(started_utc_ms,planned_start_utc_ms,0) DESC,rowid DESC",
+        (experiment_id,))
 
 
 @app.get("/api/conditions")
@@ -300,12 +323,19 @@ def get_run(run_id: str):
         "SELECT note FROM run_transitions WHERE run_id=? AND to_state='FAILED' ORDER BY utc_ms DESC LIMIT 1",
         (run_id,))
     run["last_error"] = err_rows[0]["note"] if err_rows else None
+    run["record_counts"] = {
+        "phone": _db.query_one("SELECT COUNT(*) AS n FROM phone_samples WHERE run_id=?", (run_id,))["n"],
+        "gnb": _db.query_one("SELECT COUNT(*) AS n FROM oai_snapshots WHERE run_id=?", (run_id,))["n"],
+        "cir": _db.query_one("SELECT COUNT(*) AS n FROM oai_channel WHERE run_id=?", (run_id,))["n"],
+        "clips": _db.query_one("SELECT COUNT(*) AS n FROM clips WHERE run_id=?", (run_id,))["n"],
+    }
     return run
 
 
 @app.delete("/api/runs/{run_id}")
 def delete_run(run_id: str):
-    for t in ("phone_samples", "oai_snapshots", "oai_events", "sync_anchors", "run_transitions"):
+    for t in ("phone_samples", "oai_snapshots", "oai_events", "oai_channel", "oai_config",
+              "sync_anchors", "run_transitions", "clips", "rc_samples"):
         _db.execute(f"DELETE FROM {t} WHERE run_id=?", (run_id,))
     _db.execute("DELETE FROM runs WHERE run_id=?", (run_id,))
     return {"ok": True}
@@ -478,12 +508,34 @@ def list_templates(experiment_id: str):
 
 @app.post("/api/experiments/{experiment_id}/templates")
 def add_template(experiment_id: str, payload: dict = Body(...)):
-    return _flow().add_template(experiment_id, payload["name"], payload.get("config", {}))
+    try:
+        return _flow().add_template(experiment_id, payload["name"], payload.get("config", {}))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.put("/api/experiments/{experiment_id}/templates/{template_id}")
+def update_template(experiment_id: str, template_id: int, payload: dict = Body(...)):
+    try:
+        return _flow().update_template(experiment_id, template_id, payload["name"], payload.get("config", {}))
+    except ValueError as e:
+        raise HTTPException(404 if "not found" in str(e) else 409, str(e))
+
+
+@app.post("/api/experiments/{experiment_id}/templates/{template_id}/default")
+def set_default_template(experiment_id: str, template_id: int):
+    try:
+        return _flow().set_default_template(experiment_id, template_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
 
 
 @app.delete("/api/experiments/{experiment_id}/templates/{template_id}")
 def delete_template(experiment_id: str, template_id: int):
-    _flow().delete_template(experiment_id, template_id)
+    try:
+        _flow().delete_template(experiment_id, template_id)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
     return {"ok": True}
 
 

@@ -9,7 +9,10 @@ type Sample = { id: number; elapsed_realtime_ns: number; utc_epoch_ms: number | 
 type GnbSnapshot = { fetched_utc_ms: number; ul_goodput_mbps: number | null; dl_goodput_mbps: number | null };
 type ChannelMetric = { run_id: string; fetched_utc_ms: number; rms_delay_ns: number | null; k_factor_db: number | null; tap_count: number | null; peak_db: number | null; noise_db: number | null };
 type Cir = { dt_ns: number; n_samples: number; pdp: { tau_ns: number; power_db: number }[] };
-type Run = { run_id: string; state: string | null; started_utc_ms: number | null; ended_utc_ms: number | null };
+type Run = {
+  run_id: string; state: string | null; started_utc_ms: number | null; ended_utc_ms: number | null;
+  configuration_name?: string | null; quality_status?: string | null; requested_config_json?: string | null;
+};
 type ClipRow = { id: number; run_id: string | null; start_ms: number | null; end_ms: number | null; label: string | null; created_utc: string | null };
 
 type Segment = { id: number; start: number; end: number; label: string };
@@ -107,9 +110,9 @@ export default function Timeline({ experimentId, initialRunId = '', onBack }: {
     <div className="stack">
       <div className="page-head">
         <div>
-          <div className="title">历史结果 · {experimentId}</div>
+          <div className="title">Records & Clips · {experimentId}</div>
           <div className="subtitle">
-            fused timeline — t=0 = 首次对时{data?.t0_source ? `（${data.t0_source}）` : ''}，单位秒，手机/gNB 关键时间戳已标注
+            Run {runId || '—'} · Configuration {selectedRun?.configuration_name || (selectedRun?.requested_config_json ? 'recorded snapshot' : 'snapshot unavailable')} · fused timeline, t=0 = first clock sync{data?.t0_source ? ` (${data.t0_source})` : ''}
           </div>
         </div>
         <div className="row gap-sm">
@@ -122,10 +125,13 @@ export default function Timeline({ experimentId, initialRunId = '', onBack }: {
         </div>
       </div>
 
-      <Card title="Run record" sub={runId || 'No run selected'}>
+      <Card title="Run context" sub={`${experimentId} / ${runId || 'No run selected'}`}>
         {selectedRun ? (
           <div className="row gap-sm">
-            <Badge tone={selectedRun.state === 'STOPPED' || selectedRun.state === 'COMPLETE' ? 'good' : 'muted'}>{selectedRun.state ?? '—'}</Badge>
+            <span className="mono">Experiment {experimentId}</span>
+            <span className="mono">Run {selectedRun.run_id}</span>
+            <span>Configuration <b>{selectedRun.configuration_name || (selectedRun.requested_config_json ? 'Recorded snapshot' : 'Snapshot unavailable')}</b></span>
+            <Badge tone={selectedRun.quality_status === 'PASS' || selectedRun.state === 'STOPPED' || selectedRun.state === 'COMPLETE' ? 'good' : 'muted'}>{selectedRun.quality_status || selectedRun.state || '—'}</Badge>
             <span className="mono">phone {samples.length}</span>
             <span className="mono">gNB {gnb.length}</span>
             <span className="mono">CIR {channel.length}</span>

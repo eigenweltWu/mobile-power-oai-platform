@@ -1,960 +1,327 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import type { Dispatch, FormEvent, SetStateAction } from 'react';
 import { api, downloadFile } from '../api';
-import type { Experiment, PlatformStatus } from '../types';
-import { Badge, Card, EmptyState, ErrorBox, Field, FullScreenLoader, Modal, Spinner, StaticValue, toast } from '../components/ui';
+import type { Experiment, Run } from '../types';
+import { Badge, Card, EmptyState, ErrorBox, Field, Modal, Spinner, StaticValue, toast } from '../components/ui';
 import { useLoad } from '../components/DataView';
-import { fmtIso } from '../format';
+import { fmtIso, fmtTs } from '../format';
 
-type Template = { id: number; experiment_id: string; name: string; config_json: string; created_utc: string };
-type Run = { run_id: string; state: string; experiment_id: string; condition_id: string; quality_status: string | null };
-
-/** Phone adb serial is fixed by the rig; users must not edit it. */
-const PHONE_SERIAL = '53616213';
+type ExperimentSummary = Experiment & {
+  configuration_count?: number; run_count?: number; last_run_state?: string | null;
+  last_quality_status?: string | null; last_activity_utc_ms?: number | null;
+};
+type Configuration = {
+  id: number; experiment_id: string; name: string; config_json: string; created_utc: string;
+  updated_utc?: string | null; is_default?: number; used_by_runs?: number;
+};
+type RunDetail = Run & {
+  requested_config?: Record<string, unknown> | null; actual_config?: Record<string, unknown> | null;
+  configuration_name?: string | null; last_error?: string | null;
+  record_counts?: { phone: number; gnb: number; cir: number; clips: number };
+};
+type ConfigEditor = { id: number | null; name: string; config: Record<string, string>; original: string };
+type DetailTab = 'overview' | 'configurations' | 'history';
 
 const EMPTY_FORM = { experiment_id: '', environment: 'AC', operator_name: '', notes: '', purpose: '', flow: '' };
+const PAGE_SIZE = 12;
+const RUN_PAGE_SIZE = 15;
+const DEFAULT_CONFIGURATION: Record<string, unknown> = {
+  frequencyMHz: 3349.92, bandwidthMHz: 100, txGainDb: 60, rxGainDb: 40,
+  puschTargetMode: 'manual', puschTargetSnrX10: 89, schedulerMode: 'auto', ulTrafficMbps: 5,
+};
+const CONFIG_KEYS = ['frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb', 'puschTargetMode', 'puschTargetSnrX10', 'schedulerMode', 'qm', 'mcs', 'nPrb', 'ulTrafficMbps'];
+const QM_OPTIONS = [{ value: '2', label: '2 · QPSK' }, { value: '4', label: '4 · 16QAM' }, { value: '6', label: '6 · 64QAM' }, { value: '8', label: '8 · 256QAM' }];
+const QM_MCS_RANGE: Record<string, { min: number; max: number }> = { '2': { min: 0, max: 9 }, '4': { min: 10, max: 16 }, '6': { min: 17, max: 27 }, '8': { min: 28, max: 31 } };
 
-/** Complete set of OAI configurable properties (backend apply_condition keys). */
-type OaiFieldDef = { key: string; label: string; type: 'number' | 'select'; options?: string[] };
-
-const OAI_FIELDS: OaiFieldDef[] = [
-  { key: 'frequencyMHz', label: 'Frequency (MHz)', type: 'number' },
-  { key: 'bandwidthMHz', label: 'Bandwidth (MHz)', type: 'number' },
-  { key: 'txGainDb', label: 'TX gain (dB)', type: 'number' },
-  { key: 'rxGainDb', label: 'RX gain (dB)', type: 'number' },
-  { key: 'puschTargetMode', label: 'PUSCH target mode', type: 'select', options: ['auto', 'manual'] },
-  { key: 'puschTargetSnrX10', label: 'PUSCH target SNR (×10)', type: 'number' },
-  { key: 'schedulerMode', label: 'Scheduler mode', type: 'select', options: ['auto', 'manual'] },
-  { key: 'mcs', label: 'MCS', type: 'number' },
-  { key: 'qm', label: 'Qm', type: 'number' },
-  { key: 'nPrb', label: 'N_PRB', type: 'number' },
-  { key: 'ulTrafficMbps', label: 'UL Traffic (Mbps; ≥100 = saturation)', type: 'number' },
-];
-
-/** UL Mbps at or above this threshold means "saturate the link" (the phone
- *  switches its workload engine from UL_CBR to UL_SATURATION). */
-const UL_SATURATION_THRESHOLD_MBPS = 100;
-const UL_TRAFFIC_DEFAULT_MBPS = 5;
-
-function emptyOaiConfig(): Record<string, string> {
-  const c: Record<string, string> = {};
-  for (const f of OAI_FIELDS) c[f.key] = '';
-  return c;
+function parseConfig(json: string | null | undefined): Record<string, unknown> {
+  try { return json ? JSON.parse(json) ?? {} : {}; } catch { return {}; }
 }
-
-function configJsonToForm(configJson: string): Record<string, string> {
-  const form = emptyOaiConfig();
-  let obj: Record<string, unknown> = {};
-  try {
-    obj = JSON.parse(configJson) ?? {};
-  } catch {
-    /* invalid JSON -> all fields empty */
-  }
-  for (const f of OAI_FIELDS) {
-    const v = obj[f.key];
-    if (v !== undefined && v !== null) form[f.key] = String(v);
-  }
-  // ensure manual-mode sub-fields always have concrete values (no blanks)
-  if (form.puschTargetMode === 'manual' && !form.puschTargetSnrX10) form.puschTargetSnrX10 = '89';
-  if (form.schedulerMode === 'manual') {
-    if (!form.qm) form.qm = '2';
-    if (!form.mcs) form.mcs = '0';
-    if (!form.nPrb) form.nPrb = '273';
-  }
-  if (!form.ulTrafficMbps) form.ulTrafficMbps = String(UL_TRAFFIC_DEFAULT_MBPS);
-  return form;
-}
-
-function formToConfigObject(form: Record<string, string>): Record<string, unknown> {
-  const cfg: Record<string, unknown> = {};
-  for (const f of OAI_FIELDS) {
-    const v = form[f.key];
-    if (v === undefined || v === '') continue;
-    if (f.type === 'number') {
-      const n = Number(v);
-      cfg[f.key] = Number.isFinite(n) ? n : v;
-    } else {
-      cfg[f.key] = v;
-    }
-  }
-  return cfg;
-}
-
-function configSummary(configJson: string): { key: string; label: string; value: string }[] {
-  const form = configJsonToForm(configJson);
-  const out: { key: string; label: string; value: string }[] = [];
-  for (const f of OAI_FIELDS) {
-    if (form[f.key] !== '') out.push({ key: f.key, label: f.label, value: form[f.key] });
-  }
+function configForm(config: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of CONFIG_KEYS) out[key] = config[key] == null ? '' : String(config[key]);
+  if (!out.puschTargetMode) out.puschTargetMode = 'auto';
+  if (!out.schedulerMode) out.schedulerMode = 'auto';
+  if (!out.ulTrafficMbps) out.ulTrafficMbps = '5';
   return out;
 }
-
-/** Config every experiment gets by default (the "Default" template) — fully explicit. */
-const DEFAULT_TEMPLATE_CONFIG: Record<string, unknown> = {
-  frequencyMHz: 3349.92,
-  bandwidthMHz: 100,
-  txGainDb: 60,
-  rxGainDb: 40,
-  puschTargetMode: 'manual',
-  puschTargetSnrX10: 89,
-  schedulerMode: 'auto',
-  ulTrafficMbps: UL_TRAFFIC_DEFAULT_MBPS, // safe CBR default; ≥100 explicitly requests saturation
-};
-
-/** Qm → (modulation, feasible MCS range) for the UL scheduler. */
-const QM_OPTIONS = [
-  { value: '2', label: '2 · QPSK' },
-  { value: '4', label: '4 · 16QAM' },
-  { value: '6', label: '6 · 64QAM' },
-  { value: '8', label: '8 · 256QAM' },
-];
-const QM_MCS_RANGE: Record<string, { min: number; max: number }> = {
-  '2': { min: 0, max: 9 },
-  '4': { min: 10, max: 16 },
-  '6': { min: 17, max: 27 },
-  '8': { min: 28, max: 31 },
-};
-function mcsRangeHint(qm: string): string {
-  const r = QM_MCS_RANGE[qm];
-  return r ? `MCS ${r.min}–${r.max}` : 'select Qm';
-}
-
-/** Compare a template's config_json with the experiment's initial_oai_config. */
-function configsEqual(a: string | null | undefined, b: string): boolean {
-  if (!a) return false;
-  let oa: unknown = a;
-  let ob: unknown = b;
-  try {
-    oa = JSON.parse(a);
-  } catch {
-    /* raw string */
-  }
-  try {
-    ob = JSON.parse(b);
-  } catch {
-    /* raw string */
-  }
-  return JSON.stringify(oa) === JSON.stringify(ob);
-}
-
-/** Build the config object from the form, honouring auto/manual modes. */
-function buildTemplateConfig(c: Record<string, string>): Record<string, unknown> {
-  const num = (k: string): unknown => {
-    const v = c[k];
-    if (v === undefined || v === '') return undefined;
-    const n = Number(v);
-    return Number.isFinite(n) ? n : v;
+function buildConfig(form: Record<string, string>): Record<string, unknown> {
+  const number = (key: string) => Number(form[key]);
+  const config: Record<string, unknown> = {
+    frequencyMHz: number('frequencyMHz'), bandwidthMHz: number('bandwidthMHz'), txGainDb: number('txGainDb'), rxGainDb: number('rxGainDb'),
+    puschTargetMode: form.puschTargetMode, schedulerMode: form.schedulerMode, ulTrafficMbps: number('ulTrafficMbps'),
   };
-  const cfg: Record<string, unknown> = {
-    frequencyMHz: num('frequencyMHz'),
-    bandwidthMHz: num('bandwidthMHz'),
-    txGainDb: num('txGainDb'),
-    rxGainDb: num('rxGainDb'),
-    puschTargetMode: c.puschTargetMode || 'auto',
-    schedulerMode: c.schedulerMode || 'auto',
-  };
-  if (cfg.puschTargetMode === 'manual') {
-    const snr = num('puschTargetSnrX10');
-    if (snr !== undefined) cfg.puschTargetSnrX10 = snr;
+  if (form.puschTargetMode === 'manual') config.puschTargetSnrX10 = number('puschTargetSnrX10');
+  if (form.schedulerMode === 'manual') Object.assign(config, { qm: number('qm'), mcs: number('mcs'), nPrb: number('nPrb') });
+  return config;
+}
+function validateConfig(form: Record<string, string>): Record<string, string> {
+  const errors: Record<string, string> = {};
+  for (const key of ['frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb', 'ulTrafficMbps']) if (form[key] === '' || !Number.isFinite(Number(form[key]))) errors[key] = 'Enter a valid number.';
+  if (!errors.frequencyMHz && Number(form.frequencyMHz) <= 0) errors.frequencyMHz = 'Must be greater than 0 MHz.';
+  if (!errors.bandwidthMHz && Number(form.bandwidthMHz) <= 0) errors.bandwidthMHz = 'Must be greater than 0 MHz.';
+  for (const key of ['txGainDb', 'rxGainDb']) if (!errors[key] && (Number(form[key]) < 0 || Number(form[key]) > 100)) errors[key] = 'Expected range: 0–100 dB.';
+  if (Number(form.ulTrafficMbps) < 0) errors.ulTrafficMbps = 'Must be 0 or greater.';
+  if (form.puschTargetMode === 'manual') {
+    const target = Number(form.puschTargetSnrX10);
+    if (form.puschTargetSnrX10 === '' || !Number.isFinite(target)) errors.puschTargetSnrX10 = 'Required in manual mode.';
+    else if (!Number.isInteger(target)) errors.puschTargetSnrX10 = 'Enter an integer in 0.1 dB units.';
   }
-  if (cfg.schedulerMode === 'manual') {
-    const qm = num('qm');
-    const mcs = num('mcs');
-    const nPrb = num('nPrb');
-    if (qm !== undefined) cfg.qm = qm;
-    if (mcs !== undefined) cfg.mcs = mcs;
-    if (nPrb !== undefined) cfg.nPrb = nPrb;
+  if (form.schedulerMode === 'manual') {
+    const range = QM_MCS_RANGE[form.qm]; const mcs = Number(form.mcs);
+    if (!range) errors.qm = 'Select modulation.';
+    if (form.mcs === '' || !Number.isFinite(mcs)) errors.mcs = 'Required.';
+    else if (!Number.isInteger(mcs)) errors.mcs = 'Enter a whole MCS index.';
+    else if (range && (mcs < range.min || mcs > range.max)) errors.mcs = `Valid range: ${range.min}–${range.max}.`;
+    const nPrb = Number(form.nPrb);
+    if (form.nPrb === '' || !Number.isFinite(nPrb)) errors.nPrb = 'Required.';
+    else if (!Number.isInteger(nPrb) || nPrb < 1 || nPrb > 273) errors.nPrb = 'Enter a whole number from 1 to 273.';
   }
-  const ul = num('ulTrafficMbps');
-  cfg.ulTrafficMbps = Number.isFinite(Number(ul)) ? Number(ul) : UL_TRAFFIC_DEFAULT_MBPS;
-  return cfg;
+  return errors;
+}
+function summary(config: Record<string, unknown>): [string, string][] {
+  const snr = Number(config.puschTargetSnrX10);
+  const pusch = config.puschTargetMode === 'manual' && Number.isFinite(snr) ? `Manual · ${(snr / 10).toFixed(1)} dB` : 'Auto';
+  const scheduler = config.schedulerMode === 'manual' ? `Manual · Qm ${config.qm ?? '—'} · MCS ${config.mcs ?? '—'}` : 'Auto';
+  return [['Frequency', config.frequencyMHz == null ? '—' : `${config.frequencyMHz} MHz`], ['Bandwidth', config.bandwidthMHz == null ? '—' : `${config.bandwidthMHz} MHz`], ['TX / RX Gain', `${config.txGainDb ?? '—'} / ${config.rxGainDb ?? '—'} dB`], ['PUSCH', pusch], ['Scheduler', scheduler], ['UL Traffic', config.ulTrafficMbps == null ? '—' : `${config.ulTrafficMbps} Mbps`]];
+}
+function statusTone(status: string | null | undefined): 'good' | 'warn' | 'bad' | 'muted' {
+  const value = status?.toUpperCase();
+  if (value === 'PASS' || value === 'COMPLETE' || value === 'STOPPED') return 'good';
+  if (value === 'WARNING' || value === 'RUNNING' || value === 'PREPARING') return 'warn';
+  if (value === 'FAILED' || value === 'ERROR') return 'bad';
+  return 'muted';
+}
+function ConfigValues({ data }: { data: Record<string, unknown> | null | undefined }) {
+  if (!data) return <EmptyState>Configuration snapshot unavailable for this legacy Run.</EmptyState>;
+  const entries = Object.entries(data);
+  if (!entries.length) return <EmptyState>An empty Configuration was recorded.</EmptyState>;
+  return <dl className="config-values">{entries.map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</dd></div>)}</dl>;
 }
 
-/** Return an error string when the form has a blank/invalid field, else null. */
-function validateTemplateConfig(c: Record<string, string>): string | null {
-  for (const k of ['frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb']) {
-    const v = c[k];
-    if (v === undefined || v === '' || !Number.isFinite(Number(v))) return `${k} must be a number`;
-  }
-  if (c.puschTargetMode === 'manual') {
-    const v = c.puschTargetSnrX10;
-    if (v === undefined || v === '' || !Number.isFinite(Number(v))) return 'PUSCH target SNR (×10) is required in manual mode';
-  }
-  if (c.schedulerMode === 'manual') {
-    const qm = c.qm;
-    if (!qm) return 'select Qm (modulation)';
-    const mcs = Number(c.mcs);
-    if (c.mcs === undefined || c.mcs === '' || !Number.isFinite(mcs)) return 'MCS is required';
-    const r = QM_MCS_RANGE[qm];
-    if (r && (mcs < r.min || mcs > r.max)) return `MCS ${mcs} is out of range ${r.min}–${r.max} for Qm ${qm}`;
-    const nPrb = Number(c.nPrb);
-    if (c.nPrb === undefined || c.nPrb === '' || !Number.isFinite(nPrb)) return 'N_PRB is required';
-  }
-  const ul = Number(c.ulTrafficMbps ?? UL_TRAFFIC_DEFAULT_MBPS);
-  if (!Number.isFinite(ul) || ul < 0) return 'UL Traffic Saturation (Mbps) must be ≥ 0';
-  return null;
-}
-
-/** Map an OAI template config onto a condition payload for the auto-run flow. */
-function conditionFromTemplate(conditionId: string, exp: Experiment, cfg: Record<string, unknown>): Record<string, unknown> {
-  const payload: Record<string, unknown> = {
-    condition_id: conditionId,
-    experiment_id: exp.experiment_id,
-    environment: exp.environment,
-  };
-  const map: [string, string][] = [
-    ['frequencyMHz', 'frequency_mhz'],
-    ['bandwidthMHz', 'bandwidth_mhz'],
-    ['txGainDb', 'tx_gain_db'],
-    ['rxGainDb', 'rx_gain_db'],
-    ['puschTargetMode', 'pusch_target_mode'],
-    ['puschTargetSnrX10', 'pusch_target_snr_x10'],
-    ['schedulerMode', 'scheduler_mode'],
-    ['mcs', 'mcs'],
-    ['qm', 'qm'],
-    ['nPrb', 'n_prb'],
-  ];
-  for (const [k, field] of map) {
-    if (cfg[k] !== undefined && cfg[k] !== null) payload[field] = cfg[k];
-  }
-  return payload;
-}
-
-export default function Experiments({ nav }: { nav: (p: string) => void }) {
-  const { data, error, loading, reload } = useLoad<Experiment[]>(() => api.get('/api/experiments'), []);
-  const [phoneState, setPhoneState] = useState<string>('OFFLINE');
+export default function Experiments({ nav, initialExperimentId = '' }: { nav: (path: string) => void; initialExperimentId?: string }) {
+  const experiments = useLoad<ExperimentSummary[]>(() => api.get('/api/experiments'), []);
   const [form, setForm] = useState({ ...EMPTY_FORM });
-  const [creating, setCreating] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<Error | null>(null);
+  const [search, setSearch] = useState('');
+  const [environment, setEnvironment] = useState('ALL');
+  const [sort, setSort] = useState('newest');
+  const [page, setPage] = useState(1);
+  const selected = experiments.data?.find((x) => x.experiment_id === initialExperimentId) ?? null;
 
-  // task editor state (floating window)
-  const [selected, setSelected] = useState<Experiment | null>(null);
-  const [editorLoading, setEditorLoading] = useState(false);
-  const [edit, setEdit] = useState({ purpose: '', flow: '', notes: '' });
-  const [templates, setTemplates] = useState<Template[]>([]);
-  const [runs, setRuns] = useState<Run[]>([]);
-  const [tplModal, setTplModal] = useState<{ name: string; config: Record<string, string> } | null>(null);
-  const [tplEditing, setTplEditing] = useState<number | null>(null);
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const rows = (experiments.data ?? []).filter((x) => (environment === 'ALL' || x.environment === environment) && (!q || `${x.experiment_id} ${x.operator_name ?? ''} ${x.purpose ?? ''}`.toLowerCase().includes(q)));
+    rows.sort((a, b) => sort === 'oldest' ? String(a.created_utc).localeCompare(String(b.created_utc)) : sort === 'activity' ? (b.last_activity_utc_ms ?? 0) - (a.last_activity_utc_ms ?? 0) : String(b.created_utc).localeCompare(String(a.created_utc)));
+    return rows;
+  }, [experiments.data, search, environment, sort]);
+  useEffect(() => setPage(1), [search, environment, sort]);
 
-  // full-screen operation overlay + delete confirm floating window
-  const [overlay, setOverlay] = useState<{ title: string; steps: string[]; active: number } | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<Experiment | null>(null);
-  const [deleting, setDeleting] = useState(false);
-
-  /** Refresh the phone connection state (triggered before every operation). */
-  const detectPhone = async (): Promise<string> => {
+  const create = async (event: FormEvent) => {
+    event.preventDefault(); if (!form.experiment_id.trim()) return;
+    setCreating(true); setCreateError(null);
     try {
-      const s = await api.get<PlatformStatus>('/api/platform/status');
-      const st = s.phone.state?.toUpperCase() ?? 'OFFLINE';
-      setPhoneState(st);
-      return st;
-    } catch {
-      setPhoneState('OFFLINE');
-      return 'OFFLINE';
-    }
+      const created = await api.post<Experiment & { configuration_error?: string }>('/api/experiments', { ...form, experiment_id: form.experiment_id.trim() });
+      setShowCreate(false); setForm({ ...EMPTY_FORM }); experiments.reload();
+      if (created.configuration_error) toast('err', `Experiment created, but Default Configuration failed: ${created.configuration_error}`);
+      else toast('ok', 'Experiment and Default Configuration created.');
+      nav(`/experiments/${encodeURIComponent(created.experiment_id)}`);
+    } catch (error) { setCreateError(error instanceof Error ? error : new Error(String(error))); }
+    finally { setCreating(false); }
   };
+  const exportExperiment = async (experimentId: string) => {
+    try { await downloadFile(`/api/experiments/${encodeURIComponent(experimentId)}/export`, `${experimentId}.zip`); toast('ok', `Export started for ${experimentId}.`); }
+    catch (error) { toast('err', error instanceof Error ? error.message : String(error)); }
+  };
+  const deleteExperiment = async (experimentId: string) => {
+    const typed = window.prompt(`This permanently deletes conditions, Runs, Configurations and derived files.\n\nType ${experimentId} to confirm.`);
+    if (typed !== experimentId) return;
+    try { await api.delete(`/api/experiments/${encodeURIComponent(experimentId)}`); toast('ok', `Experiment ${experimentId} deleted.`); experiments.reload(); nav('/experiments'); }
+    catch (error) { toast('err', error instanceof Error ? error.message : String(error)); }
+  };
+
+  if (initialExperimentId) {
+    if (experiments.loading && !experiments.data) return <Spinner label="Loading Experiment…" />;
+    if (experiments.error) return <ErrorBox error={experiments.error} />;
+    if (!selected) return <Card title="Experiment not found"><button className="btn" onClick={() => nav('/experiments')}>← Experiments</button></Card>;
+    return <ExperimentDetail experiment={selected} nav={nav} onReload={experiments.reload} onExport={() => exportExperiment(selected.experiment_id)} onDelete={() => deleteExperiment(selected.experiment_id)} />;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const shown = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  return <div className="stack">
+    <div className="page-head"><div><div className="title">Experiments</div><div className="subtitle">Configure here. Review here. Run from Dashboard.</div></div><button className="btn primary" onClick={() => setShowCreate(true)}>+ New Experiment</button></div>
+    <div className="experiment-toolbar">
+      <input aria-label="Search experiments" placeholder="Search ID, operator or purpose" value={search} onChange={(e) => setSearch(e.target.value)} />
+      <select aria-label="Environment filter" value={environment} onChange={(e) => setEnvironment(e.target.value)}><option value="ALL">All environments</option><option value="AC">AC</option><option value="RC">RC</option></select>
+      <select aria-label="Sort experiments" value={sort} onChange={(e) => setSort(e.target.value)}><option value="newest">Newest created</option><option value="oldest">Oldest created</option><option value="activity">Last activity</option></select>
+      <button className="btn" onClick={experiments.reload}>Refresh</button>
+    </div>
+    {experiments.loading && !experiments.data ? <Spinner /> : experiments.error ? <ErrorBox error={experiments.error} /> : !experiments.data?.length ? <EmptyState><b>No experiments</b><br />Create your first Experiment.</EmptyState> : !filtered.length ? <EmptyState>No Experiments match the current search and filter.</EmptyState> : <>
+      <div className="grid cols-2">{shown.map((item) => {
+        const result = item.last_quality_status || item.last_run_state;
+        return <article key={item.experiment_id} className={`card experiment-card ${item.environment === 'RC' ? 'rc' : 'ac'}`}>
+          <div className="row between"><div><h2 className="mono">{item.experiment_id}</h2><div className="card-sub">Created {fmtIso(item.created_utc)}</div></div><Badge tone={item.environment === 'RC' ? 'warn' : 'accent'}>{item.environment ?? '—'}</Badge></div>
+          <div className="experiment-purpose">{item.purpose || 'No purpose recorded.'}</div><dl className="kv"><dt>Operator</dt><dd>{item.operator_name || '—'}</dd></dl>
+          <div className="experiment-card-stats"><span><b>{item.configuration_count ?? 0}</b> Configurations</span><span><b>{item.run_count ?? 0}</b> Runs / History</span><span>Last result {result ? <Badge tone={statusTone(result)}>{result}</Badge> : '—'}</span><span>Last activity <b>{fmtTs(item.last_activity_utc_ms)}</b></span></div>
+          <div className="row between" style={{ marginTop: 16 }}><button className="btn primary" onClick={() => nav(`/experiments/${encodeURIComponent(item.experiment_id)}`)}>Manage Experiment</button><details className="more-menu"><summary aria-label={`More actions for ${item.experiment_id}`}>•••</summary><div><button onClick={() => exportExperiment(item.experiment_id)}>Export experiment</button><button className="danger-text" onClick={() => deleteExperiment(item.experiment_id)}>Delete experiment</button></div></details></div>
+        </article>;
+      })}</div>
+      <div className="pagination"><span>{filtered.length} Experiments · page {page} of {totalPages}</span><button className="btn sm" disabled={page === 1} onClick={() => setPage((x) => x - 1)}>Previous</button><button className="btn sm" disabled={page === totalPages} onClick={() => setPage((x) => x + 1)}>Next</button></div>
+    </>}
+    {showCreate && <Modal title="New Experiment" sub="Create the Experiment first, then manage its Configurations." onClose={() => setShowCreate(false)} footer={<><button className="btn" onClick={() => setShowCreate(false)}>Cancel</button><button className="btn primary" form="create-experiment" type="submit" disabled={creating}>{creating ? 'Creating…' : 'Create & Configure'}</button></>}>
+      <form id="create-experiment" className="stack" onSubmit={create}>{createError && <ErrorBox error={createError} />}<div className="notice-box">A Default Configuration will be created automatically and shown explicitly after creation.</div><div className="grid cols-2"><Field label="Experiment ID"><input required autoFocus className="mono" value={form.experiment_id} onChange={(e) => setForm({ ...form, experiment_id: e.target.value })} /></Field><Field label="Environment"><select value={form.environment} onChange={(e) => setForm({ ...form, environment: e.target.value })}><option value="AC">AC</option><option value="RC">RC</option></select></Field><Field label="Operator"><input value={form.operator_name} onChange={(e) => setForm({ ...form, operator_name: e.target.value })} /></Field></div><Field label="Purpose"><textarea rows={2} value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })} /></Field><Field label="Flow"><textarea rows={2} value={form.flow} onChange={(e) => setForm({ ...form, flow: e.target.value })} /></Field><Field label="Notes"><textarea rows={2} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field></form>
+    </Modal>}
+  </div>;
+}
+
+function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
+  experiment: ExperimentSummary; nav: (path: string) => void; onReload: () => void; onExport: () => void; onDelete: () => void;
+}) {
+  const configurations = useLoad<Configuration[]>(() => api.get(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates`), [experiment.experiment_id]);
+  const runs = useLoad<Run[]>(() => api.get(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/runs`), [experiment.experiment_id]);
+  const [tab, setTab] = useState<DetailTab>('overview');
+  const [overview, setOverview] = useState({ operator_name: experiment.operator_name || '', purpose: experiment.purpose || '', flow: experiment.flow || '', notes: experiment.notes || '' });
+  const [overviewBaseline, setOverviewBaseline] = useState('');
+  const [overviewError, setOverviewError] = useState<Error | null>(null);
+  const [savingOverview, setSavingOverview] = useState(false);
+  const [editor, setEditor] = useState<ConfigEditor | null>(null);
+  const [configErrors, setConfigErrors] = useState<Record<string, string>>({});
+  const [configApiError, setConfigApiError] = useState<Error | null>(null);
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [runPage, setRunPage] = useState(1);
+  const [selectedRunId, setSelectedRunId] = useState('');
 
   useEffect(() => {
-    detectPhone();
-  }, []);
+    const next = { operator_name: experiment.operator_name || '', purpose: experiment.purpose || '', flow: experiment.flow || '', notes: experiment.notes || '' };
+    setOverview(next); setOverviewBaseline(JSON.stringify(next));
+  }, [experiment]);
+  const overviewDirty = overviewBaseline !== '' && JSON.stringify(overview) !== overviewBaseline;
+  const configDirty = !!editor && JSON.stringify({ name: editor.name, config: editor.config }) !== editor.original;
+  const dirty = overviewDirty || configDirty;
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => { if (dirty) event.preventDefault(); };
+    window.addEventListener('beforeunload', warn); return () => window.removeEventListener('beforeunload', warn);
+  }, [dirty]);
+  const allowLeave = () => !dirty || window.confirm('Discard unsaved changes?');
+  const changeTab = (next: DetailTab) => { if (next === tab || allowLeave()) { setTab(next); setEditor(null); } };
+  const back = () => { if (allowLeave()) nav('/experiments'); };
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!form.experiment_id.trim()) return;
-    setCreating(true);
-    const expId = form.experiment_id.trim();
+  const saveOverview = async () => {
+    setSavingOverview(true); setOverviewError(null);
+    try { await api.put(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}`, overview); setOverviewBaseline(JSON.stringify(overview)); onReload(); toast('ok', 'Experiment details saved.'); }
+    catch (error) { setOverviewError(error instanceof Error ? error : new Error(String(error))); }
+    finally { setSavingOverview(false); }
+  };
+  const openConfiguration = (row?: Configuration, duplicate = false) => {
+    if (configDirty && !window.confirm('Discard unsaved changes?')) return;
+    const config = configForm(row ? parseConfig(row.config_json) : DEFAULT_CONFIGURATION);
+    const next = { id: duplicate ? null : row?.id ?? null, name: row ? `${row.name}${duplicate ? ' Copy' : ''}` : '', config };
+    setEditor({ ...next, original: JSON.stringify({ name: next.name, config: next.config }) }); setConfigErrors({}); setConfigApiError(null);
+  };
+  const saveConfiguration = async () => {
+    if (!editor) return;
+    const errors = validateConfig(editor.config); if (!editor.name.trim()) errors.name = 'Configuration name is required.';
+    setConfigErrors(errors); if (Object.keys(errors).length) return;
+    setSavingConfig(true); setConfigApiError(null);
     try {
-      await api.post('/api/experiments', {
-        experiment_id: expId,
-        environment: form.environment,
-        operator_name: form.operator_name,
-        notes: form.notes,
-        purpose: form.purpose,
-        flow: form.flow,
-      });
-      // seed the default template and use it as the startup config
-      try {
-        await api.post(`/api/experiments/${encodeURIComponent(expId)}/templates`, { name: 'Default', config: DEFAULT_TEMPLATE_CONFIG });
-        await api.put(`/api/experiments/${encodeURIComponent(expId)}`, { initial_oai_config: DEFAULT_TEMPLATE_CONFIG });
-      } catch {
-        /* the editor also guarantees a Default template */
-      }
-      setForm({ ...EMPTY_FORM });
-      setShowCreate(false);
-      toast('ok', `experiment ${expId} created`);
-      reload();
-    } catch (err) {
-      toast('err', err instanceof Error ? err.message : String(err));
-    } finally {
-      setCreating(false);
-    }
+      const body = { name: editor.name.trim(), config: buildConfig(editor.config) };
+      if (editor.id == null) await api.post(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates`, body);
+      else await api.put(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates/${editor.id}`, body);
+      setEditor(null); configurations.reload(); onReload(); toast('ok', 'Configuration saved.');
+    } catch (error) { setConfigApiError(error instanceof Error ? error : new Error(String(error))); }
+    finally { setSavingConfig(false); }
   };
-
-  /** Load templates (guaranteeing a Default template) + runs, without blocking. */
-  const loadEditorData = async (x: Experiment) => {
-    let t: Template[] = [];
-    let r: Run[] = [];
-    try {
-      t = await api.get<Template[]>(`/api/experiments/${encodeURIComponent(x.experiment_id)}/templates`);
-    } catch {
-      t = [];
-    }
-    try {
-      r = await api.get<Run[]>(`/api/experiments/${encodeURIComponent(x.experiment_id)}/runs`);
-    } catch {
-      r = [];
-    }
-    // guarantee a Default template exists, with explicit RF values (migrate old sparse ones)
-    const def = t.find((tpl) => tpl.name === 'Default');
-    let sparse = false;
-    if (def) {
-      let p: Record<string, unknown> = {};
-      try {
-        p = JSON.parse(def.config_json) ?? {};
-      } catch {
-        sparse = true;
-      }
-      if (!sparse && (p.frequencyMHz === undefined || p.bandwidthMHz === undefined || p.txGainDb === undefined || p.rxGainDb === undefined)) {
-        sparse = true;
-      }
-    }
-    if (!def || sparse) {
-      try {
-        if (def) await api.delete(`/api/experiments/${encodeURIComponent(x.experiment_id)}/templates/${def.id}`);
-        await api.post(`/api/experiments/${encodeURIComponent(x.experiment_id)}/templates`, { name: 'Default', config: DEFAULT_TEMPLATE_CONFIG });
-        t = await api.get<Template[]>(`/api/experiments/${encodeURIComponent(x.experiment_id)}/templates`);
-      } catch {
-        /* keep whatever we had */
-      }
-    }
-    setTemplates(t);
-    setRuns(r);
-    setEditorLoading(false);
+  const setDefault = async (row: Configuration) => {
+    try { await api.post(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates/${row.id}/default`); configurations.reload(); onReload(); toast('ok', `${row.name} is now the Default Configuration.`); }
+    catch (error) { setConfigApiError(error instanceof Error ? error : new Error(String(error))); }
   };
-
-  /** Open the editor instantly; load data + phone state in the background. */
-  const openEditor = (x: Experiment) => {
-    setSelected(x);
-    setEdit({ purpose: x.purpose || '', flow: x.flow || '', notes: x.notes || '' });
-    setRuns([]);
-    setTemplates([]);
-    setEditorLoading(true);
-    detectPhone(); // background, updates the badge
-    loadEditorData(x);
+  const archive = async (row: Configuration) => {
+    if (!window.confirm(`Archive Configuration “${row.name}”? Historical Run snapshots will remain unchanged.`)) return;
+    try { await api.delete(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates/${row.id}`); configurations.reload(); onReload(); toast('ok', 'Configuration archived.'); }
+    catch (error) { setConfigApiError(error instanceof Error ? error : new Error(String(error))); }
   };
-
-  /** Automated run: create condition + run + prepare gNB + start, with a full-screen loader. */
-  const runExperiment = async (x: Experiment) => {
-    const steps = ['Creating condition', 'Creating run', 'Preparing gNB config', 'Starting experiment'];
-    setOverlay({ title: `Running ${x.experiment_id}`, steps, active: 0 });
-    detectPhone(); // background badge update — never blocks the UI
-    try {
-      // use the startup template's config as the condition
-      const tpls = await api.get<Template[]>(`/api/experiments/${encodeURIComponent(x.experiment_id)}/templates`).catch(() => [] as Template[]);
-      const startup = tpls.find((t) => configsEqual(x.initial_oai_config, t.config_json)) ?? tpls.find((t) => t.name === 'Default') ?? tpls[0];
-      const cfg: Record<string, unknown> = startup
-        ? (() => {
-            try {
-              return JSON.parse(startup.config_json) ?? {};
-            } catch {
-              return {};
-            }
-          })()
-        : { ...DEFAULT_TEMPLATE_CONFIG };
-
-      setOverlay((o) => (o ? { ...o, active: 1 } : o));
-      const conditionId = `${x.experiment_id}_auto_${Date.now()}`;
-      await api.post('/api/conditions', conditionFromTemplate(conditionId, x, cfg));
-
-      setOverlay((o) => (o ? { ...o, active: 2 } : o));
-      const runId = `R_${Date.now()}`;
-      await api.post<Run>('/api/runs', {
-        run_id: runId,
-        experiment_id: x.experiment_id,
-        condition_id: conditionId,
-        device_id: PHONE_SERIAL,
-        start_delay_s: 30,
-      });
-
-      setOverlay((o) => (o ? { ...o, active: 3 } : o));
-      const prep = await api.post<{ verify?: { ok?: boolean; problems?: string[] } }>(`/api/runs/${encodeURIComponent(runId)}/prepare`, { requested_config: cfg });
-      if (prep.verify && prep.verify.ok === false) {
-        const problems = (prep.verify.problems ?? []).join('; ') || 'gNB not ready';
-        throw new Error(`prepare failed: ${problems}`);
-      }
-
-      setOverlay((o) => (o ? { ...o, active: 4 } : o));
-      await api.post(`/api/experiments/${encodeURIComponent(x.experiment_id)}/start`, { serial: PHONE_SERIAL, run_id: runId });
-
-      toast('ok', `run ${runId} started`);
-      reload();
-      nav('/dashboard');
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-      reload();
-    } finally {
-      setOverlay(null);
-    }
+  const removeRun = async (runId: string) => {
+    if (!window.confirm(`Delete Run ${runId} and its indexed records?`)) return;
+    try { await api.delete(`/api/runs/${encodeURIComponent(runId)}`); runs.reload(); setSelectedRunId(''); toast('ok', 'Run deleted.'); }
+    catch (error) { toast('err', error instanceof Error ? error.message : String(error)); }
   };
+  const defaultConfiguration = configurations.data?.find((x) => !!x.is_default);
+  const totalRunPages = Math.max(1, Math.ceil((runs.data?.length ?? 0) / RUN_PAGE_SIZE));
+  const visibleRuns = (runs.data ?? []).slice((runPage - 1) * RUN_PAGE_SIZE, runPage * RUN_PAGE_SIZE);
 
-  const openResult = (x: Experiment) => {
-    detectPhone(); // background
-    nav(`/timeline/${encodeURIComponent(x.experiment_id)}`);
-  };
+  return <div className="stack experiment-detail">
+    <div className="page-head"><div><button className="btn ghost" onClick={back}>← Experiments</button><div className="title mono">{experiment.experiment_id}</div><div className="subtitle">Experiment management · execution controls are on Dashboard</div></div><Badge tone={experiment.environment === 'RC' ? 'warn' : 'accent'}>{experiment.environment ?? '—'}</Badge></div>
+    <div className="tabs" role="tablist">{(['overview', 'configurations', 'history'] as DetailTab[]).map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => changeTab(item)}>{item === 'overview' ? 'Overview' : item === 'configurations' ? `Configurations (${configurations.data?.length ?? 0})` : `History (${runs.data?.length ?? 0})`}</button>)}</div>
 
-  const push = async (x: Experiment) => {
-    const steps = ['Pushing task to phone'];
-    setOverlay({ title: `Pushing ${x.experiment_id}`, steps, active: 0 });
-    detectPhone(); // background badge update
-    try {
-      await api.post(`/api/experiments/${encodeURIComponent(x.experiment_id)}/push`, { serial: PHONE_SERIAL });
-      toast('ok', 'Task pushed to phone');
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    } finally {
-      setOverlay(null);
-    }
-  };
+    {tab === 'overview' && <Card title="Overview" sub="Experiment metadata. ID, environment and creation time are read only."><div className="stack">
+      {overviewError && <ErrorBox error={overviewError} />}<div className="grid cols-3"><Field label="Experiment ID"><StaticValue>{experiment.experiment_id}</StaticValue></Field><Field label="Environment"><StaticValue>{experiment.environment ?? '—'}</StaticValue></Field><Field label="Created time"><StaticValue>{fmtIso(experiment.created_utc)}</StaticValue></Field></div>
+      <Field label="Operator"><input value={overview.operator_name} onChange={(e) => setOverview({ ...overview, operator_name: e.target.value })} /></Field><Field label="Purpose"><textarea rows={3} value={overview.purpose} onChange={(e) => setOverview({ ...overview, purpose: e.target.value })} /></Field><Field label="Flow"><textarea rows={3} value={overview.flow} onChange={(e) => setOverview({ ...overview, flow: e.target.value })} /></Field><Field label="Notes"><textarea rows={3} value={overview.notes} onChange={(e) => setOverview({ ...overview, notes: e.target.value })} /></Field>
+      <div><button className="btn primary" disabled={!overviewDirty || savingOverview} onClick={saveOverview}>{savingOverview ? 'Saving…' : 'Save changes'}</button></div>
+    </div></Card>}
 
-  const stopExperiment = async (x: Experiment) => {
-    setOverlay({ title: `Stopping ${x.experiment_id}`, steps: ['Stopping experiment'], active: 0 });
-    try {
-      await api.post(`/api/experiments/${encodeURIComponent(x.experiment_id)}/stop`);
-      toast('ok', 'Experiment stopped');
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    } finally {
-      setOverlay(null);
-    }
-  };
-
-  const doExport = async (x: Experiment) => {
-    detectPhone(); // background
-    setBusy('export');
-    try {
-      await downloadFile(`/api/experiments/${encodeURIComponent(x.experiment_id)}/export`, `${x.experiment_id}.zip`);
-      toast('ok', `download started for ${x.experiment_id}`);
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const confirmDelete = async () => {
-    if (!deleteTarget) return;
-    detectPhone(); // background
-    setDeleting(true);
-    try {
-      await api.delete(`/api/experiments/${encodeURIComponent(deleteTarget.experiment_id)}`);
-      toast('ok', `experiment ${deleteTarget.experiment_id} deleted`);
-      if (selected?.experiment_id === deleteTarget.experiment_id) setSelected(null);
-      setDeleteTarget(null);
-      reload();
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    } finally {
-      setDeleting(false);
-    }
-  };
-
-  const saveTask = async () => {
-    if (!selected) return;
-    detectPhone(); // background
-    try {
-      await api.put(`/api/experiments/${encodeURIComponent(selected.experiment_id)}`, edit);
-      toast('ok', 'Task saved');
-      reload();
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const setTplField = (key: string, value: string) => {
-    setTplModal((m) => (m ? { ...m, config: { ...m.config, [key]: value } } : m));
-  };
-
-  const saveTemplate = async () => {
-    if (!selected || !tplModal) return;
-    if (!tplModal.name.trim()) {
-      toast('err', 'template name is required');
-      return;
-    }
-    const invalid = validateTemplateConfig(tplModal.config);
-    if (invalid) {
-      toast('err', invalid);
-      return;
-    }
-    try {
-      if (tplEditing != null) {
-        await api.delete(`/api/experiments/${encodeURIComponent(selected.experiment_id)}/templates/${tplEditing}`);
-      }
-      await api.post(`/api/experiments/${encodeURIComponent(selected.experiment_id)}/templates`, {
-        name: tplModal.name.trim(),
-        config: buildTemplateConfig(tplModal.config),
-      });
-      setTemplates(await api.get<Template[]>(`/api/experiments/${encodeURIComponent(selected.experiment_id)}/templates`));
-      setTplModal(null);
-      setTplEditing(null);
-      toast('ok', 'Template saved');
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const deleteTemplate = async (t: Template) => {
-    if (!selected) return;
-    if (t.name === 'Default') {
-      toast('err', 'the Default template cannot be deleted');
-      return;
-    }
-    try {
-      await api.delete(`/api/experiments/${encodeURIComponent(selected.experiment_id)}/templates/${t.id}`);
-      setTemplates(templates.filter((x) => x.id !== t.id));
-      toast('ok', 'Template deleted');
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  /** Which template is currently wired as the experiment's startup config. */
-  const isStartup = (t: Template) => configsEqual(selected?.initial_oai_config, t.config_json);
-
-  const setStartupTemplate = async (t: Template) => {
-    if (!selected) return;
-    let cfg: unknown;
-    try {
-      cfg = JSON.parse(t.config_json);
-    } catch {
-      toast('err', 'template config is not valid JSON');
-      return;
-    }
-    try {
-      const updated = await api.put<Experiment>(`/api/experiments/${encodeURIComponent(selected.experiment_id)}`, { initial_oai_config: cfg });
-      setSelected(updated);
-      toast('ok', `startup template → ${t.name}`);
-      reload();
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const deleteRun = async (runId: string) => {
-    try {
-      await api.delete(`/api/runs/${encodeURIComponent(runId)}`);
-      setRuns(runs.filter((r) => r.run_id !== runId));
-      toast('ok', `run ${runId} deleted`);
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const phoneTone = phoneState === 'CONNECTED' ? 'good' : phoneState === 'ATTACHED' ? 'accent' : 'muted';
-
-  return (
-    <div className="stack">
-      <div className="page-head">
-        <div>
-          <div className="title">Experiments</div>
-          <div className="subtitle">create and manage AC / RC experiments, records and clips</div>
-        </div>
-        <div className="row gap-sm">
-          <button className="btn" onClick={detectPhone}>Check Phone</button>
-          <button className="btn primary" onClick={() => setShowCreate(true)}>+ New Experiment</button>
-        </div>
-      </div>
-
-      <Card title="Phone channel">
-        <div className="row gap-sm" style={{ fontSize: 12 }}>
-          <Badge tone={phoneTone}>PHONE: {phoneState}</Badge>
-          <span style={{ color: 'var(--muted)' }}>adb serial</span>
-          <StaticValue title="Fixed by the rig — read only">{PHONE_SERIAL}</StaticValue>
-          <span style={{ color: 'var(--faint)', fontSize: 11.5 }}>
-            every operation re-checks this status
-          </span>
-        </div>
+    {tab === 'configurations' && <div className="stack">
+      {configApiError && <ErrorBox error={configApiError} />}
+      {experiment.environment === 'RC' && <Card title="RC Configuration" sub="Mechanical sampling and stirrer settings are part of this RC Experiment."><button className="btn" onClick={() => { if (allowLeave()) nav(`/experiments/${encodeURIComponent(experiment.experiment_id)}/rc`); }}>Open RC Setup</button></Card>}
+      <Card title="Default Configuration" sub="Used for the next Run unless Dashboard explicitly selects another Configuration.">
+        {configurations.loading && !configurations.data ? <Spinner /> : configurations.error ? <><ErrorBox error={configurations.error} /><button className="btn sm" onClick={configurations.reload}>Retry</button></> : defaultConfiguration ? <ConfigurationCard row={defaultConfiguration} onEdit={() => openConfiguration(defaultConfiguration)} onDuplicate={() => openConfiguration(defaultConfiguration, true)} /> : <EmptyState><b>Configuration required</b><br />Add a Configuration, then explicitly set it as default.</EmptyState>}
       </Card>
-
-      <Card
-        title="Experiments"
-        sub={`${data?.length ?? 0} total`}
-        right={<button className="btn" onClick={reload}>Refresh</button>}
-      >
-        {loading && !data ? (
-          <Spinner />
-        ) : error ? (
-          <ErrorBox error={error} />
-        ) : data && data.length === 0 ? (
-          <EmptyState>No experiments yet — create your first one.</EmptyState>
-        ) : (
-          <div className="grid cols-2">
-            {data?.map((x) => (
-              <div key={x.experiment_id} className={`card experiment-card ${x.environment === 'RC' ? 'rc' : 'ac'}`}>
-                <div className="card-header">
-                  <div>
-                    <h2 className="mono" style={{ fontSize: 14 }}>{x.experiment_id}</h2>
-                    <div className="card-sub">{fmtIso(x.created_utc)}</div>
-                  </div>
-                  <Badge tone={x.environment === 'RC' ? 'warn' : x.environment === 'AC' ? 'accent' : 'muted'}>{x.environment ?? '—'}</Badge>
-                </div>
-                <div className="kv" style={{ fontSize: 13 }}>
-                  <dt>purpose</dt>
-                  <dd>{x.purpose || '—'}</dd>
-                  <dt>flow</dt>
-                  <dd>{x.flow || '—'}</dd>
-                  <dt>operator</dt>
-                  <dd>{x.operator_name || '—'}</dd>
-                </div>
-                <div className="row gap-sm" style={{ marginTop: 14, flexWrap: 'wrap' }}>
-                  <button className="btn sm" disabled={busy !== null} onClick={() => openEditor(x)}>Edit</button>
-                  <button className="btn sm" disabled={busy !== null} onClick={() => push(x)}>Push</button>
-                  <button className="btn sm primary" disabled={busy !== null} onClick={() => runExperiment(x)}>Run</button>
-                  {x.environment === 'RC' && (
-                    <button className="btn sm" disabled={busy !== null}
-                      onClick={() => nav(`/experiments/${encodeURIComponent(x.experiment_id)}/rc`)}>RC Setup</button>
-                  )}
-                  <button className="btn sm" disabled={busy !== null} onClick={() => openResult(x)}>Records & Clips</button>
-                  <button className="btn sm" disabled={busy !== null} onClick={() => doExport(x)}>Export</button>
-                  <button className="btn sm danger" disabled={busy !== null} onClick={() => setDeleteTarget(x)}>Delete</button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+      <Card title="Saved Configurations" sub="Cards are read-only until an explicit action is selected." right={<button className="btn" onClick={() => openConfiguration()}>+ Add Configuration</button>}>
+        {configurations.loading && !configurations.data ? <Spinner /> : configurations.error ? <><ErrorBox error={configurations.error} /><button className="btn sm" onClick={configurations.reload}>Retry</button></> : !configurations.data?.length ? <EmptyState><b>No configurations</b><br />Add a Configuration before running this Experiment.</EmptyState> : <div className="stack">{configurations.data.map((row) => <ConfigurationCard key={row.id} row={row} onEdit={() => openConfiguration(row)} onDuplicate={() => openConfiguration(row, true)} onDefault={row.is_default ? undefined : () => setDefault(row)} onArchive={row.is_default ? undefined : () => archive(row)} />)}</div>}
       </Card>
+      {editor && <ConfigurationEditor editor={editor} setEditor={setEditor} errors={configErrors} apiError={configApiError} saving={savingConfig} onSave={saveConfiguration} onCancel={() => { if (!configDirty || window.confirm('Discard unsaved changes?')) setEditor(null); }} />}
+    </div>}
 
-      {/* Create experiment (floating window) */}
-      {showCreate && (
-        <Modal
-          title="New Experiment"
-          sub="register an experiment task in the platform"
-          onClose={() => setShowCreate(false)}
-          footer={
-            <>
-              <button className="btn" onClick={() => setShowCreate(false)}>Cancel</button>
-              <button className="btn primary" form="create-exp-form" type="submit" disabled={creating || !form.experiment_id.trim()}>
-                {creating ? 'Creating…' : 'Create Experiment'}
-              </button>
-            </>
-          }
-        >
-          <form id="create-exp-form" className="stack" onSubmit={submit}>
-            <div className="grid cols-2">
-              <Field label="Experiment ID (required)">
-                <input
-                  className="mono"
-                  value={form.experiment_id}
-                  placeholder="e.g. AC_2026_08_15_01"
-                  autoFocus
-                  onChange={(e) => setForm({ ...form, experiment_id: e.target.value })}
-                />
-              </Field>
-              <Field label="Environment">
-                <select value={form.environment} onChange={(e) => setForm({ ...form, environment: e.target.value })}>
-                  <option value="AC">AC</option>
-                  <option value="RC">RC</option>
-                </select>
-              </Field>
-              <Field label="Operator">
-                <input value={form.operator_name} onChange={(e) => setForm({ ...form, operator_name: e.target.value })} />
-              </Field>
-              <Field label="Notes">
-                <input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
-              </Field>
-            </div>
-            <Field label="Purpose">
-              <textarea rows={2} value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })} />
-            </Field>
-            <Field label="Flow">
-              <textarea rows={2} value={form.flow} onChange={(e) => setForm({ ...form, flow: e.target.value })} />
-            </Field>
-          </form>
-        </Modal>
-      )}
+    {tab === 'history' && <div className="stack"><Card title="Run History" sub="Newest first. Each Run uses its execution-time Configuration snapshot.">
+      {runs.loading && !runs.data ? <Spinner /> : runs.error ? <><ErrorBox error={runs.error} /><button className="btn sm" onClick={runs.reload}>Retry</button></> : !runs.data?.length ? <EmptyState><b>No run history</b><br />No Runs have been recorded yet. Execute Runs from Dashboard.</EmptyState> : <><div className="table-wrap"><table className="data"><thead><tr><th>Time</th><th>Run ID</th><th>Configuration</th><th>Result</th><th>Quality</th><th>Actions</th></tr></thead><tbody>{visibleRuns.map((run) => <tr key={run.run_id}><td>{fmtTs(run.started_utc_ms)}</td><td className="mono">{run.run_id}</td><td>{run.configuration_name || (run.requested_config_json ? 'Recorded snapshot' : <span className="muted-text">Snapshot unavailable</span>)}</td><td><Badge tone={statusTone(run.state)}>{run.state}</Badge></td><td>{run.quality_status ? <Badge tone={statusTone(run.quality_status)}>{run.quality_status}</Badge> : '—'}</td><td><button className="btn sm" onClick={() => setSelectedRunId(run.run_id)}>View result</button></td></tr>)}</tbody></table></div><div className="pagination"><span>Page {runPage} of {totalRunPages}</span><button className="btn sm" disabled={runPage === 1} onClick={() => setRunPage((x) => x - 1)}>Previous</button><button className="btn sm" disabled={runPage === totalRunPages} onClick={() => setRunPage((x) => x + 1)}>Next</button></div></>}
+    </Card>{selectedRunId && <RunResultDetail runId={selectedRunId} nav={nav} onDelete={() => removeRun(selectedRunId)} onClose={() => setSelectedRunId('')} />}</div>}
 
-      {/* Task editor (floating window) */}
-      {selected && (
-        <Modal
-          title={`Edit · ${selected.experiment_id}`}
-          sub={`${selected.environment ?? '—'} · operator ${selected.operator_name || '—'}`}
-          onClose={() => setSelected(null)}
-          size="lg"
-        >
-          <div className="stack">
-            <div className="grid cols-2">
-              <Field label="Purpose">
-                <textarea rows={3} value={edit.purpose} onChange={(e) => setEdit({ ...edit, purpose: e.target.value })} />
-              </Field>
-              <Field label="Flow">
-                <textarea rows={3} value={edit.flow} onChange={(e) => setEdit({ ...edit, flow: e.target.value })} />
-              </Field>
-              <Field label="Notes">
-                <input value={edit.notes} onChange={(e) => setEdit({ ...edit, notes: e.target.value })} />
-              </Field>
-            </div>
-            <div className="row gap-sm">
-              <button className="btn primary" onClick={saveTask}>Save Task</button>
-              <button className="btn danger" onClick={() => stopExperiment(selected)}>Stop Experiment</button>
-            </div>
+    <details className="danger-zone"><summary>Danger Zone</summary><div className="row between"><div><b>Export or delete this Experiment</b><div className="muted-text">Deletion includes conditions, Runs, Configurations and derived files.</div></div><div className="row"><button className="btn" onClick={onExport}>Export everything</button><button className="btn danger" onClick={onDelete}>Delete Experiment</button></div></div></details>
+  </div>;
+}
 
-            <Card
-              title="Templates"
-              sub="click a template to use it at startup"
-              right={
-                <button
-                  className="btn sm"
-                  onClick={() => {
-                    const base = templates.find(isStartup) ?? templates.find((t) => t.name === 'Default') ?? templates[0];
-                    setTplModal({
-                      name: '',
-                      config: base ? configJsonToForm(base.config_json) : configJsonToForm(JSON.stringify(DEFAULT_TEMPLATE_CONFIG)),
-                    });
-                  }}
-                >
-                  + Add Template
-                </button>
-              }
-            >
-              {editorLoading ? (
-                <Spinner label="loading templates & runs…" />
-              ) : templates.length === 0 ? (
-                <EmptyState>No templates.</EmptyState>
-              ) : (
-                <div className="stack" style={{ gap: 10 }}>
-                  {templates.map((t) => {
-                    const props = configSummary(t.config_json);
-                    const startup = isStartup(t);
-                    return (
-                      <div
-                        key={t.id}
-                        className="card"
-                        style={{
-                          padding: 12,
-                          cursor: 'pointer',
-                          border: startup ? '1px solid var(--accent)' : undefined,
-                          background: startup ? 'var(--accent-soft)' : undefined,
-                        }}
-                        title="Click to use this template at startup"
-                        onClick={() => setStartupTemplate(t)}
-                      >
-                        <div className="row between">
-                          <div className="row gap-sm">
-                            <b style={{ fontSize: 13 }}>{t.name}</b>
-                            {t.name === 'Default' && <Badge tone="muted">Default</Badge>}
-                            {startup && <Badge tone="accent">startup</Badge>}
-                          </div>
-                          <div className="row gap-sm" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              className="btn sm"
-                              onClick={() => {
-                                setTplModal({ name: t.name, config: configJsonToForm(t.config_json) });
-                                setTplEditing(t.id);
-                              }}
-                            >
-                              Edit
-                            </button>
-                            <button className="btn sm danger" onClick={() => deleteTemplate(t)}>Delete</button>
-                          </div>
-                        </div>
-                        {props.length === 0 ? (
-                          <div style={{ fontSize: 12, color: 'var(--faint)', marginTop: 8 }}>no config set</div>
-                        ) : (
-                          <div className="row gap-sm" style={{ marginTop: 8, fontSize: 11.5 }}>
-                            {props.map((p) => (
-                              <span key={p.key} className="badge muted">{p.label} = {p.value}</span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </Card>
+function ConfigurationCard({ row, onEdit, onDuplicate, onDefault, onArchive }: {
+  row: Configuration; onEdit: () => void; onDuplicate: () => void; onDefault?: () => void; onArchive?: () => void;
+}) {
+  const config = parseConfig(row.config_json);
+  return <article className={`configuration-card ${row.is_default ? 'default' : ''}`}>
+    <div className="row between"><div><b>{row.name}</b><div className="muted-text">Created {fmtIso(row.created_utc)} · used by {row.used_by_runs ?? 0} Run(s)</div></div>{row.is_default ? <Badge tone="accent">DEFAULT FOR NEXT RUN</Badge> : null}</div>
+    <dl className="configuration-summary">{summary(config).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
+    <details className="details"><summary>View full configuration</summary><div className="details-body"><ConfigValues data={config} /></div></details>
+    <div className="row gap-sm" style={{ marginTop: 10 }}><button className="btn sm" onClick={onEdit}>Edit</button><button className="btn sm" onClick={onDuplicate}>Duplicate</button>{onDefault && <button className="btn sm" onClick={onDefault}>Set as default</button>}{onArchive && <button className="btn sm ghost" onClick={onArchive}>Archive</button>}</div>
+  </article>;
+}
 
-            <Card title="Results" sub={`${runs.length} run(s)`}>
-              {editorLoading ? (
-                <Spinner label="loading runs…" />
-              ) : runs.length === 0 ? (
-                <EmptyState>No results yet.</EmptyState>
-              ) : (
-                <div className="grid cols-3">
-                  {runs.map((r) => (
-                    <div key={r.run_id} className="card" style={{ padding: 12 }}>
-                      <div className="row between">
-                        <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{r.run_id}</span>
-                        <button className="btn sm danger" onClick={() => deleteRun(r.run_id)}>Delete</button>
-                      </div>
-                      <div className="row gap-sm" style={{ marginTop: 8 }}>
-                        <Badge tone={r.state === 'COMPLETE' ? 'good' : r.state === 'FAILED' ? 'bad' : r.state === 'WARNING' ? 'warn' : 'muted'}>
-                          {r.state}
-                        </Badge>
-                        {r.quality_status && (
-                          <Badge tone={r.quality_status === 'PASS' ? 'good' : r.quality_status === 'FAILED' ? 'bad' : 'warn'}>
-                            {r.quality_status}
-                          </Badge>
-                        )}
-                      </div>
-                      <button className="btn sm" style={{ marginTop: 8 }}
-                        onClick={() => nav(`/timeline/${encodeURIComponent(r.experiment_id)}/${encodeURIComponent(r.run_id)}`)}>
-                        View records & clip →
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </Card>
-          </div>
-        </Modal>
-      )}
+function ConfigurationEditor({ editor, setEditor, errors, apiError, saving, onSave, onCancel }: {
+  editor: ConfigEditor; setEditor: Dispatch<SetStateAction<ConfigEditor | null>>; errors: Record<string, string>;
+  apiError: Error | null; saving: boolean; onSave: () => void; onCancel: () => void;
+}) {
+  const c = editor.config;
+  const set = (key: string, value: string) => setEditor((old) => old ? { ...old, config: { ...old.config, [key]: value } } : old);
+  const input = (label: string, key: string, hint?: string) => <Field label={label} hint={hint}><input className="mono" type="number" value={c[key]} onChange={(e) => set(key, e.target.value)} />{errors[key] && <span className="field-error">{errors[key]}</span>}</Field>;
+  const range = QM_MCS_RANGE[c.qm];
+  return <Card title={editor.id == null ? 'Add Configuration' : 'Edit Configuration'} sub="Unsaved changes are protected when you leave this editor."><div className="stack">
+    {apiError && <ErrorBox error={apiError} />}<Field label="Configuration name"><input value={editor.name} onChange={(e) => setEditor({ ...editor, name: e.target.value })} />{errors.name && <span className="field-error">{errors.name}</span>}</Field>
+    <section><h3>RF</h3><div className="grid cols-4">{input('Frequency', 'frequencyMHz', 'MHz')}{input('Bandwidth', 'bandwidthMHz', 'MHz')}{input('TX Gain', 'txGainDb', 'dB')}{input('RX Gain', 'rxGainDb', 'dB')}</div></section>
+    <section><h3>PUSCH</h3><div className="grid cols-3"><Field label="Mode"><select value={c.puschTargetMode} onChange={(e) => set('puschTargetMode', e.target.value)}><option value="auto">Auto</option><option value="manual">Manual</option></select></Field>{c.puschTargetMode === 'manual' && input('Target SNR', 'puschTargetSnrX10', `${c.puschTargetSnrX10 || '89'} → ${(Number(c.puschTargetSnrX10 || 89) / 10).toFixed(1)} dB`)}</div></section>
+    <section><h3>UL Scheduler</h3><div className="grid cols-4"><Field label="Mode"><select value={c.schedulerMode} onChange={(e) => set('schedulerMode', e.target.value)}><option value="auto">Auto</option><option value="manual">Manual</option></select></Field>{c.schedulerMode === 'manual' && <><Field label="Modulation"><select value={c.qm} onChange={(e) => set('qm', e.target.value)}><option value="">Select…</option>{QM_OPTIONS.map((x) => <option key={x.value} value={x.value}>{x.label}</option>)}</select>{errors.qm && <span className="field-error">{errors.qm}</span>}</Field>{input('MCS', 'mcs', range ? `${range.min}–${range.max} for selected modulation` : 'Select modulation first')}{input('N_PRB', 'nPrb')}</>}</div></section>
+    <section><h3>Traffic</h3><div className="grid cols-3">{input('UL Traffic', 'ulTrafficMbps', 'Mbps · values ≥100 request saturation')}</div></section>
+    <div className="row"><button className="btn primary" disabled={saving} onClick={onSave}>{saving ? 'Saving…' : 'Save Configuration'}</button><button className="btn" onClick={onCancel}>Cancel</button></div>
+  </div></Card>;
+}
 
-      {/* Delete confirm (floating window) */}
-      {deleteTarget && (
-        <Modal
-          title="Delete Experiment"
-          sub={deleteTarget.experiment_id}
-          onClose={() => setDeleteTarget(null)}
-          footer={
-            <>
-              <button className="btn" onClick={() => setDeleteTarget(null)}>Cancel</button>
-              <button className="btn danger" disabled={deleting} onClick={confirmDelete}>
-                {deleting ? 'Deleting…' : 'Delete'}
-              </button>
-            </>
-          }
-        >
-          <div className="notice-box">
-            This permanently removes the experiment, its conditions, runs, templates and derived files. This cannot be undone.
-          </div>
-        </Modal>
-      )}
-
-      {/* Template editor (floating window, structured OAI fields) */}
-      {tplModal &&
-        (() => {
-          const c = tplModal.config;
-          const puschManual = c.puschTargetMode === 'manual';
-          const schedManual = c.schedulerMode === 'manual';
-          return (
-            <Modal
-              title={tplEditing != null ? 'Edit Template' : 'Add Template'}
-              sub={selected?.experiment_id}
-              onClose={() => {
-                setTplModal(null);
-                setTplEditing(null);
-              }}
-              size="lg"
-              footer={<button className="btn primary" onClick={saveTemplate}>Save Template</button>}
-            >
-              <div className="stack">
-                <Field label="Template name">
-                  <input value={tplModal.name} placeholder="e.g. my_template" onChange={(e) => setTplModal({ ...tplModal, name: e.target.value })} />
-                </Field>
-
-                <h3 style={{ margin: 0 }}>RF / gNB</h3>
-                <div className="grid cols-3">
-                  <Field label="Frequency (MHz)">
-                    <input className="mono" type="number" value={c.frequencyMHz} onChange={(e) => setTplField('frequencyMHz', e.target.value)} />
-                  </Field>
-                  <Field label="Bandwidth (MHz)">
-                    <input className="mono" type="number" value={c.bandwidthMHz} onChange={(e) => setTplField('bandwidthMHz', e.target.value)} />
-                  </Field>
-                  <Field label="TX gain (dB)">
-                    <input className="mono" type="number" value={c.txGainDb} onChange={(e) => setTplField('txGainDb', e.target.value)} />
-                  </Field>
-                  <Field label="RX gain (dB)">
-                    <input className="mono" type="number" value={c.rxGainDb} onChange={(e) => setTplField('rxGainDb', e.target.value)} />
-                  </Field>
-                </div>
-
-                <h3 style={{ margin: 0 }}>PUSCH target</h3>
-                <div className="grid cols-3">
-                  <Field label="PUSCH target mode">
-                    <select
-                      value={c.puschTargetMode}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setTplModal((m) => {
-                          if (!m) return m;
-                          const config: Record<string, string> = { ...m.config, puschTargetMode: v };
-                          if (v === 'manual' && !config.puschTargetSnrX10) config.puschTargetSnrX10 = '89';
-                          return { ...m, config };
-                        });
-                      }}
-                    >
-                      <option value="auto">auto</option>
-                      <option value="manual">manual</option>
-                    </select>
-                  </Field>
-                  {puschManual && (
-                    <Field label="PUSCH target SNR (×10)">
-                      <input className="mono" type="number" value={c.puschTargetSnrX10} onChange={(e) => setTplField('puschTargetSnrX10', e.target.value)} />
-                    </Field>
-                  )}
-                </div>
-
-                <h3 style={{ margin: 0 }}>UL scheduler</h3>
-                <div className="grid cols-3">
-                  <Field label="Scheduler mode">
-                    <select
-                      value={c.schedulerMode}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setTplModal((m) => {
-                          if (!m) return m;
-                          const config: Record<string, string> = { ...m.config, schedulerMode: v };
-                          if (v === 'manual') {
-                            if (!config.qm) config.qm = '2';
-                            if (!config.mcs) config.mcs = '0';
-                            if (!config.nPrb) config.nPrb = '273';
-                          }
-                          return { ...m, config };
-                        });
-                      }}
-                    >
-                      <option value="auto">auto</option>
-                      <option value="manual">manual</option>
-                    </select>
-                  </Field>
-                  {schedManual && (
-                    <>
-                      <Field label="Qm (modulation)">
-                        <select
-                          value={c.qm}
-                          onChange={(e) => {
-                            const v = e.target.value;
-                            setTplModal((m) => {
-                              if (!m) return m;
-                              const config: Record<string, string> = { ...m.config, qm: v };
-                              const r = QM_MCS_RANGE[v];
-                              const cur = Number(config.mcs);
-                              if (r && (config.mcs === '' || !Number.isFinite(cur) || cur < r.min || cur > r.max)) {
-                                config.mcs = String(r.min);
-                              }
-                              return { ...m, config };
-                            });
-                          }}
-                        >
-                          {QM_OPTIONS.map((o) => (
-                            <option key={o.value} value={o.value}>{o.label}</option>
-                          ))}
-                        </select>
-                      </Field>
-                      <Field label="MCS" hint={mcsRangeHint(c.qm)}>
-                        <input className="mono" type="number" value={c.mcs} placeholder={mcsRangeHint(c.qm)} onChange={(e) => setTplField('mcs', e.target.value)} />
-                      </Field>
-                      <Field label="N_PRB">
-                        <input className="mono" type="number" value={c.nPrb} onChange={(e) => setTplField('nPrb', e.target.value)} />
-                      </Field>
-                    </>
-                  )}
-                </div>
-              </div>
-            </Modal>
-          );
-        })()}
-
-      {overlay && <FullScreenLoader title={overlay.title} steps={overlay.steps} active={overlay.active} />}
-    </div>
-  );
+function RunResultDetail({ runId, nav, onDelete, onClose }: { runId: string; nav: (path: string) => void; onDelete: () => void; onClose: () => void }) {
+  const run = useLoad<RunDetail>(() => api.get(`/api/runs/${encodeURIComponent(runId)}`), [runId]);
+  if (run.loading && !run.data) return <Card title="Run Result"><Spinner /></Card>;
+  if (run.error) return <Card title="Run Result"><ErrorBox error={run.error} /><button className="btn sm" onClick={run.reload}>Retry</button></Card>;
+  if (!run.data) return null;
+  const item = run.data;
+  return <Card title="Result Detail" sub={`${item.experiment_id} / ${item.run_id}`} right={<button className="btn sm" onClick={onClose}>Close</button>}><div className="stack">
+    <div className="result-context"><div><span>Experiment</span><b>{item.experiment_id}</b></div><div><span>Run</span><b>{item.run_id}</b></div><div><span>Configuration</span><b>{item.configuration_name || (item.requested_config ? 'Recorded snapshot' : 'Snapshot unavailable')}</b></div><div><span>Status</span><Badge tone={statusTone(item.quality_status || item.state)}>{item.quality_status || item.state}</Badge></div></div>
+    <section><h3>Run Summary</h3><dl className="config-values"><div><dt>Run ID</dt><dd>{item.run_id}</dd></div><div><dt>Experiment ID</dt><dd>{item.experiment_id}</dd></div><div><dt>Condition ID</dt><dd>{item.condition_id}</dd></div><div><dt>Started</dt><dd>{fmtTs(item.started_utc_ms)}</dd></div><div><dt>Completed</dt><dd>{fmtTs(item.ended_utc_ms)}</dd></div><div><dt>State</dt><dd>{item.state}</dd></div><div><dt>Quality</dt><dd>{item.quality_status || 'Not evaluated'}</dd></div></dl></section>
+    <section><h3>Requested Configuration</h3><ConfigValues data={item.requested_config} /></section><section><h3>Applied / Verified Configuration</h3><ConfigValues data={item.actual_config} /></section>
+    <section><h3>Result</h3><div className="result-counts"><span>Phone records <b>{item.record_counts?.phone ?? 0}</b></span><span>gNB records <b>{item.record_counts?.gnb ?? 0}</b></span><span>CIR records <b>{item.record_counts?.cir ?? 0}</b></span><span>Clips <b>{item.record_counts?.clips ?? 0}</b></span></div>{item.last_error && <ErrorBox error={item.last_error} />}<button className="btn primary" onClick={() => nav(`/timeline/${encodeURIComponent(item.experiment_id)}/${encodeURIComponent(item.run_id)}`)}>Open Records & Clips</button></section>
+    <details className="danger-zone"><summary>Run actions</summary><div className="row between"><span className="muted-text">Deleting removes this Run and its indexed records.</span><button className="btn danger" onClick={onDelete}>Delete Run</button></div></details>
+  </div></Card>;
 }

@@ -7,6 +7,18 @@
 
 ## 0. 2026-08-17 本轮续作结果
 
+### 0.1 Experiments UX / 信息架构重构（最新）
+
+- Experiments 列表已缩为配置/回顾入口：AC/RC 颜色区分卡片、搜索、环境筛选、排序、12 条分页；卡片仅展示身份、用途、人员、创建时间、Configuration/Run 数、最近结果/活动，主操作只有 **Manage Experiment**，导出/删除收进 More。
+- 单实验已改为单层工作区：**Overview / Configurations / History**。Overview 的 ID/environment/created 只读；Configurations 显式展示“下一次 Run 的默认配置”，RC Setup 只出现在 RC 实验的该页；History 按新到旧展示 Run 并打开单次结果详情和 Records & Clips。
+- 页面不再包含 Run/Stop/Push/Phone/ADB/全屏流程加载；执行操作继续留在 Dashboard。打开 Experiments/详情页只有 GET，不再因读取页面写库。
+- `oai_templates` 编辑由旧的 delete+create 改为稳定 ID 的 PUT 更新；支持复制、显式设默认、归档非默认配置。新建 Experiment 由后端创建流程自动建立 Default Configuration，部分失败会显式返回 `configuration_error`。
+- `runs` 新增 `configuration_id`/`configuration_name`，TaskFlow 启动时冻结 `requested_config_json`，应用后冻结 `actual_config_json`；以后修改/归档 Configuration 不会改变历史 Run。旧 Run 不反推当前配置：有历史 JSON 显示 Recorded snapshot，确实没有则显示 Snapshot unavailable。
+- 配置编辑器按 RF / PUSCH / UL Scheduler / Traffic 分组，含数值、增益、MCS/Qm/N_PRB 即时校验；切页、返回和浏览器关闭均有未保存保护。危险操作均放低频区域并要求确认。
+- Run 详情显式显示 Experiment / Run / Configuration / Status、requested/applied 快照及 phone/gNB/CIR/clip 数；Records & Clips 页头也保留相同上下文。Run 删除会同步清理 CIR、配置 provenance、clips、RC samples 等索引。
+- 验证：后端 **56 passed**；前端 `tsc --noEmit` + Vite production build 通过；`deploy.ps1 -SkipAndroid` 已完成最终覆盖部署（未备份、未卸载、未重装 Android）。浏览器 E2E 已验证创建→自动默认→原地编辑（ID 保持 18）→复制→设默认→搜索→RC Setup→History→Result→Records & Clips；临时实验 `UX_E2E_20260817_1343` 已精确删除且刷新确认无残留。
+- 最新只读状态：平台后端/页面正常，手机显示 CONNECTED；OAI 控制端 gNB 当前为 `exited, exitCode=0`。`/api/gnb/progress` 表明它来自 13:14:35 完成的显式 `action=stop`（request `pc-1786943675481`），不是本次 Web 部署导致；本轮未擅自重启 gNB，核心网仍为 10/10。
+
 - 已安装/准备 `deploy.ps1` 所需依赖：Python 包、前端 npm 依赖、Microsoft JDK 17、Android command-line tools/platform/build-tools、Gradle wrapper；免安装工具位于被忽略的 `.tools/`。
 - `deploy.ps1` 已支持自动发现仓库内 JDK/Android SDK、Gradle wrapper、自检后台后端启动，以及 APK 安装失败显式退出。Android 新 APK 已安装并可由 `deploy.ps1` 直接 `adb install -r` 覆盖；后续**只允许覆盖安装，不再备份、不卸载、不走系统安装器**，避免反复触发安全验证。
 - 平台后端已在 `127.0.0.1:8900` 运行并加载 RC/Stirrer 新端点；模拟搅拌器 connect → +5° move → disconnect API 冒烟通过。
@@ -103,7 +115,7 @@
 | RC campaign E2E | ✅ 2-step 首跑 + 1-step 热更新复核；原始 JSON、手机回拉、Chamber、Timeline 均通过 |
 | 页面分配 | ✅ AC/RC 统一在 Experiments；不同颜色卡片；统一 Create Experiment；RC Setup 仅从 RC 卡片进入 |
 | 记录与剪辑 | ✅ run 选择、独立时间轴、按 run 融合剪辑、保存列表和 CSV 下载；浏览器 E2E 已验证 |
-| 自动测试 | ✅ 后端 54 passed；前端 tsc + Vite build；Android assembleDebug |
+| 自动测试 | ✅ 后端 56 passed；前端 tsc + Vite build；Android assembleDebug（本轮无 Android 改动，未重装） |
 
 ---
 

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     purpose TEXT,
     flow TEXT,
     initial_oai_config TEXT,
+    default_template_id INTEGER,
     created_utc TEXT NOT NULL,
     schema_version INTEGER NOT NULL
 );
@@ -30,7 +31,9 @@ CREATE TABLE IF NOT EXISTS oai_templates (
     experiment_id TEXT NOT NULL,
     name TEXT NOT NULL,
     config_json TEXT NOT NULL,
-    created_utc TEXT NOT NULL
+    created_utc TEXT NOT NULL,
+    updated_utc TEXT,
+    archived_utc TEXT
 );
 
 CREATE TABLE IF NOT EXISTS experiment_acks (
@@ -102,6 +105,7 @@ CREATE TABLE IF NOT EXISTS runs (
     planned_order INTEGER, actual_order INTEGER, random_seed INTEGER,
     planned_start_utc_ms INTEGER, start_delay_s REAL,
     requested_config_json TEXT, actual_config_json TEXT,
+    configuration_id INTEGER, configuration_name TEXT,
     started_utc_ms INTEGER, ended_utc_ms INTEGER,
     quality_status TEXT, quality_flags_json TEXT,
     FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id),
@@ -244,16 +248,48 @@ class Database:
         with self._lock:
             self._conn.executescript(SCHEMA_DDL)
             # migration: add task fields to pre-existing experiments table
-            for col, typ in (("purpose", "TEXT"), ("flow", "TEXT"), ("initial_oai_config", "TEXT")):
+            for col, typ in (("purpose", "TEXT"), ("flow", "TEXT"), ("initial_oai_config", "TEXT"),
+                             ("default_template_id", "INTEGER")):
                 try:
                     self._conn.execute(f"ALTER TABLE experiments ADD COLUMN {col} {typ}")
                 except Exception:
                     pass
+            for table, columns in (
+                ("oai_templates", (("updated_utc", "TEXT"), ("archived_utc", "TEXT"))),
+                ("runs", (("configuration_id", "INTEGER"), ("configuration_name", "TEXT"))),
+            ):
+                for col, typ in columns:
+                    try:
+                        self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+                    except Exception:
+                        pass
             # migration: add gNB data timestamp to pre-existing experiment_acks table
             try:
                 self._conn.execute("ALTER TABLE experiment_acks ADD COLUMN gnb_data_timestamp_ms INTEGER")
             except Exception:
                 pass
+            # One-time backend migration for legacy experiments. Page reads
+            # remain read-only; no UI-open side effects are needed anymore.
+            # SQLite does not consistently allow an outer UPDATE column in a
+            # correlated subquery's ORDER BY expression. Resolve the same
+            # priority explicitly: matching stored config, named Default,
+            # then the first active Configuration.
+            self._conn.execute(
+                "UPDATE experiments SET default_template_id=(SELECT MIN(t.id) FROM oai_templates t "
+                "WHERE t.experiment_id=experiments.experiment_id AND t.archived_utc IS NULL "
+                "AND t.config_json=experiments.initial_oai_config) WHERE default_template_id IS NULL")
+            self._conn.execute(
+                "UPDATE experiments SET default_template_id=(SELECT MIN(t.id) FROM oai_templates t "
+                "WHERE t.experiment_id=experiments.experiment_id AND t.archived_utc IS NULL "
+                "AND t.name='Default') WHERE default_template_id IS NULL")
+            self._conn.execute(
+                "UPDATE experiments SET default_template_id=(SELECT MIN(t.id) FROM oai_templates t "
+                "WHERE t.experiment_id=experiments.experiment_id AND t.archived_utc IS NULL) "
+                "WHERE default_template_id IS NULL")
+            self._conn.execute(
+                "UPDATE experiments SET initial_oai_config=(SELECT config_json FROM oai_templates "
+                "WHERE id=experiments.default_template_id) WHERE default_template_id IS NOT NULL "
+                "AND initial_oai_config IS NULL")
             self._conn.commit()
 
     # -- low level --------------------------------------------------------- #

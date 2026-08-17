@@ -519,10 +519,48 @@ pre.raw {
 .details[open] summary::after { content: "▴"; }
 .details .details-body { padding: 14px; }
 
+/* ---- experiments workspace ---- */
+.experiment-toolbar { display: grid; grid-template-columns: minmax(260px, 1fr) 180px 180px auto; gap: 10px; align-items: end; }
+.experiment-card { position: relative; border-left: 4px solid var(--accent); }
+.experiment-card.rc { border-left-color: var(--warn); }
+.experiment-card h2 { margin: 0; font-size: 17px; }
+.experiment-purpose { min-height: 42px; margin: 14px 0 8px; color: var(--muted); line-height: 1.5; }
+.experiment-card-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 14px; padding: 12px; border-radius: var(--radius-sm); background: var(--panel-2); font-size: 12px; color: var(--muted); }
+.experiment-card-stats b { color: var(--ink); }
+.more-menu { position: relative; }
+.more-menu > summary { list-style: none; cursor: pointer; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; font-weight: 700; letter-spacing: 2px; }
+.more-menu > summary::-webkit-details-marker { display: none; }
+.more-menu > div { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 4; width: 180px; padding: 6px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); box-shadow: var(--shadow-lg); }
+.more-menu button { display: block; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--ink); text-align: left; cursor: pointer; }
+.more-menu button:hover { background: var(--panel-2); }
+.danger-text { color: var(--bad) !important; }
+.pagination { display: flex; justify-content: flex-end; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.pagination span { margin-right: auto; }
+.muted-text { color: var(--muted); font-size: 12px; }
+.notice-box { padding: 10px 12px; border: 1px solid #c8d8ff; border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--accent-strong); font-size: 13px; }
+.configuration-card { padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); }
+.configuration-card.default { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.configuration-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 14px 0; }
+.configuration-summary div, .config-values div { min-width: 0; padding: 9px 10px; border-radius: 7px; background: var(--panel-2); }
+.configuration-summary dt, .config-values dt { color: var(--faint); font-size: 11px; }
+.configuration-summary dd, .config-values dd { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 12px; font-weight: 600; }
+.config-values { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.field-error { display: block; margin-top: 4px; color: var(--bad); font-size: 11px; }
+.result-context { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.result-context > div { display: flex; flex-direction: column; gap: 5px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.result-context span:first-child { color: var(--faint); font-size: 11px; }
+.result-counts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.result-counts span { padding: 8px 10px; border-radius: 999px; background: var(--panel-2); color: var(--muted); font-size: 12px; }
+.danger-zone { padding: 12px 14px; border: 1px solid #f1c7c2; border-radius: var(--radius-sm); background: var(--bad-soft); }
+.danger-zone > summary { cursor: pointer; color: var(--bad); font-weight: 700; }
+.danger-zone[open] > summary { margin-bottom: 12px; }
+
 /* ---- responsive ---- */
 @media (max-width: 1080px) {
   .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cols-3, .cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .experiment-toolbar { grid-template-columns: 1fr 1fr; }
+  .result-context { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 900px) {
   .app { flex-direction: column; }
@@ -534,4 +572,5 @@ pre.raw {
   .cols-2, .cols-3, .cols-4, .two-col, .stat-grid { grid-template-columns: 1fr; }
   .page { padding: 16px; }
   .topbar { padding: 12px 16px; }
+  .experiment-toolbar, .configuration-summary, .config-values, .result-context { grid-template-columns: 1fr; }
 }

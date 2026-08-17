@@ -9,6 +9,17 @@ from __future__ import annotations
 UL_SATURATION_THRESHOLD_MBPS = 100.0
 UL_TRAFFIC_DEFAULT_MBPS = 5.0  # safe default; saturation is explicit (>= 100)
 
+DEFAULT_OAI_CONFIGURATION = {
+    "frequencyMHz": 3349.92,
+    "bandwidthMHz": 100,
+    "txGainDb": 60,
+    "rxGainDb": 40,
+    "puschTargetMode": "manual",
+    "puschTargetSnrX10": 89,
+    "schedulerMode": "auto",
+    "ulTrafficMbps": UL_TRAFFIC_DEFAULT_MBPS,
+}
+
 TEMPLATES = {
     "AC_SIGNAL_SWEEP": {
         "description": "改变 TX gain / 标定入射条件，其余固定",

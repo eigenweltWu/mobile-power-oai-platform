@@ -53,7 +53,7 @@ export default function App() {
     case 'experiments':
       page = segments[1] && segments[2] === 'rc'
         ? <Chamber initialExperimentId={decodeURIComponent(segments[1])} onBack={() => nav('/experiments')} />
-        : <Experiments nav={nav} />;
+        : <Experiments nav={nav} initialExperimentId={segments[1] ? decodeURIComponent(segments[1]) : ''} />;
       break;
     case 'timeline':
       page = <Timeline experimentId={decodeURIComponent(segments[1] || '')}

@@ -293,8 +293,8 @@ class ExperimentManager:
 
         # run-scoped tables (children of runs)
         for rid in run_ids:
-            for table in ("sync_anchors", "oai_snapshots", "oai_events", "oai_config",
-                          "run_transitions", "phone_samples"):
+            for table in ("sync_anchors", "oai_snapshots", "oai_events", "oai_channel",
+                          "oai_config", "run_transitions", "phone_samples", "rc_samples"):
                 self.db.execute(f"DELETE FROM {table} WHERE run_id=?", (rid,))
 
         # experiment-scoped rows

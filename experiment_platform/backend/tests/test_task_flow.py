@@ -476,6 +476,47 @@ def test_start_experiment_force_restarts_gnb(tmp_path):
     db.close()
 
 
+def test_configuration_update_keeps_id_and_run_snapshot(tmp_path):
+    """Editing a Configuration is an in-place update, while a started Run
+    keeps the exact requested/applied values it recorded at execution time."""
+    import json
+
+    flow, db, oai, tid = _make_template_flow(tmp_path)
+    original = {"bandwidthMHz": 20, "txGainDb": 70}
+    applied = {"bandwidthMHz": 20, "txGainDb": 69.5}
+    flow.set_default_template("EXP3", tid)
+    oai.research_config_raw.return_value = applied
+
+    result = flow.start_experiment("EXP3", "53616213")
+    run = db.get_run(result["run_id"])
+    assert run["configuration_id"] == tid
+    assert run["configuration_name"] == "T1"
+    assert json.loads(run["requested_config_json"]) == original
+    assert json.loads(run["actual_config_json"]) == applied
+
+    changed = flow.update_template("EXP3", tid, "T1 edited", {"bandwidthMHz": 40, "txGainDb": 65})
+    assert changed["id"] == tid
+    frozen = db.get_run(result["run_id"])
+    assert frozen["configuration_name"] == "T1"
+    assert json.loads(frozen["requested_config_json"]) == original
+    assert json.loads(frozen["actual_config_json"]) == applied
+
+    flow.stop_experiment("EXP3")
+    db.close()
+
+
+def test_default_configuration_cannot_be_archived(tmp_path):
+    """The explicit next-Run default must be changed before it can be archived."""
+    import pytest
+
+    flow, db, _oai, tid = _make_template_flow(tmp_path)
+    flow.set_default_template("EXP3", tid)
+    with pytest.raises(ValueError, match="default configuration"):
+        flow.delete_template("EXP3", tid)
+    assert flow.list_templates("EXP3")[0]["id"] == tid
+    db.close()
+
+
 def test_start_experiment_restart_failure_marks_run_error(tmp_path):
     """When the forced gNB restart fails, the run must transition to ERROR
     (visible on the dashboard) and the failure must propagate to the API."""

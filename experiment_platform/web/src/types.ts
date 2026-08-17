@@ -51,6 +51,8 @@ export interface Run {
   start_delay_s?: number | null;
   requested_config_json?: string | null;
   actual_config_json?: string | null;
+  configuration_id?: number | null;
+  configuration_name?: string | null;
   started_utc_ms?: number | null;
   ended_utc_ms?: number | null;
   quality_status?: string | null;
@@ -60,6 +62,7 @@ export interface Run {
   requested_config?: Record<string, unknown> | null;
   actual_config?: Record<string, unknown> | null;
   quality_flags?: string[] | null;
+  last_error?: string | null;
   [key: string]: unknown;
 }
 

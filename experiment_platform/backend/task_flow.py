@@ -366,17 +366,80 @@ class TaskFlow:
 
     # ---- OAI templates ----------------------------------------------------- #
     def list_templates(self, experiment_id: str) -> list[dict]:
-        return self.db.query("SELECT * FROM oai_templates WHERE experiment_id=? ORDER BY id", (experiment_id,))
+        return self.db.query(
+            "SELECT t.*, CASE WHEN e.default_template_id=t.id THEN 1 ELSE 0 END AS is_default, "
+            "(SELECT COUNT(*) FROM runs r WHERE r.configuration_id=t.id) AS used_by_runs "
+            "FROM oai_templates t JOIN experiments e ON e.experiment_id=t.experiment_id "
+            "WHERE t.experiment_id=? AND t.archived_utc IS NULL ORDER BY t.id",
+            (experiment_id,))
 
     def add_template(self, experiment_id: str, name: str, config: dict) -> dict:
         from datetime import datetime, timezone
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("configuration name is required")
+        if self.db.query_one(
+                "SELECT 1 FROM oai_templates WHERE experiment_id=? AND name=? AND archived_utc IS NULL",
+                (experiment_id, name)):
+            raise ValueError("configuration name already exists")
         now = datetime.now(timezone.utc).isoformat()
-        self.db.execute("INSERT INTO oai_templates(experiment_id,name,config_json,created_utc) VALUES(?,?,?,?)",
-                        (experiment_id, name, json.dumps(config, ensure_ascii=False), now))
-        return {"name": name, "config": config}
+        template_id = self.db.execute(
+            "INSERT INTO oai_templates(experiment_id,name,config_json,created_utc,updated_utc) VALUES(?,?,?,?,?)",
+            (experiment_id, name, json.dumps(config, ensure_ascii=False), now, now))
+        return self.db.query_one("SELECT * FROM oai_templates WHERE id=?", (template_id,))
+
+    def update_template(self, experiment_id: str, template_id: int, name: str, config: dict) -> dict:
+        from datetime import datetime, timezone
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("configuration name is required")
+        row = self.db.query_one(
+            "SELECT * FROM oai_templates WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
+            (template_id, experiment_id))
+        if not row:
+            raise ValueError("configuration not found")
+        if self.db.query_one(
+                "SELECT 1 FROM oai_templates WHERE experiment_id=? AND name=? "
+                "AND id<>? AND archived_utc IS NULL",
+                (experiment_id, name, template_id)):
+            raise ValueError("configuration name already exists")
+        now = datetime.now(timezone.utc).isoformat()
+        config_json = json.dumps(config, ensure_ascii=False)
+        self.db.execute(
+            "UPDATE oai_templates SET name=?,config_json=?,updated_utc=? WHERE id=?",
+            (name, config_json, now, template_id))
+        exp = self.db.query_one("SELECT default_template_id FROM experiments WHERE experiment_id=?", (experiment_id,))
+        if exp and exp.get("default_template_id") == template_id:
+            self.db.execute("UPDATE experiments SET initial_oai_config=? WHERE experiment_id=?",
+                            (config_json, experiment_id))
+        return self.db.query_one("SELECT * FROM oai_templates WHERE id=?", (template_id,))
+
+    def set_default_template(self, experiment_id: str, template_id: int) -> dict:
+        row = self.db.query_one(
+            "SELECT * FROM oai_templates WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
+            (template_id, experiment_id))
+        if not row:
+            raise ValueError("configuration not found")
+        self.db.execute(
+            "UPDATE experiments SET default_template_id=?,initial_oai_config=? WHERE experiment_id=?",
+            (template_id, row["config_json"], experiment_id))
+        return row
 
     def delete_template(self, experiment_id: str, template_id: int) -> None:
-        self.db.execute("DELETE FROM oai_templates WHERE id=? AND experiment_id=?", (template_id, experiment_id))
+        from datetime import datetime, timezone
+        row = self.db.query_one(
+            "SELECT id FROM oai_templates WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
+            (template_id, experiment_id))
+        if not row:
+            raise ValueError("configuration not found")
+        exp = self.db.query_one("SELECT default_template_id FROM experiments WHERE experiment_id=?", (experiment_id,))
+        if exp and exp.get("default_template_id") == template_id:
+            raise ValueError("default configuration cannot be archived")
+        now = datetime.now(timezone.utc).isoformat()
+        self.db.execute(
+            "UPDATE oai_templates SET archived_utc=?,updated_utc=? "
+            "WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
+            (now, now, template_id, experiment_id))
 
     def apply_template(self, experiment_id: str, template_id: int,
                        serial: str = "53616213", pc_port: int = 8420) -> dict:
@@ -467,14 +530,27 @@ class TaskFlow:
         # separate "initial config" concept — the startup config IS one of the
         # experiment's templates) > the experiment's stored initial_oai_config.
         initial = None
+        configuration_id = None
+        configuration_name = None
         if template_id is not None:
             row = self.db.query_one(
-                "SELECT config_json FROM oai_templates WHERE id=? AND experiment_id=?",
+                "SELECT id,name,config_json FROM oai_templates WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
                 (template_id, experiment_id))
-            if row and row["config_json"]:
-                initial = json.loads(row["config_json"])
+            if not row:
+                raise ValueError("configuration not found")
+            configuration_id, configuration_name = row["id"], row["name"]
+            initial = json.loads(row["config_json"])
         if initial is None:
-            initial = json.loads(exp["initial_oai_config"]) if exp.get("initial_oai_config") else {}
+            if exp.get("default_template_id"):
+                row = self.db.query_one(
+                    "SELECT id,name,config_json FROM oai_templates WHERE id=? AND archived_utc IS NULL",
+                    (exp["default_template_id"],))
+                if row:
+                    configuration_id, configuration_name = row["id"], row["name"]
+                    initial = json.loads(row["config_json"])
+            if initial is None:
+                initial = json.loads(exp["initial_oai_config"]) if exp.get("initial_oai_config") else {}
+                configuration_name = "Legacy default" if initial else None
 
         # Resolve idle/collection timings (explicit param > global default).
         idle_s = float(idle_seconds) if idle_seconds is not None else DEFAULT_IDLE_SECONDS
@@ -529,6 +605,10 @@ class TaskFlow:
             "device_id": serial, "session_id": None, "state": "PREPARING",
             "planned_order": None, "random_seed": None,
             "start_delay_s": 0.0,
+            "configuration_id": configuration_id,
+            "configuration_name": configuration_name,
+            "requested_config_json": json.dumps(initial or {}, ensure_ascii=False),
+            "started_utc_ms": int(time.time() * 1000),
         })
         self.db.transition(run_id, "PREPARING", "start_experiment: gNB starting + downlink loop")
 
@@ -550,6 +630,9 @@ class TaskFlow:
             time.sleep(2.0)  # let the modem release the PDU session
         try:
             result = self.oai.apply_condition(initial or {}, force_restart=True)
+            actual = self.oai.research_config_raw()
+            if isinstance(actual, dict):
+                self.db.set_json(run_id, "actual_config_json", actual)
             gnb_ready = True
         except Exception as e:
             self.db.transition(run_id, "ERROR", f"start_experiment: gNB restart failed: {e}")
@@ -587,7 +670,9 @@ class TaskFlow:
         #    goodput alongside the phone telemetry.
         self._start_collectors(run_id, experiment_id)
         return {"ok": ready and in_sync, "gnb_started": gnb_ready, "gnb_running": ready,
-                "ue_in_sync": in_sync, "config_applied": initial, "downlink_started": True,
+                "ue_in_sync": in_sync, "config_applied": initial,
+                "configuration_id": configuration_id, "configuration_name": configuration_name,
+                "downlink_started": True,
                 "sync_pending": True, "run_id": run_id, "shake": shake}
 
     def stop_experiment(self, experiment_id: str, serial: str = "53616213",
@@ -645,6 +730,7 @@ class TaskFlow:
 
         # 4. Mark the run STOPPED
         if run_id:
+            self.db.execute("UPDATE runs SET ended_utc_ms=? WHERE run_id=?", (stop_ms, run_id))
             self.db.transition(run_id, "STOPPED", "stopped by user", utc_ms=stop_ms)
         return {"ok": True, "pc_stop_ms": stop_ms, "phone_stop_ms": phone_stop_ms, "run_id": run_id}
 

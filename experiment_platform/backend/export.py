@@ -82,6 +82,9 @@ def _write_csv_parquet(zf: zipfile.ZipFile, name: str, df: pd.DataFrame) -> None
 def build_manifest(settings: Settings, db: Database, experiment_id: str,
                    runs_meta: list[dict], devices: list[dict], sync_rows: list[dict],
                    quality_flags: list[str]) -> dict:
+    processing = db.query(
+        "SELECT DISTINCT processing_algorithm,processing_version,noise_method,noise_margin_db "
+        "FROM rc_samples WHERE experiment_id=?", (experiment_id,))
     return {
         "experiment_id": experiment_id,
         "created_utc": _utcnow(),
@@ -90,6 +93,29 @@ def build_manifest(settings: Settings, db: Database, experiment_id: str,
         "oai": settings.redacted,
         "devices": devices,
         "runs": runs_meta,
+        "execution_modes": {r["run_id"]: r.get("execution_mode") or "UNKNOWN" for r in runs_meta},
+        "simulated_runs": [r["run_id"] for r in runs_meta if r.get("simulation")],
+        "metric_contracts": {
+            "bler": "fraction from OAI snapshot estimator; UI renders percent",
+            "harq_retransmission_rate": "retransmission deltas / (initial transmission deltas + retransmission deltas)",
+            "rc_resolved_paths": ("local PDP peaks that pass noise threshold, prominence and "
+                                  "minimum delay-separation / resolution constraints"),
+            "raw_vs_derived": {
+                "measured": ["raw OAI complex channel payload", "PUSCH RSSI", "HARQ counters/deltas", "goodput snapshots"],
+                "derived": ["complex frequency response when reconstructed from CIR", "PDP", "noise floor", "candidate peaks", "resolved effective multipath components", "RMS delay", "K-factor", "window summaries"],
+            },
+        },
+        "channel_processing": {
+            "source_of_truth": "immutable per-Sample raw OAI channel JSON",
+            "standard_pipeline": ["complex channel source", "complex CIR", "PDP",
+                                  "noise threshold", "local peak detection", "prominence filter",
+                                  "minimum separation", "resolved effective components"],
+            "processing_variants": processing,
+            "raw_data_retained": True,
+            "derived_data_overwrites_raw": False,
+            "phase_rule": "absolute phase is not physically interpreted without recorded calibration",
+            "spatial_rule": "AoA/AoD unavailable without a spatial measurement dimension",
+        },
         "clock_sync": {
             "n_runs": len(sync_rows),
             "anchors": sync_rows[:200],
@@ -115,6 +141,13 @@ def export_experiment(db: Database, settings: Settings, experiment_id: str,
     runs = db.query("SELECT * FROM runs WHERE experiment_id=?", (experiment_id,))
     run_ids = [r["run_id"] for r in runs]
     conditions = db.query("SELECT * FROM conditions WHERE experiment_id=?", (experiment_id,))
+    configurations = db.query("SELECT * FROM oai_templates WHERE experiment_id=?", (experiment_id,))
+    clips = db.query("SELECT * FROM clips WHERE experiment_id=?", (experiment_id,))
+    clip_ids = [row["id"] for row in clips]
+    clip_segments = [segment for clip_id in clip_ids for segment in
+                     db.query("SELECT * FROM clip_segments WHERE clip_id=? ORDER BY segment_order", (clip_id,))]
+    rc_samples = [sample for run_id in run_ids for sample in
+                  db.query("SELECT * FROM rc_samples WHERE run_id=? ORDER BY sample_index", (run_id,))]
     devices = db.query("SELECT * FROM devices")
     sync_rows = []
     for rid in run_ids:
@@ -164,7 +197,11 @@ def export_experiment(db: Database, settings: Settings, experiment_id: str,
         # top-level tables
         _write_csv_parquet(zf, "devices.csv", pd.DataFrame(devices))
         _write_csv_parquet(zf, "conditions.csv", pd.DataFrame(conditions))
+        _write_csv_parquet(zf, "configurations.csv", pd.DataFrame(configurations))
         _write_csv_parquet(zf, "runs.csv", pd.DataFrame(runs))
+        _write_csv_parquet(zf, "rc_samples.csv", pd.DataFrame(rc_samples))
+        _write_csv_parquet(zf, "clips.csv", pd.DataFrame(clips))
+        _write_csv_parquet(zf, "clip_segments.csv", pd.DataFrame(clip_segments))
         _write_csv_parquet(zf, "sync.csv", pd.DataFrame(sync_rows))
         if not merged_all.empty:
             _write_csv_parquet(zf, "processed/merged_1s.csv", merged_all)

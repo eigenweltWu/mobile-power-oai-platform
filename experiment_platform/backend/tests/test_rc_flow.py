@@ -5,7 +5,76 @@ from unittest.mock import Mock
 
 import pytest
 
-from experiment_platform.backend.rc_flow import RcCampaign, RcConfig, StirrerError
+from experiment_platform.backend.rc_flow import RcCampaign, RcConfig, StirrerError, analyze_cir
+
+
+def test_cir_analysis_counts_clusters_not_threshold_bins():
+    # Two physical paths span five above-threshold bins. The old implementation
+    # reported five "taps"; the traceable contract must report two paths.
+    powers_db = [-90, -30, -28, -31, -90, -45, -44, -90]
+    amplitudes = [10 ** (power / 20) for power in powers_db]
+    result = analyze_cir({"ok": True, "cirRe": amplitudes, "cirIm": [0] * 8,
+                          "dtNs": 10, "metrics": {"noiseDb": -90,
+                          "rmsDelayNs": 999, "kFactorDb": -1, "peakDb": -28}},
+                         noise_floor_db=-80, noise_margin_db=6)
+
+    assert result["processing_status"] == "OK"
+    assert result["effective_path_count"] == 2
+    assert len(result["effective_paths"]) == 2
+    assert result["detection_threshold_db"] == -74
+    assert result["rms_delay_ns_raw"] == 999
+    assert result["rms_delay_ns_filtered"] != 999
+
+
+def test_cir_analysis_surfaces_processing_failure():
+    result = analyze_cir({"ok": False, "error": "scope timeout"}, -80, 6)
+    assert result == {"processing_status": "FAILED", "processing_error": "scope timeout"}
+
+
+def test_resolved_paths_separate_first_from_strongest_and_keep_phase():
+    powers_db = [-100, -50, -100, -100, -30, -100, -100, -100]
+    amplitudes = [10 ** (power / 20) for power in powers_db]
+    result = analyze_cir(
+        {"ok": True, "cirRe": amplitudes, "cirIm": [0.0] * len(amplitudes),
+         "dtNs": 10, "metrics": {}}, -90, 6, {"bandwidthMHz": 100})
+
+    first, strongest = result["resolved_paths"]
+    assert first["delay_ns"] == 10
+    assert first["excess_delay_ns"] == 0
+    assert first["is_first_detected"] is True
+    assert first["is_strongest"] is False
+    assert strongest["delay_ns"] == 40
+    assert strongest["relative_power_db"] == 0
+    assert result["first_detected_path_id"] != result["strongest_path_id"]
+    assert result["nominal_delay_resolution_ns"] == 10
+
+
+def test_minimum_delay_resolution_merges_close_candidate_peaks():
+    powers_db = [-100, -100, -30, -60, -32, -100, -100, -100, -100, -100]
+    amplitudes = [10 ** (power / 20) for power in powers_db]
+    result = analyze_cir(
+        {"ok": True, "cirRe": amplitudes, "cirIm": [0.0] * len(amplitudes),
+         "dtNs": 10, "metrics": {}}, -90, 6, {"bandwidthMHz": 20})
+
+    assert result["raw_delay_bin_count"] == 10
+    assert result["candidate_peak_count"] == 2
+    assert result["effective_peak_count"] == 2
+    assert result["resolved_path_count"] == 1
+    assert result["minimum_resolvable_separation_ns"] == 50
+
+
+def test_configured_delay_window_is_recorded_not_hard_coded():
+    powers_db = [-100, -30, -100, -100, -100, -100, -100, -100]
+    amplitudes = [10 ** (power / 20) for power in powers_db]
+    result = analyze_cir(
+        {"ok": True, "cirRe": amplitudes, "cirIm": [0.0] * len(amplitudes),
+         "dtNs": 10, "metrics": {}}, -90, 6,
+        {"bandwidthMHz": 100, "rcChamber": {
+            "delay_window_start_ns": 5, "delay_window_end_ns": 45}})
+
+    assert result["analysis_delay_window_ns"] == {
+        "start_ns": 5.0, "end_ns": 45.0,
+        "source": "CONFIGURED_CHAMBER_AND_SYSTEM_WINDOW"}
 
 
 def _servo_campaign(runtime_applied: bool) -> RcCampaign:
@@ -61,6 +130,26 @@ def test_campaign_restores_initial_target_without_restart():
     campaign.oai.gnb_pusch_target_snr.assert_called_once_with(
         "auto", None, restart=False)
     assert campaign.pusch_x10 == 200
+
+
+def test_rc_campaign_waits_for_post_start_sync_anchor():
+    campaign = RcCampaign.__new__(RcCampaign)
+    campaign.log = []
+    loop = SimpleNamespace(sync_confirmed=False)
+
+    class StopAfterSync:
+        def wait(self, _seconds):
+            loop.sync_confirmed = True
+            return False
+
+        def is_set(self):
+            return False
+
+    campaign._stop = StopAfterSync()
+
+    assert campaign._wait_for_sync(loop) is True
+    assert campaign.state == "waiting_sync"
+    assert campaign.log[-1]["msg"] == "UE synchronized; Run time anchor recorded"
 
 
 def test_phone_window_waits_for_idle_before_rearm(monkeypatch):

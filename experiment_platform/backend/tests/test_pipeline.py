@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import time
+from unittest.mock import MagicMock
 
 import pandas as pd
 
 from experiment_platform.backend.config import Settings
 from experiment_platform.backend.db import Database
 from experiment_platform.backend.manager import ExperimentManager
+from experiment_platform.backend.collectors import SnapshotCollector
 from .fixtures import (
     MOCK_CONDITION_ID, MOCK_EXPERIMENT_ID, MOCK_RUN_ID,
     make_oai_events_df, make_oai_snapshots_df, make_phone_samples_csv,
@@ -63,6 +65,28 @@ def _insert_config(db: Database, run_id: str):
                (run_id, "before", "MOCK/before.json", "abc"))
     db.execute("INSERT INTO oai_config(run_id,stage,config_json_path,sha256) VALUES(?,?,?,?)",
                (run_id, "after", "MOCK/after.json", "abc"))
+
+
+def test_snapshot_collector_preserves_ul_and_dl_harq_contracts(tmp_path):
+    _, db, settings = _make_manager(tmp_path)
+    client = MagicMock()
+    client.research_ues_raw.return_value = {
+        "collection": {"stale": False},
+        "ues": [{"uplink": {"bler": .1, "harqInitialTxDelta": 10,
+                              "harqRetransmissionDelta": 2,
+                              "harqRetransmissionRatio": 2 / 12, "harqErrors": 1},
+                 "downlink": {"bler": .2, "harqInitialTxDelta": 20,
+                               "harqRetransmissionDelta": 3,
+                               "harqRetransmissionRatio": 3 / 23, "harqErrors": 2}}],
+    }
+    SnapshotCollector("R", settings, db, client).collect_once()
+    row = db.query_one("SELECT * FROM oai_snapshots")
+    assert row["ul_bler"] == .1 and row["dl_bler"] == .2
+    assert row["ul_harq_initial_tx_delta"] == 10
+    assert row["ul_harq_retransmission_delta"] == 2
+    assert row["dl_harq_initial_tx_delta"] == 20
+    assert row["dl_harq_retransmission_delta"] == 3
+    db.close()
 
 
 def test_clear_history_files_is_scoped_and_requires_empty_database(tmp_path):

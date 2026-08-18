@@ -32,6 +32,38 @@ DEFAULT_PHASES = [
     {"name": "idle",     "durationSeconds": 0.0},
 ]
 
+RADIO_CONFIG_KEYS = (
+    "frequencyMHz", "bandwidthMHz", "txGainDb", "rxGainDb",
+    "puschTargetMode", "puschTargetSnrX10", "schedulerMode", "mcs", "qm", "nPrb",
+)
+
+
+def execution_mode(config: dict) -> str:
+    mode = str(config.get("executionMode") or
+               (config.get("rcChamber") or {}).get("execution_mode") or
+               "REAL_HARDWARE").upper()
+    return mode if mode in {"REAL_HARDWARE", "SIMULATION"} else "REAL_HARDWARE"
+
+
+def radio_config(config: dict) -> dict:
+    """Only hardware-applicable keys; RC/traffic metadata stay in Snapshot."""
+    return {key: config[key] for key in RADIO_CONFIG_KEYS if config.get(key) is not None}
+
+
+def config_diff(requested: dict, actual: dict) -> dict:
+    """Compare only authoritative fields returned by the OAI config API."""
+    aliases = {"schedulerMode": "ulSchedulerMode"}
+    diff = {}
+    for key, wanted in radio_config(requested).items():
+        got = actual.get(key, actual.get(aliases.get(key, "")))
+        if isinstance(wanted, (int, float)) and isinstance(got, (int, float)):
+            same = abs(float(wanted) - float(got)) < 1e-6
+        else:
+            same = wanted == got
+        if not same:
+            diff[key] = {"requested": wanted, "actual": got}
+    return diff
+
 
 class TemplateSwitchNotAllowed(ValueError):
     """Template switch rejected: the active run is not in an IDLE phase."""
@@ -452,6 +484,23 @@ class TaskFlow:
             raise ValueError("configuration name already exists")
         now = datetime.now(timezone.utc).isoformat()
         config_json = json.dumps(config, ensure_ascii=False)
+        used = self.db.query_one("SELECT COUNT(*) n FROM runs WHERE configuration_id=?", (template_id,))
+        if used and used["n"]:
+            # A used Configuration is immutable. Editing creates the next
+            # version and archives only the editable catalog entry; historical
+            # Runs retain both the old id/version and their frozen Snapshot.
+            new_id = self.db.execute(
+                "INSERT INTO oai_templates(experiment_id,name,config_json,created_utc,updated_utc,version,supersedes_id) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (experiment_id, name, config_json, now, now, int(row.get("version") or 1) + 1, template_id))
+            self.db.execute("UPDATE oai_templates SET archived_utc=?,updated_utc=? WHERE id=?",
+                            (now, now, template_id))
+            exp = self.db.query_one("SELECT default_template_id FROM experiments WHERE experiment_id=?", (experiment_id,))
+            if exp and exp.get("default_template_id") == template_id:
+                self.db.execute(
+                    "UPDATE experiments SET default_template_id=?,initial_oai_config=? WHERE experiment_id=?",
+                    (new_id, config_json, experiment_id))
+            return self.db.query_one("SELECT * FROM oai_templates WHERE id=?", (new_id,))
         self.db.execute(
             "UPDATE oai_templates SET name=?,config_json=?,updated_utc=? WHERE id=?",
             (name, config_json, now, template_id))
@@ -527,7 +576,7 @@ class TaskFlow:
         if quiesced:
             time.sleep(2.0)
         try:
-            result = self.oai.apply_condition(cfg, force_restart=True)
+            result = self.oai.apply_condition(radio_config(cfg), force_restart=True)
         finally:
             if quiesced:
                 quiesce_phone(serial, False)
@@ -562,7 +611,22 @@ class TaskFlow:
                     rearm.update(agent.rearm())
             except Exception as e:
                 rearm["error"] = str(e)
-        return {"config": cfg, "result": result, "shake": shake, "rearm": rearm}
+        actual_raw = self.oai.research_config_raw()
+        actual = actual_raw if isinstance(actual_raw, dict) else {}
+        differences = config_diff(cfg, actual)
+        verified_ms = int(time.time() * 1000)
+        status = "VERIFIED" if actual and not differences else ("DIFFERENT" if actual else "UNAVAILABLE")
+        self.db.execute(
+            "INSERT OR REPLACE INTO configuration_apply_state("
+            "singleton_id,experiment_id,configuration_id,configuration_version,configuration_name,"
+            "requested_config_json,actual_config_json,diff_json,status,verified_utc_ms)"
+            " VALUES(1,?,?,?,?,?,?,?,?,?)",
+            (experiment_id, template_id, int(row.get("version") or 1), row["name"],
+             json.dumps(cfg, ensure_ascii=False), json.dumps(actual, ensure_ascii=False),
+             json.dumps(differences, ensure_ascii=False), status, verified_ms))
+        return {"config": cfg, "actual": actual, "diff": differences,
+                "verification_status": status, "verified_utc_ms": verified_ms,
+                "result": result, "shake": shake, "rearm": rearm}
 
     # ---- start / stop ------------------------------------------------------ #
     def start_experiment(self, experiment_id: str, serial: str, pc_port: int = 8420,
@@ -578,22 +642,23 @@ class TaskFlow:
         # experiment's templates) > the experiment's stored initial_oai_config.
         initial = None
         configuration_id = None
+        configuration_version = None
         configuration_name = None
         if template_id is not None:
             row = self.db.query_one(
-                "SELECT id,name,config_json FROM oai_templates WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
+                "SELECT id,name,config_json,version FROM oai_templates WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
                 (template_id, experiment_id))
             if not row:
                 raise ValueError("configuration not found")
-            configuration_id, configuration_name = row["id"], row["name"]
+            configuration_id, configuration_version, configuration_name = row["id"], row.get("version") or 1, row["name"]
             initial = json.loads(row["config_json"])
         if initial is None:
             if exp.get("default_template_id"):
                 row = self.db.query_one(
-                    "SELECT id,name,config_json FROM oai_templates WHERE id=? AND archived_utc IS NULL",
+                    "SELECT id,name,config_json,version FROM oai_templates WHERE id=? AND archived_utc IS NULL",
                     (exp["default_template_id"],))
                 if row:
-                    configuration_id, configuration_name = row["id"], row["name"]
+                    configuration_id, configuration_version, configuration_name = row["id"], row.get("version") or 1, row["name"]
                     initial = json.loads(row["config_json"])
             if initial is None:
                 initial = json.loads(exp["initial_oai_config"]) if exp.get("initial_oai_config") else {}
@@ -629,6 +694,27 @@ class TaskFlow:
             "ulTrafficMbps": ul_mbps,
             "phases": build_phases(idle_s, collection_s),
         }
+        if exp["environment"] == "RC":
+            # RC measurement windows are owned exclusively by RcCampaign.
+            # Arm into IDLE; do not run an unrelated AC-style loaded window
+            # before Sample 1.
+            plan["idleSeconds"] = 0.0
+            plan["collectionSeconds"] = 0.0
+            plan["phases"] = [{"name": "idle", "durationSeconds": 0.0}]
+        mode = execution_mode(initial or {})
+        snapshot = json.loads(json.dumps(initial or {}))
+        snapshot.setdefault("executionMode", mode)
+        snapshot["_provenance"] = {
+            "configuration_id": configuration_id,
+            "configuration_version": configuration_version,
+            "configuration_name": configuration_name,
+            "snapshot_scope": "execution-time requested conditions",
+        }
+        if exp["environment"] == "RC":
+            chamber = snapshot.setdefault("rcChamber", {})
+            chamber.setdefault("processing_algorithm", "standard-ifft-local-peak")
+            chamber.setdefault("processing_version", "3.0")
+            chamber.setdefault("noise_method", "median of per-tap calibration medians, strongest 10% excluded")
 
         # Stop any leftover downlink loop for this experiment before starting
         # a new one (repeated starts must not leak probes fighting each other).
@@ -653,41 +739,52 @@ class TaskFlow:
             "planned_order": None, "random_seed": None,
             "start_delay_s": 0.0,
             "configuration_id": configuration_id,
+            "configuration_version": configuration_version,
             "configuration_name": configuration_name,
             "requested_config_json": json.dumps(initial or {}, ensure_ascii=False),
+            "configuration_snapshot_json": json.dumps(snapshot, ensure_ascii=False),
+            "execution_mode": mode, "simulation": 1 if mode == "SIMULATION" else 0,
             "started_utc_ms": int(time.time() * 1000),
         })
         self.db.transition(run_id, "PREPARING", "start_experiment: gNB starting + downlink loop")
 
-        # 1. Apply the selected template's config and ALWAYS force a REAL
-        #    gNB restart on experiment start — every run must begin from a
-        #    known RF state (a previous experiment or template switch may
-        #    have left effective parameters half-applied, and per-parameter
-        #    restart:false writes give no reliable restart signal).
-        #    apply_condition(force_restart=True) submits the parameters,
-        #    issues ONE restart, awaits it and VERIFIES the process was
-        #    replaced. The UE re-registers on its own afterwards — we never
-        #    block waiting for it here.
-        gnb_ready = False
-        # Clear the phone modem's context BEFORE the restart (see
-        # quiesce_phone) — otherwise its RRC re-establishment against the
-        # returning gNB trips the get_searchspace() assert and kills the gNB.
+        # Starting a Run owns gNB initialization. The selected Configuration is
+        # submitted and a real restart is forced even when the gNB is currently
+        # stopped or already happens to expose the same values. UE attach and
+        # clock synchronization intentionally happen after this restart.
         quiesced = quiesce_phone(serial, True)
         if quiesced:
-            time.sleep(2.0)  # let the modem release the PDU session
+            time.sleep(2.0)
         try:
-            result = self.oai.apply_condition(initial or {}, force_restart=True)
-            actual = self.oai.research_config_raw()
-            if isinstance(actual, dict):
-                self.db.set_json(run_id, "actual_config_json", actual)
-            gnb_ready = True
+            self.oai.apply_condition(radio_config(initial or {}), force_restart=True)
+            actual_raw = self.oai.research_config_raw()
+            actual = actual_raw if isinstance(actual_raw, dict) else {}
         except Exception as e:
             self.db.transition(run_id, "ERROR", f"start_experiment: gNB restart failed: {e}")
             raise
         finally:
             if quiesced:
                 quiesce_phone(serial, False)
-                time.sleep(8.0)  # fresh registration + PDU session before shake
+                time.sleep(8.0)
+        differences = config_diff(initial or {}, actual)
+        verified_ms = int(time.time() * 1000)
+        apply_status = "VERIFIED" if actual and not differences else ("DIFFERENT" if actual else "UNAVAILABLE")
+        self.db.execute(
+            "INSERT OR REPLACE INTO configuration_apply_state("
+            "singleton_id,experiment_id,configuration_id,configuration_version,configuration_name,"
+            "requested_config_json,actual_config_json,diff_json,status,verified_utc_ms)"
+            " VALUES(1,?,?,?,?,?,?,?,?,?)",
+            (experiment_id, configuration_id, int(configuration_version or 1), configuration_name,
+             json.dumps(initial or {}, ensure_ascii=False), json.dumps(actual, ensure_ascii=False),
+             json.dumps(differences, ensure_ascii=False), apply_status, verified_ms))
+        if differences or not actual:
+            self.db.transition(run_id, "ERROR", f"Configuration verification {apply_status}: {differences}")
+            raise ValueError(f"Configuration verification {apply_status}: {differences}")
+        self.db.set_json(run_id, "actual_config_json", actual)
+        self.db.execute(
+            "UPDATE runs SET applied_configuration_id=?,applied_config_snapshot_json=? WHERE run_id=?",
+            (configuration_id, json.dumps(actual, ensure_ascii=False), run_id))
+        gnb_ready = True
 
         # 3. Verify gNB + UE in-sync
         st = self.oai.status()
@@ -716,7 +813,7 @@ class TaskFlow:
         #    oai_events (2 s) for THIS run, so the platform stores the gNB-side
         #    goodput alongside the phone telemetry.
         self._start_collectors(run_id, experiment_id)
-        return {"ok": ready and in_sync, "gnb_started": gnb_ready, "gnb_running": ready,
+        return {"ok": True, "gnb_started": gnb_ready, "gnb_running": ready,
                 "ue_in_sync": in_sync, "config_applied": initial,
                 "configuration_id": configuration_id, "configuration_name": configuration_name,
                 "downlink_started": True,
@@ -879,21 +976,31 @@ class TaskFlow:
         platform_samples = {r["run_id"]: r["n"] for r in self.db.query(
             "SELECT run_id, COUNT(*) n FROM phone_samples GROUP BY run_id")}
         out = []
+        seen_experiments: set[str] = set()
+        seen_runs: set[str] = set()
         for it in (inv.get("experiments") or []):
             eid = it.get("experimentId") or ""
+            seen_experiments.add(eid)
             runs = []
             for r in (it.get("runs") or []):
                 rid = r.get("runId") or ""
+                seen_runs.add(rid)
                 pr = platform_runs.get(rid)
+                conflict = bool(pr and pr.get("experiment_id") != eid)
+                phone_count = r.get("sampleCount")
+                platform_count = platform_samples.get(rid, 0)
                 runs.append({
                     "run_id": rid,
-                    "phone_sample_count": r.get("sampleCount"),
+                    "phone_sample_count": phone_count,
                     "first_utc_ms": r.get("firstUtcMs"),
                     "last_utc_ms": r.get("lastUtcMs"),
                     "in_platform": pr is not None,
                     "platform_state": pr["state"] if pr else None,
                     "platform_started_ms": pr["started_utc_ms"] if pr else None,
-                    "platform_sample_count": platform_samples.get(rid, 0),
+                    "platform_sample_count": platform_count,
+                    "reconciliation": ("IDENTITY_CONFLICT" if conflict else
+                                       "BOTH_MATCH" if pr and phone_count == platform_count else
+                                       "BOTH_DATA_DIFFERS" if pr else "PHONE_ONLY"),
                 })
             collected = self.db.query_one(
                 "SELECT COUNT(*) n, MAX(collected_utc_ms) last FROM collections WHERE experiment_id=?", (eid,))
@@ -903,10 +1010,33 @@ class TaskFlow:
                 "environment": task.get("environment"),
                 "phone_collection_count": it.get("collectionCount"),
                 "in_platform": eid in platform_exps,
+                "reconciliation": "BOTH" if eid in platform_exps else "PHONE_ONLY",
                 "collected_count": collected["n"] if collected else 0,
                 "last_collected_ms": collected["last"] if collected else None,
                 "runs": runs,
             })
+        # Reconciliation is a union, not a phone-filtered view. Runs that exist
+        # only in platform history must stay visible so an operator can tell
+        # "not on phone" from "not loaded yet" without guessing.
+        for experiment in self.db.query("SELECT experiment_id,environment FROM experiments ORDER BY experiment_id"):
+            eid = experiment["experiment_id"]
+            if eid in seen_experiments:
+                target = next(item for item in out if item["experiment_id"] == eid)
+            else:
+                target = {"experiment_id": eid, "environment": experiment.get("environment"),
+                          "phone_collection_count": None, "in_platform": True,
+                          "reconciliation": "PLATFORM_ONLY", "collected_count": 0,
+                          "last_collected_ms": None, "runs": []}
+                out.append(target)
+            for rid, pr in platform_runs.items():
+                if pr.get("experiment_id") != eid or rid in seen_runs:
+                    continue
+                target["runs"].append({"run_id": rid, "phone_sample_count": None,
+                    "first_utc_ms": None, "last_utc_ms": None, "in_platform": True,
+                    "platform_state": pr.get("state"),
+                    "platform_started_ms": pr.get("started_utc_ms"),
+                    "platform_sample_count": platform_samples.get(rid, 0),
+                    "reconciliation": "PLATFORM_ONLY"})
         out.sort(key=lambda e: (not e["in_platform"], e["experiment_id"]))
         return {"ok": True, "serial": serial, "phone_experiments": out}
 
@@ -957,36 +1087,57 @@ class TaskFlow:
         """Time origin for the fused timeline: the FIRST pre-run clock sync
         (task 5: “把首次开始对时的时间设为 0”). Falls back to the earliest
         phone sample, then the earliest run start, all on the PC/UTC axis."""
-        sql = "SELECT run_id, started_utc_ms FROM runs WHERE experiment_id=?"
+        sql = "SELECT run_id, started_utc_ms, time_origin_type, time_origin_utc_ms FROM runs WHERE experiment_id=?"
         args: tuple = (experiment_id,)
         if run_id:
             sql += " AND run_id=?"
             args += (run_id,)
         runs = self.db.query(sql + " ORDER BY run_id", args)
+        if run_id and runs and runs[0].get("time_origin_utc_ms"):
+            return {"t0_utc_ms": int(runs[0]["time_origin_utc_ms"]),
+                    "t0_source": runs[0].get("time_origin_type") or "persisted"}
         run_ids = [r["run_id"] for r in runs]
         ph = ",".join("?" for _ in run_ids)
-        cands: list[tuple[int, str]] = []
         if run_ids:
             row = self.db.query_one(
                 f"SELECT MIN(t1_ms) AS t FROM sync_anchors WHERE direction='before'"
                 f" AND t1_ms IS NOT NULL AND run_id IN ({ph})", tuple(run_ids))
             if row and row["t"]:
-                cands.append((int(row["t"]), "sync_before"))
+                result = {"t0_utc_ms": int(row["t"]), "t0_source": "sync_before"}
+                if run_id:
+                    self.db.execute("UPDATE runs SET time_origin_type=?,time_origin_utc_ms=? WHERE run_id=?",
+                                    (result["t0_source"], result["t0_utc_ms"], run_id))
+                return result
             row = self.db.query_one(
                 f"SELECT MIN(utc_epoch_ms) AS t FROM phone_samples WHERE utc_epoch_ms IS NOT NULL"
                 f" AND run_id IN ({ph})", tuple(run_ids))
             if row and row["t"]:
-                cands.append((int(row["t"]), "phone_first_sample"))
+                result = {"t0_utc_ms": int(row["t"]), "t0_source": "phone_first_sample"}
+                if run_id:
+                    self.db.execute("UPDATE runs SET time_origin_type=?,time_origin_utc_ms=? WHERE run_id=?",
+                                    (result["t0_source"], result["t0_utc_ms"], run_id))
+                return result
         for r in runs:
             if r.get("started_utc_ms"):
-                cands.append((int(r["started_utc_ms"]), "run_started"))
-        if not cands:
-            raise ValueError("no timestamps to anchor the fused timeline")
-        t0, src = min(cands, key=lambda c: c[0])
-        return {"t0_utc_ms": t0, "t0_source": src}
+                result = {"t0_utc_ms": int(r["started_utc_ms"]), "t0_source": "run_started"}
+                if run_id:
+                    self.db.execute("UPDATE runs SET time_origin_type=?,time_origin_utc_ms=? WHERE run_id=?",
+                                    (result["t0_source"], result["t0_utc_ms"], run_id))
+                return result
+        raise ValueError("no timestamps to anchor the fused timeline")
 
-    def timeline(self, experiment_id: str, run_id: Optional[str] = None) -> dict:
-        sql = "SELECT run_id, state, started_utc_ms, ended_utc_ms FROM runs WHERE experiment_id=?"
+    def timeline(self, experiment_id: str, run_id: Optional[str] = None,
+                 include_channel: bool = False) -> dict:
+        experiment = self.db.query_one(
+            "SELECT environment FROM experiments WHERE experiment_id=?", (experiment_id,))
+        if not experiment:
+            raise ValueError("experiment not found")
+        environment = experiment["environment"]
+        load_channel = environment == "RC" or include_channel
+        sql = ("SELECT run_id,experiment_id,state,started_utc_ms,ended_utc_ms,quality_status,"
+               "configuration_id,configuration_version,configuration_name,configuration_snapshot_json,"
+               "execution_mode,simulation,time_origin_type,time_origin_utc_ms,alignment_json "
+               "FROM runs WHERE experiment_id=?")
         args: tuple = (experiment_id,)
         if run_id:
             sql += " AND run_id=?"
@@ -1011,6 +1162,9 @@ class TaskFlow:
             clip_sql += " AND run_id=?"
             clip_args += (run_id,)
         clips = self.db.query(clip_sql + " ORDER BY id DESC", clip_args)
+        for clip_row in clips:
+            clip_row["segments"] = self.db.query(
+                "SELECT * FROM clip_segments WHERE clip_id=? ORDER BY segment_order", (clip_row["id"],))
         # gNB-side research snapshots (ul/dl_goodput_mbps recorded by the
         # SnapshotCollector during the run), UTC-stamped for alignment with
         # the phone samples (phone_samples.utc_epoch_ms).
@@ -1018,18 +1172,22 @@ class TaskFlow:
         for rid in run_ids:
             gnb += self.db.query(
                 "SELECT run_id, fetched_utc_ms, ts_utc, rnti, ul_goodput_mbps, dl_goodput_mbps,"
-                " pusch_snr_db, ul_mcs, n_prb, collection_stale"
+                " pusch_snr_db, ul_mcs, n_prb, ul_bler, dl_bler,"
+                " ul_harq_initial_tx_delta,ul_harq_retransmission_delta,ul_harq_retransmission_ratio,"
+                " dl_harq_initial_tx_delta,dl_harq_retransmission_delta,dl_harq_retransmission_ratio,"
+                " collection_stale"
                 " FROM oai_snapshots WHERE run_id=? ORDER BY fetched_utc_ms", (rid,))
         # CIR multipath metrics time-series (oai_channel table).
         channel = []
-        for rid in run_ids:
-            channel += self.db.query(
-                "SELECT run_id, fetched_utc_ms, ts_utc, rms_delay_ns, k_factor_db,"
-                " tap_count, peak_db, noise_db, mean_delay_ns"
-                " FROM oai_channel WHERE run_id=? ORDER BY fetched_utc_ms", (rid,))
+        if load_channel:
+            for rid in run_ids:
+                channel += self.db.query(
+                    "SELECT run_id, fetched_utc_ms, ts_utc, rms_delay_ns, k_factor_db,"
+                    " tap_count, peak_db, noise_db, mean_delay_ns"
+                    " FROM oai_channel WHERE run_id=? ORDER BY fetched_utc_ms", (rid,))
         # Latest CIR power-delay profile (|h(tau)|^2 in dB) for the PDP chart.
         cir = None
-        if run_ids:
+        if load_channel and run_ids:
             latest = self.db.query_one(
                 "SELECT raw_json_path, dt_ns FROM oai_channel WHERE run_id=?"
                 " ORDER BY fetched_utc_ms DESC LIMIT 1", (run_ids[-1],))
@@ -1051,70 +1209,205 @@ class TaskFlow:
                         cir = {"dt_ns": dt_ns, "n_samples": n, "pdp": pdp}
                     except Exception:
                         cir = None
+        rc_samples = []
+        if environment == "RC":
+            for rid in run_ids:
+                rc_samples += self.db.query(
+                    "SELECT * FROM rc_samples WHERE run_id=? ORDER BY sample_index", (rid,))
+        for sample in rc_samples:
+            for key in ("gnb_summary", "analytics_json"):
+                if sample.get(key):
+                    try:
+                        sample[key.removesuffix("_json")] = json.loads(sample[key])
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+            # A selected RC Sample needs its own PDP, not the latest arbitrary
+            # CIR frame from the Run.
+            raw_path = Path(sample.get("raw_json_path") or "")
+            if raw_path.exists():
+                try:
+                    raw_sample = json.loads(raw_path.read_text(encoding="utf-8"))
+                    raw_cir = raw_sample.get("cir") or {}
+                    powers = []
+                    re = raw_cir.get("cirRe") or []
+                    im = raw_cir.get("cirIm") or []
+                    n = min(len(re), len(im))
+                    step = max(1, n // 512)
+                    dt = float(raw_cir.get("dtNs") or 8.138)
+                    sample["pdp_dt_ns"] = dt
+                    full_powers = [10.0 * math.log10(
+                        max(re[i] * re[i] + im[i] * im[i], 1e-30)) for i in range(n)]
+                    for i in range(0, n, step):
+                        power = max(full_powers[i:min(n, i + step)])
+                        powers.append({"tau_ns": round(i * dt, 3),
+                                       "power_db": round(power, 3)})
+                    sample["pdp"] = powers
+                    analysis = (sample.get("analytics") or {}).get("channel") or {}
+                    if not analysis.get("analysis_delay_window_ns") and full_powers:
+                        peak = max(full_powers)
+                        threshold = analysis.get("detection_threshold_db")
+                        cutoff = float(threshold) if threshold is not None else peak - 30.0
+                        significant = [i for i, power in enumerate(full_powers[:max(1, n // 2)])
+                                       if power >= cutoff]
+                        if significant:
+                            measured_end = significant[-1] * dt
+                            padded = min((n - 1) * dt / 2,
+                                         measured_end + max(4 * dt, measured_end * 0.15))
+                            nice_step = max(10.0, 10 ** math.floor(
+                                math.log10(max(padded, 1.0))) / 2.0)
+                            sample["display_delay_window_ns"] = {
+                                "start_ns": 0.0,
+                                "end_ns": math.ceil(padded / nice_step) * nice_step,
+                                "source": ("AUTO_MEASURED_ENERGY_ENVELOPE · detection threshold"
+                                           if threshold is not None else
+                                           "AUTO_MEASURED_ENERGY_ENVELOPE · peak - 30 dB fallback"),
+                            }
+                except Exception:
+                    sample["pdp"] = None
         try:
             origin = self.clip_t0(experiment_id, run_id)
         except ValueError:
             origin = {"t0_utc_ms": None, "t0_source": None}
-        return {"samples": rows, "acks": acks, "clips": clips, "runs": runs,
-                "gnb": gnb, "channel": channel, "cir": cir, **origin}
+        timestamps = ([r.get("started_utc_ms") for r in runs] +
+                      [r.get("ended_utc_ms") for r in runs] +
+                      [r.get("utc_epoch_ms") for r in rows] +
+                      [r.get("fetched_utc_ms") for r in gnb] +
+                      [r.get("fetched_utc_ms") for r in channel])
+        valid_times = [int(value) for value in timestamps if value is not None]
+        master = {"start_utc_ms": min(valid_times) if valid_times else origin.get("t0_utc_ms"),
+                  "end_utc_ms": max(valid_times) if valid_times else origin.get("t0_utc_ms")}
+        sources = {}
+        for name, values in (("phone", [r.get("utc_epoch_ms") for r in rows]),
+                             ("gnb", [r.get("fetched_utc_ms") for r in gnb]),
+                             ("cir", [r.get("fetched_utc_ms") for r in channel]),
+                             ("rc", [r.get("started_utc_ms") for r in rc_samples])):
+            present = [int(value) for value in values if value is not None]
+            sources[name] = {"status": "ALIGNED" if present else "UNAVAILABLE",
+                             "count": len(present), "first_utc_ms": min(present) if present else None,
+                             "last_utc_ms": max(present) if present else None,
+                             "raw_offset_ms": ((min(present) - master["start_utc_ms"])
+                                               if present and master["start_utc_ms"] else None),
+                             "applied_correction_ms": 0}
+        events = []
+        for rid in run_ids:
+            events += [{"run_id": rid, "timestamp_utc_ms": row["utc_ms"],
+                        "kind": "RUN_STATE", "label": row["to_state"], "detail": row.get("note")}
+                       for row in self.db.query(
+                           "SELECT utc_ms,to_state,note FROM run_transitions WHERE run_id=? ORDER BY utc_ms", (rid,))]
+        for sample in rc_samples:
+            events += [
+                {"run_id": sample.get("run_id"), "timestamp_utc_ms": sample.get("started_utc_ms"),
+                 "kind": "RC_SAMPLE_START", "label": f"Sample {sample.get('sample_index')} measurement start"},
+                {"run_id": sample.get("run_id"), "timestamp_utc_ms": sample.get("ended_utc_ms"),
+                 "kind": "RC_SAMPLE_COMPLETE", "label": f"Sample {sample.get('sample_index')} complete"},
+            ]
+        return {"environment": environment, "samples": rows, "acks": acks, "clips": clips, "runs": runs,
+                "gnb": gnb, "channel": channel, "cir": cir, "rc_samples": rc_samples,
+                "events": [event for event in events if event.get("timestamp_utc_ms")],
+                "master": master, "alignment": sources, **origin}
 
-    def clip(self, experiment_id: str, run_id: Optional[str], start_ms: float, end_ms: float,
-             label: str) -> dict:
-        """Fused clip on the sync-zeroed time axis (task 5).
-
-        ``start_ms``/``end_ms`` are milliseconds RELATIVE to the experiment's
-        time origin (first pre-run clock sync — see clip_t0). The clip fuses
-        phone samples + gNB snapshots + channel metrics inside the window into
-        one CSV stamped ``t_s`` (seconds since the origin) and records it as a
-        new copy in the clips table (re-saving never overwrites).
-        """
+    def save_clip(self, experiment_id: str, run_id: str, name: str,
+                  segments: list[dict], clip_id: Optional[int] = None) -> dict:
+        """Persist one non-destructive, ordered, same-Run Clip composition."""
         import pandas as pd
         from datetime import datetime, timezone
-        t0 = self.clip_t0(experiment_id, run_id)["t0_utc_ms"]
-        lo, hi = t0 + float(start_ms), t0 + float(end_ms)
-        run_sql = " AND run_id=?" if run_id else ""
-        window_args: tuple = (lo, hi, run_id) if run_id else (lo, hi)
-        phone = self.db.query(
-            "SELECT utc_epoch_ms AS ts, run_id, phase, battery_power_w, battery_current_now_ua,"
-            " battery_voltage_mv, soc_percent, ss_rsrp_dbm, ss_sinr_db, workload_actual_mbps"
-            " FROM phone_samples WHERE utc_epoch_ms IS NOT NULL AND utc_epoch_ms BETWEEN ? AND ?"
-            + run_sql + " ORDER BY utc_epoch_ms", window_args)
-        gnb = self.db.query(
-            "SELECT fetched_utc_ms AS ts, run_id, ul_goodput_mbps, dl_goodput_mbps, pusch_snr_db,"
-            " ul_mcs, n_prb FROM oai_snapshots WHERE fetched_utc_ms IS NOT NULL"
-            " AND fetched_utc_ms BETWEEN ? AND ?" + run_sql + " ORDER BY fetched_utc_ms",
-            window_args)
-        channel = self.db.query(
-            "SELECT fetched_utc_ms AS ts, run_id, rms_delay_ns, k_factor_db, tap_count, peak_db,"
-            " noise_db FROM oai_channel WHERE fetched_utc_ms IS NOT NULL"
-            " AND fetched_utc_ms BETWEEN ? AND ?" + run_sql + " ORDER BY fetched_utc_ms",
-            window_args)
+        run = self.db.get_run(run_id)
+        if not run or run["experiment_id"] != experiment_id:
+            raise ValueError("Run not found in this Experiment")
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("Clip name is required")
+        if not segments:
+            raise ValueError("Clip needs at least one Segment")
+        t0_meta = self.clip_t0(experiment_id, run_id)
+        t0 = int(t0_meta["t0_utc_ms"])
+        normalized = []
+        for order, segment in enumerate(segments):
+            source_run = segment.get("source_run_id") or run_id
+            if source_run != run_id:
+                raise ValueError("Cross-Run Clips are not supported")
+            start = float(segment.get("source_start_relative_ms", segment.get("start_ms", 0)))
+            end = float(segment.get("source_end_relative_ms", segment.get("end_ms", 0)))
+            if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                raise ValueError(f"Segment {order + 1} has an invalid time range")
+            normalized.append({"source_run_id": run_id, "start_ms": start, "end_ms": end,
+                               "label": str(segment.get("label") or ""), "order": order})
 
-        def _frame(rows: list[dict], source: str):
-            if not rows:
-                return None
-            df = pd.DataFrame(rows)
-            df.insert(0, "t_s", ((df["ts"] - t0) / 1000.0).round(3))
-            df.insert(1, "source", source)
-            return df.drop(columns=["ts"])
+        def rows_for(table: str, timestamp: str, columns: str, lo: float, hi: float) -> list[dict]:
+            return self.db.query(
+                f"SELECT {timestamp} AS ts,run_id,{columns} FROM {table} "
+                f"WHERE run_id=? AND {timestamp} BETWEEN ? AND ? ORDER BY {timestamp}",
+                (run_id, lo, hi))
 
-        frames = [f for f in (_frame(phone, "phone"), _frame(gnb, "gnb"),
-                              _frame(channel, "channel")) if f is not None]
-        fused = pd.concat(frames, ignore_index=True, sort=False) if frames else \
-            pd.DataFrame(columns=["t_s", "source"])
+        frames = []
+        clip_cursor_s = 0.0
+        for segment in normalized:
+            lo, hi = t0 + segment["start_ms"], t0 + segment["end_ms"]
+            sources = (
+                ("phone", rows_for("phone_samples", "utc_epoch_ms",
+                    "phase,battery_power_w,battery_current_now_ua,battery_voltage_mv,soc_percent,"
+                    "ss_rsrp_dbm,ss_sinr_db,workload_actual_mbps", lo, hi)),
+                ("gnb", rows_for("oai_snapshots", "fetched_utc_ms",
+                    "ul_goodput_mbps,dl_goodput_mbps,pusch_snr_db,ul_mcs,n_prb,ul_bler,dl_bler,"
+                    "ul_harq_retransmission_delta,dl_harq_retransmission_delta", lo, hi)),
+                ("channel", rows_for("oai_channel", "fetched_utc_ms",
+                    "rms_delay_ns,k_factor_db,tap_count,peak_db,noise_db", lo, hi)),
+            )
+            for source, rows in sources:
+                if not rows:
+                    continue
+                frame = pd.DataFrame(rows)
+                frame.insert(0, "clip_t_s", (clip_cursor_s + (frame["ts"] - lo) / 1000.0).round(3))
+                frame.insert(1, "source_t_s", ((frame["ts"] - t0) / 1000.0).round(3))
+                frame.insert(2, "segment_order", segment["order"] + 1)
+                frame.insert(3, "segment_label", segment["label"])
+                frame.insert(4, "source", source)
+                frames.append(frame.drop(columns=["ts"]))
+            clip_cursor_s += (segment["end_ms"] - segment["start_ms"]) / 1000.0
+        fused = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame(
+            columns=["clip_t_s", "source_t_s", "segment_order", "segment_label", "source"])
         out_dir = self.s.processed_dir / "clips"
         out_dir.mkdir(parents=True, exist_ok=True)
-        fname = f"{experiment_id}_{label or 'clip'}_s{int(start_ms)}_e{int(end_ms)}_{int(time.time() * 1000)}.csv"
-        path = out_dir / fname
+        safe_name = "".join(char if char.isalnum() or char in "-_" else "_" for char in name)[:80]
+        path = out_dir / f"{experiment_id}_{safe_name}_{int(time.time() * 1000)}.csv"
         fused.to_csv(path, index=False)
         self.db.record_file(path)
         now = datetime.now(timezone.utc).isoformat()
-        clip_id = self.db.execute(
-            "INSERT INTO clips(experiment_id,run_id,start_ms,end_ms,label,created_utc,output_path)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (experiment_id, run_id, start_ms, end_ms, label, now, str(path)))
+        start_ms = min(segment["start_ms"] for segment in normalized)
+        end_ms = max(segment["end_ms"] for segment in normalized)
+        if clip_id is None:
+            clip_id = self.db.execute(
+                "INSERT INTO clips(experiment_id,run_id,start_ms,end_ms,label,created_utc,updated_utc,"
+                "output_path,configuration_snapshot_json,execution_mode,time_origin_type,time_origin_utc_ms,"
+                "quality_status,alignment_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (experiment_id, run_id, start_ms, end_ms, name, now, now, str(path),
+                 run.get("configuration_snapshot_json"), run.get("execution_mode"),
+                 t0_meta["t0_source"], t0, run.get("quality_status"), run.get("alignment_json")))
+        else:
+            existing = self.db.query_one("SELECT id FROM clips WHERE id=? AND run_id=?", (clip_id, run_id))
+            if not existing:
+                raise ValueError("Clip not found")
+            self.db.execute(
+                "UPDATE clips SET start_ms=?,end_ms=?,label=?,updated_utc=?,output_path=? WHERE id=?",
+                (start_ms, end_ms, name, now, str(path), clip_id))
+            self.db.execute("DELETE FROM clip_segments WHERE clip_id=?", (clip_id,))
+        self.db.executemany(
+            "INSERT INTO clip_segments(clip_id,source_run_id,source_start_utc_ms,source_end_utc_ms,"
+            "source_start_relative_ms,source_end_relative_ms,segment_order,label) VALUES(?,?,?,?,?,?,?,?)",
+            [(clip_id, run_id, int(t0 + segment["start_ms"]), int(t0 + segment["end_ms"]),
+              segment["start_ms"], segment["end_ms"], segment["order"], segment["label"])
+             for segment in normalized])
         return {"ok": True, "clip_id": clip_id, "path": str(path), "n_rows": int(len(fused)),
+                "duration_ms": round(clip_cursor_s * 1000, 3), "segments": len(normalized),
                 "t0_utc_ms": t0}
+
+    def clip(self, experiment_id: str, run_id: Optional[str], start_ms: float, end_ms: float,
+             label: str) -> dict:
+        if not run_id:
+            raise ValueError("Run is required")
+        return self.save_clip(experiment_id, run_id, label or "Clip", [
+            {"source_run_id": run_id, "source_start_relative_ms": start_ms,
+             "source_end_relative_ms": end_ms, "label": label}])
 
 
 _flows: dict[str, TaskFlow] = {}

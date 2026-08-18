@@ -1,25 +1,33 @@
-import { useEffect, useState } from 'react';
+import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from 'react';
 import Dashboard from './pages/Dashboard';
 import Experiments from './pages/Experiments';
 import Timeline from './pages/Timeline';
 import Settings from './pages/Settings';
 import PhoneSync from './pages/PhoneSync';
 import Chamber from './pages/Chamber';
-import { Icon, ToastHost } from './components/ui';
+import { Badge, Card, Icon, ToastHost } from './components/ui';
+import { OperatorContextProvider, useOperatorContext } from './context';
+
+class PageErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  componentDidCatch(error: Error, info: ErrorInfo) { console.error('Page render failed', error, info); }
+  render() { return this.state.error ? <div className="error-box"><b>Page render failed</b><div>{this.state.error.message}</div><div>Reload the page or return to Dashboard.</div></div> : this.props.children; }
+}
 
 const NAV: { path: string; label: string; icon: string }[] = [
   { path: '/dashboard', label: 'Dashboard', icon: 'grid' },
   { path: '/experiments', label: 'Experiments', icon: 'flask' },
-  { path: '/sync', label: 'Phone Sync', icon: 'download' },
-  { path: '/settings', label: 'Settings', icon: 'settings' },
+  { path: '/sync', label: 'Data Import', icon: 'download' },
+  { path: '/advanced', label: 'Advanced', icon: 'settings' },
 ];
 
 const TITLES: Record<string, string> = {
   dashboard: 'Dashboard',
   experiments: 'Experiments',
-  timeline: 'Timeline',
-  sync: 'Phone Sync',
-  settings: 'Settings',
+  timeline: 'Result Workspace',
+  sync: 'Data Import',
+  advanced: 'Advanced',
 };
 
 function useHashRoute(): [string, (path: string) => void] {
@@ -35,20 +43,36 @@ function useHashRoute(): [string, (path: string) => void] {
   return [hash, nav];
 }
 
-export default function App() {
+function ContextBar() {
+  const { value } = useOperatorContext();
+  return <div className="context-bar" aria-label="Current experiment and run context">
+    <div><span>Experiment</span><b>{value.experimentId || '—'}</b></div>
+    <div><span>Environment</span><b>{value.environment || '—'}</b></div>
+    <div><span>Configuration</span><b>{value.configurationName || '—'}</b></div>
+    <div><span>Run</span><b>{value.runId || '—'}</b></div>
+    <div><span>Status</span>{value.status ? <Badge tone={value.status === 'RUNNING' ? 'warn' : value.status === 'COMPLETE' ? 'good' : 'muted'}>{value.status}</Badge> : <b>—</b>}</div>
+    <div><span>Quality</span><b>{value.quality || '—'}</b></div>
+  </div>;
+}
+
+function Advanced({ nav }: { nav: (path: string) => void }) {
+  return <div className="stack"><div className="page-head"><div><div className="title">Advanced / Research Tools</div><div className="subtitle">Hardware diagnostics and administrative settings outside the normal Run workflow.</div></div></div>
+    <div className="grid cols-2"><Card title="RC Hardware" sub="Connection, manual jog, DLL, helper and simulation diagnostics."><button className="btn" onClick={() => nav('/advanced/rc-hardware')}>Open diagnostics</button></Card><Card title="System Settings" sub="OAI connectivity and administrative settings."><button className="btn" onClick={() => nav('/advanced/settings')}>Open settings</button></Card></div>
+  </div>;
+}
+
+function AppShell() {
   const [hash, nav] = useHashRoute();
-  const [pathPart, queryPart] = hash.split('?');
-  const params = new URLSearchParams(queryPart || '');
+  const pathPart = hash.split('?')[0];
   const segments = pathPart.replace(/^\/+/, '').split('/').filter(Boolean);
   const section = segments[0] || 'dashboard';
-  const initialExperimentId = params.get('exp') ?? undefined;
 
   const isActive = (path: string) => section === path.slice(1);
 
   let page: React.ReactNode;
   switch (section) {
     case 'dashboard':
-      page = <Dashboard />;
+      page = <Dashboard nav={nav} />;
       break;
     case 'experiments':
       page = segments[1] && segments[2] === 'rc'
@@ -62,21 +86,23 @@ export default function App() {
     case 'sync':
       page = <PhoneSync />;
       break;
-    case 'settings':
-      page = <Settings />;
+    case 'advanced':
+      page = segments[1] === 'rc-hardware' ? <Chamber onBack={() => nav('/advanced')} />
+        : segments[1] === 'settings' ? <Settings />
+        : <Advanced nav={nav} />;
       break;
     // Removed pages (to be rebuilt later): Run Detail, AC/RC Compare,
-    // Matrix, Data. Also Run Planner / Export live inside the Experiments hub.
+    // Matrix, Data and Export live inside the Experiments hub.
     case 'run':
     case 'comparison':
     case 'matrix':
     case 'data':
-    case 'planner':
     case 'export':
+    case 'settings':
       page = <Experiments nav={nav} />;
       break;
     default:
-      page = <Dashboard />;
+      page = <Dashboard nav={nav} />;
   }
 
   const title = TITLES[section] ?? 'Dashboard';
@@ -116,9 +142,14 @@ export default function App() {
             <span className="live-dot">live</span>
           </div>
         </header>
-        <main className="page">{page}</main>
+        <ContextBar />
+        <main className="page"><PageErrorBoundary key={hash}>{page}</PageErrorBoundary></main>
       </div>
       <ToastHost />
     </div>
   );
+}
+
+export default function App() {
+  return <OperatorContextProvider><AppShell /></OperatorContextProvider>;
 }

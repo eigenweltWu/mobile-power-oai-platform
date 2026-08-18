@@ -84,60 +84,24 @@ def test_sync_confirm_failure_leaves_unconfirmed(tmp_path):
 def test_start_experiment_no_condition_creates_default(tmp_path):
     """start_experiment must not hit the runs.condition_id FK when the caller
     never created a condition (auto runs reference "<exp>_default")."""
-    from experiment_platform.backend.task_flow import TaskFlow
-
-    s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
-                 oai_host="127.0.0.1", oai_port=1)
-    s.ensure_dirs()
-    db = Database(s.db_path)
-    db.upsert_experiment({"experiment_id": "EXP2", "environment": "AC",
-                          "operator_name": "", "notes": "", "purpose": "", "flow": "",
-                          "initial_oai_config": None,
-                          "created_utc": "2026-01-01T00:00:00+00:00",
-                          "schema_version": 1})
-    oai = MagicMock()
-    oai.ensure_gnb_running.return_value = True
-    oai.status.return_value = MagicMock()
-    oai.status.return_value.gnb = MagicMock(running=True)
-    oai.research_ues.side_effect = RuntimeError("no ues yet")
-    oai.shake.return_value = {"ok": False, "ue_ip": None, "error": "no UE PDU session"}
-    oai.oai_pc_offset_ms.return_value = 0.0
-
-    flow = TaskFlow(s, db, oai)
-    res = flow.start_experiment("EXP2", "53616213")  # no run/condition pre-created
+    flow, db, _oai, _tid = _make_template_flow(tmp_path)
+    db.execute("DELETE FROM conditions WHERE condition_id='C1'")
+    res = flow.start_experiment("EXP3", "53616213")  # no run/condition pre-created
     assert res["downlink_started"] is True
     # the synthesized condition now exists and the run references it
-    cond = db.query_one("SELECT * FROM conditions WHERE condition_id='EXP2_default'")
+    cond = db.query_one("SELECT * FROM conditions WHERE condition_id='EXP3_default'")
     assert cond is not None
     run = db.query_one("SELECT * FROM runs WHERE run_id=?", (res["run_id"],))
-    assert run["condition_id"] == "EXP2_default"
-    flow.stop_experiment("EXP2")
+    assert run["condition_id"] == "EXP3_default"
+    flow.stop_experiment("EXP3")
     db.close()
 
 
 def test_start_then_stop_discards_unconfirmed_run(tmp_path):
     """A Run stopped before sync-confirm never reached the phone and must not
     survive as platform history. Its indexed/raw platform data is discarded."""
-    from experiment_platform.backend.task_flow import TaskFlow
-
-    s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
-                 oai_host="127.0.0.1", oai_port=1)
-    s.ensure_dirs()
-    db = Database(s.db_path)
-    db.upsert_experiment({"experiment_id": "EXP3", "environment": "AC",
-                          "operator_name": "", "notes": "", "purpose": "", "flow": "",
-                          "initial_oai_config": None,
-                          "created_utc": "2026-01-01T00:00:00+00:00",
-                          "schema_version": 1})
-    oai = MagicMock()
-    oai.ensure_gnb_running.return_value = True
-    oai.status.return_value = MagicMock()
-    oai.status.return_value.gnb = MagicMock(running=True)
-    oai.research_ues.side_effect = RuntimeError("no ues yet")
-    oai.shake.return_value = {"ok": False, "ue_ip": None, "error": "no UE PDU session"}
-    oai.oai_pc_offset_ms.return_value = 0.0
-
-    flow = TaskFlow(s, db, oai)
+    flow, db, _oai, _tid = _make_template_flow(tmp_path)
+    s = flow.s
     res = flow.start_experiment("EXP3", "53616213")
     rid = res["run_id"]
     assert db.get_run(rid)["state"] == "PREPARING"
@@ -299,6 +263,18 @@ def _make_template_flow(tmp_path):
     flow = TaskFlow(s, db, oai)
     flow.add_template("EXP3", "T1", {"bandwidthMHz": 20, "txGainDb": 70})
     tid = flow.list_templates("EXP3")[0]["id"]
+    flow.set_default_template("EXP3", tid)
+    actual = {"bandwidthMHz": 20, "txGainDb": 70}
+    oai.research_config_raw.return_value = actual
+    oai.status.return_value.gnb.running = True
+    oai.research_ues.side_effect = RuntimeError("no ues yet")
+    db.execute(
+        "INSERT OR REPLACE INTO configuration_apply_state("
+        "singleton_id,experiment_id,configuration_id,configuration_version,configuration_name,"
+        "requested_config_json,actual_config_json,diff_json,status,verified_utc_ms) "
+        "VALUES(1,?,?,?,?,?,?,?,?,?)",
+        ("EXP3", tid, 1, "T1", '{"bandwidthMHz":20,"txGainDb":70}',
+         '{"bandwidthMHz":20,"txGainDb":70}', '{}', "VERIFIED", 1))
     return flow, db, oai, tid
 
 
@@ -499,31 +475,30 @@ def test_apply_template_without_active_run_skips_rearm(tmp_path, monkeypatch):
     db.close()
 
 
-# ---- experiment start ALWAYS force-restarts the gNB ----------------------- #
+# ---- every start owns a fresh gNB restart --------------------------------- #
 
 def test_start_experiment_force_restarts_gnb(tmp_path):
-    """Every experiment start must issue a REAL gNB restart (verified), not
-    just ensure the process is running — a fresh run begins from a known RF
-    state even when the template config is identical to what is applied."""
-    flow, db, oai, _tid = _make_template_flow(tmp_path)
+    """A stopped gNB and no prior Apply state must not block Start."""
+    flow, db, oai, tid = _make_template_flow(tmp_path)
+    db.execute("DELETE FROM configuration_apply_state")
+    oai.status.return_value.gnb.running = False
     flow.start_experiment("EXP3", "53616213")
-    oai.apply_condition.assert_called_once()
-    kwargs = oai.apply_condition.call_args.kwargs
-    assert kwargs.get("force_restart") is True
-    # ensure_gnb_running is no longer on the start path (the forced restart
-    # starts a stopped gNB too — docker restart semantics)
+    oai.apply_condition.assert_called_once_with(
+        {"bandwidthMHz": 20, "txGainDb": 70}, force_restart=True)
     oai.ensure_gnb_running.assert_not_called()
+    applied = db.query_one("SELECT * FROM configuration_apply_state")
+    assert applied["configuration_id"] == tid
+    assert applied["status"] == "VERIFIED"
     db.close()
 
 
-def test_configuration_update_keeps_id_and_run_snapshot(tmp_path):
-    """Editing a Configuration is an in-place update, while a started Run
-    keeps the exact requested/applied values it recorded at execution time."""
+def test_configuration_update_versions_and_keeps_run_snapshot(tmp_path):
+    """Editing a used Configuration creates v2 while v1 remains frozen."""
     import json
 
     flow, db, oai, tid = _make_template_flow(tmp_path)
     original = {"bandwidthMHz": 20, "txGainDb": 70}
-    applied = {"bandwidthMHz": 20, "txGainDb": 69.5}
+    applied = {"bandwidthMHz": 20, "txGainDb": 70}
     flow.set_default_template("EXP3", tid)
     oai.research_config_raw.return_value = applied
 
@@ -535,7 +510,8 @@ def test_configuration_update_keeps_id_and_run_snapshot(tmp_path):
     assert json.loads(run["actual_config_json"]) == applied
 
     changed = flow.update_template("EXP3", tid, "T1 edited", {"bandwidthMHz": 40, "txGainDb": 65})
-    assert changed["id"] == tid
+    assert changed["id"] != tid
+    assert changed["version"] == 2
     frozen = db.get_run(result["run_id"])
     assert frozen["configuration_name"] == "T1"
     assert json.loads(frozen["requested_config_json"]) == original
@@ -558,17 +534,16 @@ def test_default_configuration_cannot_be_archived(tmp_path):
 
 
 def test_start_experiment_restart_failure_marks_run_error(tmp_path):
-    """When the forced gNB restart fails, the run must transition to ERROR
-    (visible on the dashboard) and the failure must propagate to the API."""
+    """A failed Start-owned restart marks the fresh Run as ERROR."""
     import pytest
 
     flow, db, oai, _tid = _make_template_flow(tmp_path)
+    db.execute("DELETE FROM configuration_apply_state")
     oai.apply_condition.side_effect = RuntimeError("gNB restart FAILED: crashed")
     with pytest.raises(RuntimeError, match="gNB restart FAILED"):
         flow.start_experiment("EXP3", "53616213")
-    runs = db.query("SELECT run_id, state FROM runs WHERE experiment_id='EXP3' "
-                    "ORDER BY rowid DESC LIMIT 1")
-    assert runs[0]["state"] == "ERROR"
+    assert db.query_one("SELECT * FROM configuration_apply_state") is None
+    assert db.query_one("SELECT state FROM runs ORDER BY rowid DESC LIMIT 1")["state"] == "ERROR"
     db.close()
 
 

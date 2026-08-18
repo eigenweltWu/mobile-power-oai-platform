@@ -487,12 +487,29 @@ class ExperimentService : Service() {
     }
 
     private fun monitorSignal(nr: Map<String, Any?>, nowNs: Long) {
+        // The PC deliberately cycles airplane mode while restarting the gNB.
+        // Forget the pre-restart signal timestamp during that external cycle;
+        // otherwise the stale timeout immediately triggers a second cycle as
+        // soon as Android resumes sampling, tearing down a healthy new attach.
+        val airplaneOn = android.provider.Settings.Global.getInt(
+            contentResolver, android.provider.Settings.Global.AIRPLANE_MODE_ON, 0) != 0
+        if (airplaneOn) {
+            lastSignalElapsedNs = 0L
+            return
+        }
         val hasSignal = (nr["ss_rsrp_dbm"] != null) || (nr["network_type"] != null && nr["network_type"] != "OTHER")
         if (hasSignal) {
             lastSignalElapsedNs = nowNs
             return
         }
-        if (airplaneToggling || lastSignalElapsedNs == 0L) return
+        if (airplaneToggling) return
+        // Start a fresh grace period after service/app start or airplane-off.
+        // Previously zero meant "never recover" when the service began without
+        // signal, while a stale non-zero value could recover far too early.
+        if (lastSignalElapsedNs == 0L) {
+            lastSignalElapsedNs = nowNs
+            return
+        }
         val thresholdNs = noSignalSeconds() * 1_000_000_000L
         if (nowNs - lastSignalElapsedNs >= thresholdNs) {
             airplaneToggling = true

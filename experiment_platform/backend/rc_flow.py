@@ -5,7 +5,7 @@ flow is SAMPLED: after every stirrer step the platform
 
   1. waits for the stirrer to stand still,
   2. fine-tunes ``puschTargetSnrX10`` (multiple small steps, never a gNB
-     restart) so the gNB-received power (CIR peak tap) returns to the
+     restart) so the authoritative OAI PUSCH RSSI (dBFS) returns to the
      configured target — the stirrer must not change the receiver's RSSP,
   3. triggers ONE timed phone recording window (idle → loaded(dwell) via
      /agent/session + /agent/rearm — same run id, so all samples land in a
@@ -31,6 +31,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
+from scipy.signal import find_peaks
+
 from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
@@ -50,6 +53,250 @@ def _tap_powers_db(cir: dict) -> list[float]:
             for i in range(n)]
 
 
+PROCESSING_ALGORITHM = "standard-ifft-local-peak"
+PROCESSING_VERSION = "3.0"
+NOISE_METHOD = "median of per-tap calibration medians, strongest 10% excluded"
+PEAK_PROMINENCE_DB = 3.0
+
+
+def _clusters_above(values_db: list[float], threshold_db: float) -> list[list[int]]:
+    """Return contiguous threshold regions on the circular PDP.
+
+    A single physical impulse occupies several adjacent FFT bins.  Counting
+    bins (the old implementation) inflated one path into tens or hundreds of
+    "taps".  One contiguous circular region is therefore one candidate path.
+    """
+    groups: list[list[int]] = []
+    for i, value in enumerate(values_db):
+        if value < threshold_db:
+            continue
+        if groups and groups[-1][-1] == i - 1:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    if len(groups) > 1 and groups[0][0] == 0 and groups[-1][-1] == len(values_db) - 1:
+        groups[0] = groups.pop() + groups[0]
+    return groups
+
+
+def analyze_cir(cir: Optional[dict], noise_floor_db: Optional[float],
+                noise_margin_db: float, measurement: Optional[dict] = None) -> dict:
+    """Create the traceable channel-analysis contract consumed by Result.
+
+    Resolved paths are local peaks that pass noise, prominence and minimum
+    delay-separation constraints. Backend-supplied metrics remain available
+    separately and are never relabelled as resolved results.
+    """
+    if not cir or not cir.get("ok"):
+        return {"processing_status": "FAILED", "processing_error":
+                (cir or {}).get("error") or "CIR unavailable"}
+    powers_db = _tap_powers_db(cir)
+    if not powers_db:
+        return {"processing_status": "FAILED", "processing_error": "empty CIR"}
+    if noise_floor_db is None or not math.isfinite(float(noise_floor_db)):
+        return {"processing_status": "FAILED", "processing_error":
+                "noise estimation failed"}
+
+    peak_db = max(powers_db)
+    metrics = cir.get("metrics") or {}
+    raw_noise = metrics.get("noiseDb")
+    raw_threshold = max(float(raw_noise) + 6.0 if raw_noise is not None else -math.inf,
+                        peak_db - 25.0)
+    threshold_db = float(noise_floor_db) + float(noise_margin_db)
+    dt_ns = float(cir.get("dtNs") or 8.138)
+    n = len(powers_db)
+    cfg = measurement or {}
+    chamber_cfg = cfg.get("rcChamber") or {}
+    prominence_db = float(chamber_cfg.get("peak_prominence_db", PEAK_PROMINENCE_DB))
+    configured_bw = cfg.get("bandwidthMHz") or cir.get("bandwidthMHz")
+    sampled_bw_mhz = 1000.0 / dt_ns
+    effective_bw_mhz = float(configured_bw) if configured_bw else sampled_bw_mhz
+    nominal_resolution_ns = 1000.0 / effective_bw_mhz
+    min_separation_ns = max(dt_ns, nominal_resolution_ns)
+    min_separation_bins = max(1, math.ceil(min_separation_ns / dt_ns))
+    values = np.asarray(powers_db, dtype=float)
+    tiled = np.tile(values, 3)
+
+    def circular_peaks(*, prominence: Optional[float] = None,
+                       distance: Optional[int] = None) -> tuple[list[int], dict[int, float]]:
+        kwargs: dict[str, Any] = {"height": threshold_db}
+        if prominence is not None:
+            kwargs["prominence"] = prominence
+        if distance is not None:
+            kwargs["distance"] = distance
+        indexes, props = find_peaks(tiled, **kwargs)
+        selected = [(position, int(index - n)) for position, index in enumerate(indexes)
+                    if n <= index < 2 * n]
+        prominence_values = props.get("prominences", [])
+        return ([index for _, index in selected],
+                {index: float(prominence_values[position]) for position, index in selected}
+                if len(prominence_values) else {})
+
+    candidate_indexes, _ = circular_peaks()
+    effective_indexes, _ = circular_peaks(prominence=prominence_db)
+    resolved_indexes, prominences = circular_peaks(
+        prominence=prominence_db, distance=min_separation_bins)
+    resolved_indexes.sort()
+
+    re = cir.get("cirRe") or []
+    im = cir.get("cirIm") or []
+    strongest_index = max(resolved_indexes, key=lambda index: powers_db[index]) if resolved_indexes else None
+    first_index = resolved_indexes[0] if resolved_indexes else None
+    strongest_power = powers_db[strongest_index] if strongest_index is not None else None
+    paths = []
+    for path_number, index in enumerate(resolved_indexes, 1):
+        margin = powers_db[index] - threshold_db
+        prominence = prominences.get(index, 0.0)
+        confidence = "HIGH" if margin >= 12 and prominence >= 6 else (
+            "MEDIUM" if margin >= 6 else "LOW")
+        paths.append({
+            "path_id": f"P{path_number}", "path": path_number,
+            "peak_index": index, "delay_ns": round(index * dt_ns, 3),
+            "excess_delay_ns": round((index - int(first_index)) * dt_ns, 3),
+            "complex_gain_real": float(re[index]), "complex_gain_imag": float(im[index]),
+            "magnitude_db": round(powers_db[index], 3), "power_db": round(powers_db[index], 3),
+            "relative_power_db": round(powers_db[index] - float(strongest_power), 3),
+            "phase_deg": round(math.degrees(math.atan2(float(im[index]), float(re[index]))), 3),
+            "phase_calibration": ((cir.get("calibration") or {}).get("phase") or "UNCALIBRATED"),
+            "noise_floor_db": round(float(noise_floor_db), 3),
+            "threshold_db": round(threshold_db, 3),
+            "snr_above_noise_db": round(powers_db[index] - float(noise_floor_db), 3),
+            "margin_above_threshold_db": round(margin, 3),
+            "peak_prominence_db": round(prominence, 3),
+            "near_threshold": margin < 3.0, "resolved": True, "confidence": confidence,
+            "is_first_detected": index == first_index,
+            "is_strongest": index == strongest_index,
+            "detection_algorithm": PROCESSING_ALGORITHM,
+            "processing_version": PROCESSING_VERSION,
+        })
+
+    if paths:
+        energies = [10 ** (path["power_db"] / 10.0) for path in paths]
+        delays = [path["excess_delay_ns"] for path in paths]
+        total = sum(energies)
+        mean_delay = sum(delay * energy for delay, energy in zip(delays, energies)) / total
+        rms_delay = math.sqrt(sum((delay - mean_delay) ** 2 * energy
+                                  for delay, energy in zip(delays, energies)) / total)
+        strongest_energy = max(energies)
+        remainder = total - strongest_energy
+        k_factor = 10.0 * math.log10(strongest_energy / remainder) if remainder > 0 else None
+        filtered_peak = max(path["power_db"] for path in paths)
+    else:
+        mean_delay = rms_delay = k_factor = filtered_peak = None
+
+    configured_window_start = float(chamber_cfg.get("delay_window_start_ns") or 0.0)
+    configured_window_end = float(chamber_cfg.get("delay_window_end_ns") or 0.0)
+    capture_end_ns = (n - 1) * dt_ns
+    if configured_window_end > configured_window_start:
+        analysis_window = {
+            "start_ns": round(max(0.0, configured_window_start), 3),
+            "end_ns": round(min(capture_end_ns, configured_window_end), 3),
+            "source": "CONFIGURED_CHAMBER_AND_SYSTEM_WINDOW",
+        }
+    elif paths:
+        margin_ns = max(4.0 * nominal_resolution_ns, 2.0 * float(rms_delay or 0.0))
+        auto_end = max(path["delay_ns"] for path in paths) + margin_ns
+        auto_end = math.ceil(auto_end / nominal_resolution_ns) * nominal_resolution_ns
+        analysis_window = {"start_ns": 0.0,
+                           "end_ns": round(min(capture_end_ns, auto_end), 3),
+                           "source": "AUTO_RESOLVED_PATH_ENVELOPE"}
+    else:
+        analysis_window = None
+
+    center_mhz = cfg.get("frequencyMHz") or cir.get("frequencyMHz")
+    frequency_spacing_mhz = sampled_bw_mhz / n
+    complex_values = np.asarray(re, dtype=float) + 1j * np.asarray(im, dtype=float)
+    raw_h_re = cir.get("frequencyResponseRe") or cir.get("hRe") or []
+    raw_h_im = cir.get("frequencyResponseIm") or cir.get("hIm") or []
+    raw_frequencies = cir.get("frequencyHz") or cir.get("frequenciesHz") or []
+    has_raw_h = len(raw_h_re) == len(raw_h_im) == n
+    has_raw_grid = len(raw_frequencies) == n
+    response = (np.asarray(raw_h_re, dtype=float) + 1j * np.asarray(raw_h_im, dtype=float)
+                if has_raw_h else np.fft.fft(complex_values))
+    display_step = max(1, n // 512)
+    start_mhz = float(center_mhz) - sampled_bw_mhz / 2 if center_mhz else 0.0
+    frequency_response = [{
+        "frequency_mhz": round(float(raw_frequencies[index]) / 1e6 if has_raw_grid
+                               else start_mhz + index * frequency_spacing_mhz, 6),
+        "real": round(float(response[index].real), 9),
+        "imag": round(float(response[index].imag), 9),
+        "magnitude_db": round(20.0 * math.log10(max(abs(response[index]), 1e-15)), 3),
+        "phase_deg": round(math.degrees(math.atan2(response[index].imag, response[index].real)), 3),
+    } for index in range(0, n, display_step)]
+    complex_cir = [{
+        "delay_ns": round(index * dt_ns, 3), "real": round(float(re[index]), 9),
+        "imag": round(float(im[index]), 9),
+        "magnitude": round(abs(complex_values[index]), 9),
+        "power_db": round(powers_db[index], 3),
+        "phase_deg": round(math.degrees(math.atan2(float(im[index]), float(re[index]))), 3),
+    } for index in range(0, n, display_step)]
+
+    return {
+        "processing_status": "OK",
+        "processing_error": None,
+        "processing_algorithm": PROCESSING_ALGORITHM,
+        "processing_version": PROCESSING_VERSION,
+        "noise_method": NOISE_METHOD,
+        "noise_floor_db": round(float(noise_floor_db), 3),
+        "noise_margin_db": float(noise_margin_db),
+        "detection_threshold_db": round(threshold_db, 3),
+        "raw_detection_threshold_db": round(raw_threshold, 3),
+        "raw_delay_bin_count": n,
+        "candidate_peak_count": len(candidate_indexes),
+        "effective_peak_count": len(effective_indexes),
+        "resolved_path_count": len(paths),
+        # Compatibility aliases. These are not raw tap/path semantics.
+        "raw_path_count": len(candidate_indexes),
+        "effective_path_count": len(paths),
+        "removed_path_count": max(0, len(candidate_indexes) - len(paths)),
+        "rms_delay_ns_raw": metrics.get("rmsDelayNs"),
+        "rms_delay_ns_filtered": round(rms_delay, 3) if rms_delay is not None else None,
+        "mean_delay_ns_filtered": round(mean_delay, 3) if mean_delay is not None else None,
+        "k_factor_db_raw": metrics.get("kFactorDb"),
+        "k_factor_db_filtered": round(k_factor, 3) if k_factor is not None else None,
+        "peak_db_raw": metrics.get("peakDb"),
+        "peak_db_filtered": round(filtered_peak, 3) if filtered_peak is not None else None,
+        "delay_reference": "FIRST_RESOLVED_COMPONENT",
+        "first_detected_path_id": paths[0]["path_id"] if paths else None,
+        "strongest_path_id": next((path["path_id"] for path in paths if path["is_strongest"]), None),
+        "effective_bandwidth_mhz": round(effective_bw_mhz, 6),
+        "sampled_fft_bandwidth_mhz": round(sampled_bw_mhz, 6),
+        "nominal_delay_resolution_ns": round(nominal_resolution_ns, 6),
+        "minimum_resolvable_separation_ns": round(min_separation_ns, 6),
+        "capture_delay_window_ns": {"start_ns": 0.0, "end_ns": round(capture_end_ns, 3)},
+        "analysis_delay_window_ns": analysis_window,
+        "peak_prominence_threshold_db": prominence_db,
+        "peak_detection_method": "scipy.signal.find_peaks on circular PDP",
+        "window_function": cir.get("windowFunction") or "UPSTREAM_UNAVAILABLE",
+        "frequency_spacing_mhz": round(frequency_spacing_mhz, 9),
+        "frequency_grid_consistency": ("CONSISTENT" if has_raw_grid and n > 1 and np.allclose(
+            np.diff(np.asarray(raw_frequencies, dtype=float)),
+            np.diff(np.asarray(raw_frequencies, dtype=float))[0]) else
+            ("SYNTHESIZED_GRID" if has_raw_h else "RECONSTRUCTED_FROM_COMPLEX_CIR")),
+        "frequency_response_source": "RAW_COMPLEX_H_F" if has_raw_h else "FFT_FROM_COMPLEX_CIR",
+        "measurement_metadata": {
+            "start_frequency_mhz": round(float(raw_frequencies[0]) / 1e6, 6)
+            if has_raw_grid else round(start_mhz, 6),
+            "end_frequency_mhz": round(float(raw_frequencies[-1]) / 1e6, 6)
+            if has_raw_grid else round(start_mhz + (n - 1) * frequency_spacing_mhz, 6),
+            "effective_bandwidth_mhz": round(effective_bw_mhz, 6),
+            "n_frequency_points": n, "frequency_spacing_mhz": round(
+                (float(raw_frequencies[1]) - float(raw_frequencies[0])) / 1e6
+                if has_raw_grid and n > 1 else frequency_spacing_mhz, 9),
+            "missing_frequency_samples": 0 if has_raw_grid else None,
+            "window_function": cir.get("windowFunction") or "UPSTREAM_UNAVAILABLE",
+            "fft_ifft_length": n,
+        },
+        "calibration": cir.get("calibration") or {
+            "amplitude": "UNAVAILABLE", "phase": "UNCALIBRATED",
+            "cable_delay": "UNAVAILABLE", "system_response": "UNAVAILABLE"},
+        "complex_cir": complex_cir,
+        "frequency_response": frequency_response,
+        "resolved_paths": paths,
+        "effective_paths": paths,
+    }
+
+
 class RcConfig:
     """Per-campaign knobs (validated defaults — the UI can override each)."""
 
@@ -58,15 +305,18 @@ class RcConfig:
         "n_steps": 12,            # number of samples (stirrer realizations)
         "dwell_s": 20.0,          # loaded window = the actual measurement
         "settle_s": 8.0,          # mechanical settle after the stirrer stops
-        "target_rssp_db": -60.0,  # gNB-received peak-tap power to hold
+        "target_rssp_db": -60.0,  # gNB PUSCH RSSI target (dBFS)
         "rssp_tol_db": 1.5,       # servo deadband
         "pusch_step_x10": 10,     # ±1.0 dB target-SNR per servo iteration
         "max_servo_iters": 6,
         "servo_settle_s": 5.0,    # TPC propagation wait between iterations
         "noise_frames": 20,       # 底噪标定帧数
         "noise_margin_db": 6.0,   # taps below floor+margin are noise
+        "peak_prominence_db": 3.0,
+        "delay_window_start_ns": 0.0,
+        "delay_window_end_ns": 0.0,
         "stirrer_speed_deg_s": 20.0,
-        "simulate_stirrer": False,
+        "execution_mode": "REAL_HARDWARE",
     }
 
     def __init__(self, cfg: Optional[dict] = None):
@@ -83,8 +333,16 @@ class RcConfig:
         self.servo_settle_s = float(c["servo_settle_s"])
         self.noise_frames = int(c["noise_frames"])
         self.noise_margin_db = float(c["noise_margin_db"])
+        self.peak_prominence_db = float(c["peak_prominence_db"])
+        self.delay_window_start_ns = float(c["delay_window_start_ns"])
+        self.delay_window_end_ns = float(c["delay_window_end_ns"])
         self.stirrer_speed_deg_s = float(c["stirrer_speed_deg_s"])
-        self.simulate_stirrer = bool(c["simulate_stirrer"])
+        legacy_simulation = bool(c.get("simulate_stirrer", False))
+        self.execution_mode = str(c.get("execution_mode") or
+                                  ("SIMULATION" if legacy_simulation else "REAL_HARDWARE")).upper()
+        if self.execution_mode not in {"REAL_HARDWARE", "SIMULATION"}:
+            raise ValueError("execution_mode must be REAL_HARDWARE or SIMULATION")
+        self.simulate_stirrer = self.execution_mode == "SIMULATION"
 
     def as_dict(self) -> dict:
         return {
@@ -94,8 +352,11 @@ class RcConfig:
             "pusch_step_x10": self.pusch_step_x10, "max_servo_iters": self.max_servo_iters,
             "servo_settle_s": self.servo_settle_s, "noise_frames": self.noise_frames,
             "noise_margin_db": self.noise_margin_db,
+            "peak_prominence_db": self.peak_prominence_db,
+            "delay_window_start_ns": self.delay_window_start_ns,
+            "delay_window_end_ns": self.delay_window_end_ns,
             "stirrer_speed_deg_s": self.stirrer_speed_deg_s,
-            "simulate_stirrer": self.simulate_stirrer,
+            "execution_mode": self.execution_mode,
         }
 
 
@@ -123,6 +384,8 @@ class RcCampaign(threading.Thread):
         self.initial_pusch_x10: Optional[int] = None
         self.last_rssp_db: Optional[float] = None
         self.noise_floor_db: Optional[float] = None
+        self.noise_std_db: Optional[float] = None
+        self.noise_frame_count = 0
         self.log: list[dict] = []
         self.error: Optional[str] = None
         self.started_ms = _now_ms()
@@ -147,12 +410,22 @@ class RcCampaign(threading.Thread):
         return None
 
     def _rssp_db(self) -> Optional[float]:
-        """Receiver RSSP proxy = strongest CIR tap power (dB)."""
-        raw = self._cir(timeout_s=6.0)
-        if not raw:
-            return None
-        taps = _tap_powers_db(raw)
-        return max(taps) if taps else None
+        """gNB receive-power proxy from OAI PUSCH RSSI (explicitly dBFS).
+
+        CIR amplitudes are uncalibrated scope units and cannot be compared to
+        a target such as -60 dBFS.  The previous proxy made the live servo see
+        values around +57 dB against a -60 target.  OAI already exposes the
+        measured uplink ``puschRssi`` and its unit, so use that authoritative
+        receive-power observation instead.
+        """
+        raw = self.oai.research_ues_raw()
+        values = []
+        for ue in raw.get("ues") or []:
+            uplink = ue.get("uplink") or {}
+            value = uplink.get("puschRssi")
+            if value is not None and uplink.get("puschRssiUnit") == "dBFS":
+                values.append(float(value))
+        return max(values) if values else None
 
     def _phone(self):
         return self.flow._phone(self.serial, self.pc_port)
@@ -182,7 +455,17 @@ class RcCampaign(threading.Thread):
         ranked = sorted(per_tap_median)
         cut = max(1, int(len(ranked) * 0.9))
         floor_db = ranked[:cut][len(ranked[:cut]) // 2]
+        frame_floors = []
+        for taps in stacks:
+            ordered = sorted(taps)
+            frame_cut = max(1, int(len(ordered) * 0.9))
+            frame_floors.append(ordered[:frame_cut][len(ordered[:frame_cut]) // 2])
+        mean_floor = sum(frame_floors) / len(frame_floors)
+        std_floor = math.sqrt(sum((value - mean_floor) ** 2 for value in frame_floors) /
+                              len(frame_floors))
         self.noise_floor_db = floor_db
+        self.noise_std_db = std_floor
+        self.noise_frame_count = len(stacks)
         out_dir = self.s.raw_dir / "rc" / (self.run_id or self.experiment_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / "noise_profile.json"
@@ -190,11 +473,14 @@ class RcCampaign(threading.Thread):
             "captured_utc_ms": _now_ms(), "frames": len(stacks),
             "n_taps": n, "per_tap_median_db": [round(v, 2) for v in per_tap_median],
             "noise_floor_db": round(floor_db, 2),
+            "noise_std_db": round(std_floor, 3),
+            "noise_method": NOISE_METHOD,
             "margin_db": self.cfg.noise_margin_db,
         }, ensure_ascii=False), encoding="utf-8")
         self.db.record_file(path)
         self._say("noise", f"noise floor {floor_db:.1f} dB from {len(stacks)} frames")
-        return {"noise_floor_db": floor_db, "n_taps": n, "path": str(path)}
+        return {"noise_floor_db": floor_db, "noise_std_db": std_floor,
+                "frames": len(stacks), "n_taps": n, "path": str(path)}
 
     def servo_pusch(self, stirrer: StirrerAgent) -> list[dict]:
         """多次微调 puschTargetSnrX10 until receiver RSSP returns to target.
@@ -220,7 +506,7 @@ class RcCampaign(threading.Thread):
             rssp = self._rssp_db()
             self.last_rssp_db = rssp
             if rssp is None:
-                self._say("servo", "no CIR available — skipping servo")
+                self._say("servo", "authoritative OAI PUSCH RSSI unavailable — skipping servo")
                 return log
             err = self.cfg.target_rssp_db - rssp
             log.append({"iter": it, "rssp_db": round(rssp, 2),
@@ -335,34 +621,67 @@ class RcCampaign(threading.Thread):
 
     def finalize_sample(self, index: int, angle_deg: float, window: dict,
                         servo_log: list[dict], noise: Optional[dict]) -> None:
-        """Grab final CIR, filter against the noise floor, aggregate gNB data."""
+        """Grab final CIR and persist one window-consistent analytics object."""
         raw = self._cir(timeout_s=8.0)
-        taps = _tap_powers_db(raw) if raw else []
-        floor = self.noise_floor_db if self.noise_floor_db is not None \
-            else float((raw or {}).get("metrics", {}).get("noiseDb", -100.0))
-        margin = self.cfg.noise_margin_db
-        thresh = floor + margin
-        kept = [(i, p) for i, p in enumerate(taps) if p > thresh]
-        dt_ns = float((raw or {}).get("dtNs") or 8.138)
-        total = sum(10 ** (p / 10.0) for _, p in kept) or 1e-30
-        mean_delay = sum(i * dt_ns * 10 ** (p / 10.0) for i, p in kept) / total
-        rms_delay = math.sqrt(max(0.0, sum(
-            (i * dt_ns - mean_delay) ** 2 * 10 ** (p / 10.0) for i, p in kept) / total))
+        run = self.db.query_one(
+            "SELECT configuration_snapshot_json FROM runs WHERE run_id=?", (self.run_id,)) or {}
+        try:
+            measurement = json.loads(run.get("configuration_snapshot_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            measurement = {}
+        channel = analyze_cir(raw, self.noise_floor_db, self.cfg.noise_margin_db,
+                              measurement)
         m = (raw or {}).get("metrics") or {}
-        peak_f = max((p for _, p in kept), default=None)
-        # gNB-side aggregates inside the window (collectors already wrote them)
+        # OAI exposes interval deltas. Summing deltas inside the exact loaded
+        # window gives per-Sample HARQ counts; cumulative harqRounds are never
+        # mistaken for a Sample value.
         gnb_summary: dict[str, Any] = {}
         try:
             row = self.db.query_one(
-                f"SELECT AVG(ul_goodput_mbps) ul, AVG(dl_goodput_mbps) dl, AVG(pusch_snr_db) snr,"
-                f" AVG(ul_mcs) mcs, AVG(ul_bler) bler, COUNT(*) n FROM oai_snapshots"
+                "SELECT AVG(ul_goodput_mbps) ul_goodput_mbps,"
+                " AVG(dl_goodput_mbps) dl_goodput_mbps, AVG(pusch_snr_db) pusch_snr_db,"
+                " AVG(ul_mcs) ul_mcs, AVG(ul_bler) ul_bler, AVG(dl_bler) dl_bler,"
+                " SUM(ul_harq_initial_tx_delta) ul_harq_tx,"
+                " SUM(ul_harq_retransmission_delta) ul_harq_retx,"
+                " SUM(dl_harq_initial_tx_delta) dl_harq_tx,"
+                " SUM(dl_harq_retransmission_delta) dl_harq_retx,"
+                " SUM(ul_harq_errors) ul_harq_errors, SUM(dl_harq_errors) dl_harq_errors,"
+                " COUNT(*) snapshot_count"
+                " FROM oai_snapshots"
                 f" WHERE run_id=? AND fetched_utc_ms BETWEEN ? AND ?",
                 (self.run_id, window["started_utc_ms"], window["ended_utc_ms"]))
             if row:
                 gnb_summary = {k: (round(v, 3) if isinstance(v, float) else v)
                                for k, v in row.items() if v is not None}
+                for prefix in ("ul", "dl"):
+                    tx = gnb_summary.get(f"{prefix}_harq_tx")
+                    retx = gnb_summary.get(f"{prefix}_harq_retx")
+                    gnb_summary[f"{prefix}_harq_retx_rate"] = (
+                        round(float(retx) / (float(tx) + float(retx)), 6)
+                        if tx is not None and retx is not None and float(tx) + float(retx) > 0
+                        else None)
         except Exception:
             pass
+        data_complete = bool(channel.get("processing_status") == "OK" and
+                             gnb_summary.get("snapshot_count", 0) > 0)
+        analytics = {
+            "identity": {"experiment_id": self.experiment_id, "run_id": self.run_id,
+                         "sample_id": index, "angle_deg": angle_deg},
+            "window": {"start_utc_ms": window["started_utc_ms"],
+                       "end_utc_ms": window["ended_utc_ms"],
+                       "aggregation": "measurement window only"},
+            "channel": channel,
+            "radio": {"rssp_dbfs": self.last_rssp_db,
+                      "target_rssp_dbfs": self.cfg.target_rssp_db,
+                      "pusch_target_snr_x10": self.pusch_x10},
+            "link": {**gnb_summary,
+                     "bler_contract": "OAI snapshot estimator; arithmetic mean over measurement window",
+                     "harq_contract": "sum of OAI per-snapshot deltas over measurement window"},
+            "quality": {"data_complete": data_complete,
+                        "alignment_status": "MASTER_UTC_WINDOW",
+                        "processing_status": channel.get("processing_status"),
+                        "processing_error": channel.get("processing_error")},
+        }
         # persist raw per-sample payload (CIR + servo log + metadata)
         out_dir = self.s.raw_dir / "rc" / (self.run_id or self.experiment_id)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -373,10 +692,7 @@ class RcCampaign(threading.Thread):
             "target_rssp_db": self.cfg.target_rssp_db,
             "noise_floor_db": self.noise_floor_db,
             "servo_log": servo_log, "gnb_summary": gnb_summary,
-            "filtered": {"tap_count": len(kept), "threshold_db": round(thresh, 2),
-                         "rms_delay_ns": round(rms_delay, 1),
-                         "mean_delay_ns": round(mean_delay, 1),
-                         "peak_db": peak_f},
+            "analytics": analytics,
             "cir": raw,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -388,22 +704,46 @@ class RcCampaign(threading.Thread):
                stirrer_step_deg, pusch_target_snr_x10, rssp_db, target_rssp_db,
                rssp_error_db, noise_floor_db, noise_margin_db,
                tap_count, tap_count_filtered, rms_delay_ns, rms_delay_ns_filtered,
+               raw_delay_bin_count, candidate_peak_count, effective_peak_count, resolved_path_count,
                mean_delay_ns, k_factor_db, peak_db, peak_db_filtered,
                started_utc_ms, ended_utc_ms, servo_iters, servo_log,
-               gnb_summary, raw_json_path, created_utc)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               gnb_summary, raw_json_path, analytics_json,
+               processing_status, processing_error, detection_threshold_db,
+               noise_std_db, noise_frame_count, processing_algorithm, processing_version,
+               noise_method, data_complete, alignment_status, created_utc)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (self.experiment_id, self.run_id, index, "RC", angle_deg,
              self.cfg.step_deg, self.pusch_x10, rssp, self.cfg.target_rssp_db,
              (round(self.cfg.target_rssp_db - rssp, 2) if rssp is not None else None),
              self.noise_floor_db, self.cfg.noise_margin_db,
-             m.get("tapCount"), len(kept), m.get("rmsDelayNs"), round(rms_delay, 1),
-             round(mean_delay, 1), m.get("kFactorDb"), m.get("peakDb"), peak_f,
+             channel.get("raw_path_count"), channel.get("effective_path_count"),
+             m.get("rmsDelayNs"), channel.get("rms_delay_ns_filtered"),
+             channel.get("raw_delay_bin_count"), channel.get("candidate_peak_count"),
+             channel.get("effective_peak_count"), channel.get("resolved_path_count"),
+             channel.get("mean_delay_ns_filtered"), channel.get("k_factor_db_filtered"),
+             m.get("peakDb"), channel.get("peak_db_filtered"),
              window["started_utc_ms"], window["ended_utc_ms"], len(servo_log),
              json.dumps(servo_log, ensure_ascii=False),
              json.dumps(gnb_summary, ensure_ascii=False), str(path),
+             json.dumps(analytics, ensure_ascii=False),
+             channel.get("processing_status"), channel.get("processing_error"),
+             channel.get("detection_threshold_db"), self.noise_std_db, self.noise_frame_count,
+             PROCESSING_ALGORITHM, PROCESSING_VERSION, NOISE_METHOD,
+             1 if data_complete else 0, "MASTER_UTC_WINDOW",
              datetime.now(timezone.utc).isoformat()))
 
     # ---- main ---------------------------------------------------------------- #
+    def _wait_for_sync(self, loop) -> bool:
+        self.state = "waiting_sync"
+        self._say("sync", "waiting for post-restart UE synchronization")
+        while not loop.sync_confirmed and not self._stop.wait(0.5):
+            pass
+        if self._stop.is_set():
+            self.state = "stopped"
+            return False
+        self._say("sync", "UE synchronized; Run time anchor recorded")
+        return True
+
     def run(self) -> None:
         try:
             self._run_inner()
@@ -428,6 +768,12 @@ class RcCampaign(threading.Thread):
         plan = loop.plan if loop else None
         if not plan:
             raise ValueError("downlink loop plan not found — start the experiment first")
+
+        # RC motion and measurement must never race the post-restart UE
+        # synchronization. DownlinkLoop records the successful sync-confirm as
+        # the Run's time anchor; only then may the chamber campaign proceed.
+        if not self._wait_for_sync(loop):
+            return
 
         try:
             controls = self.oai.gnb_controls()
@@ -485,6 +831,11 @@ class RcCampaign(threading.Thread):
         self.state = ("stopped" if self._stop.is_set() else
                       ("completed" if self.samples_done == self.cfg.n_steps else "incomplete"))
         self._say("campaign", f"campaign {self.state} — {self.samples_done} samples")
+        if self.state == "completed" and self.run_id:
+            stopped = self.flow.stop_experiment(
+                self.experiment_id, self.serial, self.pc_port, requested_run_id=self.run_id)
+            if not stopped.get("discarded") and self.db.get_run(self.run_id):
+                self.db.transition(self.run_id, "COMPLETE", "RC campaign completed automatically")
 
     def stop(self) -> None:
         self._stop.set()
@@ -538,10 +889,25 @@ class RcRunner:
             "log": camp.log[-40:],
         }
 
-    def samples(self, experiment_id: str) -> list[dict]:
-        return self.db.query(
-            "SELECT * FROM rc_samples WHERE experiment_id=? ORDER BY sample_index",
-            (experiment_id,))
+    def samples(self, experiment_id: Optional[str] = None,
+                run_id: Optional[str] = None) -> list[dict]:
+        if run_id:
+            rows = self.db.query(
+                "SELECT * FROM rc_samples WHERE run_id=? ORDER BY sample_index", (run_id,))
+        elif experiment_id:
+            rows = self.db.query(
+                "SELECT * FROM rc_samples WHERE experiment_id=? ORDER BY run_id,sample_index",
+                (experiment_id,))
+        else:
+            return []
+        for row in rows:
+            for key in ("servo_log", "gnb_summary", "analytics_json"):
+                if row.get(key):
+                    try:
+                        row[key.removesuffix("_json")] = json.loads(row[key])
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+        return rows
 
 
 _runners: dict[str, RcRunner] = {}

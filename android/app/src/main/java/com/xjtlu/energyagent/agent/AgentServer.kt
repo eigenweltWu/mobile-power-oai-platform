@@ -23,6 +23,8 @@ import org.json.JSONObject
  */
 class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
 
+    @Volatile private var nettestProcess: Process? = null
+
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri.trimEnd('/')
         return try {
@@ -39,6 +41,8 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
                 session.method == Method.POST && uri == "/agent/task/start" -> json(ok(taskStart(session)))
                 session.method == Method.POST && uri == "/agent/task/stop" -> json(ok(taskStop()))
                 session.method == Method.POST && uri == "/agent/downlink" -> json(ok(downlink(session)))
+                session.method == Method.POST && uri == "/agent/nettest/start" -> json(ok(nettestStart(session)))
+                session.method == Method.POST && uri == "/agent/nettest/stop" -> json(ok(nettestStop()))
                 session.method == Method.POST && uri == "/agent/sync/confirm" -> json(ok(syncConfirm(session)))
                 session.method == Method.POST && uri == "/agent/rearm" -> json(ok(rearm()))
                 session.method == Method.POST && uri == "/agent/collected" -> json(ok(collected(session)))
@@ -211,6 +215,63 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
             put("phoneRecvMs", recv)
             put("phoneSendMs", send)
             put("phoneElapsedNs", recvElapsed)
+        }
+    }
+
+    /** Start the fixed local nc workload used by the OAI control-center.
+     *  Only typed, validated fields are accepted; callers cannot supply shell
+     *  commands. Control and traffic both travel over the UE's 5G PDU link. */
+    @Synchronized
+    private fun nettestStart(session: IHTTPSession): JSONObject {
+        val body = JSONObject(readBody(session))
+        val direction = body.optString("direction")
+        val protocol = body.optString("protocol")
+        val host = body.optString("host")
+        val port = body.optInt("port")
+        val limitSeconds = body.optInt("limitSeconds", 300).coerceIn(1, 300)
+        require(direction == "downlink" || direction == "uplink") { "invalid direction" }
+        require(protocol == "tcp" || protocol == "udp") { "invalid protocol" }
+        require(validIpv4(host)) { "invalid host" }
+        require(port in 1..65535) { "invalid port" }
+
+        nettestStop()
+        val command = when {
+            protocol == "tcp" && direction == "uplink" ->
+                "dd if=/dev/zero bs=65536 2>/dev/null | nc -w 8 $host $port"
+            protocol == "tcp" -> "nc -w 8 $host $port"
+            direction == "uplink" ->
+                "dd if=/dev/zero bs=65000 2>/dev/null | nc -u -w 8 $host $port"
+            else -> "(echo hi; tail -f /dev/null) | nc -u -w 8 $host $port"
+        }
+        nettestProcess = ProcessBuilder("timeout", limitSeconds.toString(), "sh", "-c", command)
+            .redirectOutput(ProcessBuilder.Redirect.to(java.io.File("/dev/null")))
+            .redirectError(ProcessBuilder.Redirect.to(java.io.File("/dev/null")))
+            .start()
+        return JSONObject().apply {
+            put("started", true)
+            put("direction", direction)
+            put("protocol", protocol)
+            put("host", host)
+            put("port", port)
+            put("limitSeconds", limitSeconds)
+        }
+    }
+
+    @Synchronized
+    private fun nettestStop(): JSONObject {
+        nettestProcess?.let { process ->
+            process.destroy()
+            if (process.isAlive) process.destroyForcibly()
+        }
+        nettestProcess = null
+        return JSONObject().apply { put("stopped", true) }
+    }
+
+    private fun validIpv4(value: String): Boolean {
+        val parts = value.split('.')
+        return parts.size == 4 && parts.all { part ->
+            part.isNotEmpty() && part.length <= 3 && part.all(Char::isDigit) &&
+                (part.toIntOrNull() ?: -1) in 0..255
         }
     }
 

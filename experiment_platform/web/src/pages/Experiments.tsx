@@ -12,14 +12,14 @@ type ExperimentSummary = Experiment & {
 };
 type Configuration = {
   id: number; experiment_id: string; name: string; config_json: string; created_utc: string;
-  updated_utc?: string | null; is_default?: number; used_by_runs?: number;
+  updated_utc?: string | null; is_default?: number; used_by_runs?: number; version?: number;
 };
 type RunDetail = Run & {
   requested_config?: Record<string, unknown> | null; actual_config?: Record<string, unknown> | null;
   configuration_name?: string | null; last_error?: string | null;
   record_counts?: { phone: number; gnb: number; cir: number; clips: number };
 };
-type ConfigEditor = { id: number | null; name: string; config: Record<string, string>; original: string };
+type ConfigEditor = { id: number | null; name: string; environment: string; config: Record<string, string>; original: string };
 type DetailTab = 'overview' | 'configurations' | 'history';
 
 const EMPTY_FORM = { experiment_id: '', environment: 'AC', operator_name: '', notes: '', purpose: '', flow: '' };
@@ -29,32 +29,47 @@ const DEFAULT_CONFIGURATION: Record<string, unknown> = {
   frequencyMHz: 3349.92, bandwidthMHz: 100, txGainDb: 60, rxGainDb: 40,
   puschTargetMode: 'manual', puschTargetSnrX10: 89, schedulerMode: 'auto', ulTrafficMbps: 5,
 };
-const CONFIG_KEYS = ['frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb', 'puschTargetMode', 'puschTargetSnrX10', 'schedulerMode', 'qm', 'mcs', 'nPrb', 'ulTrafficMbps'];
+const CONFIG_KEYS = ['frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb', 'puschTargetMode', 'puschTargetSnrDb', 'schedulerMode', 'qm', 'mcs', 'nPrb', 'ulTrafficMbps'];
+const RC_DEFAULTS: Record<string, unknown> = { step_deg: 5, n_steps: 12, dwell_s: 20, settle_s: 8, servo_settle_s: 5, target_rssp_db: -60, rssp_tol_db: 1.5, pusch_step_x10: 10, max_servo_iters: 6, noise_frames: 20, noise_margin_db: 6, peak_prominence_db: 3, delay_window_start_ns: 0, delay_window_end_ns: 0 };
+const RC_KEYS = Object.keys(RC_DEFAULTS);
 const QM_OPTIONS = [{ value: '2', label: '2 · QPSK' }, { value: '4', label: '4 · 16QAM' }, { value: '6', label: '6 · 64QAM' }, { value: '8', label: '8 · 256QAM' }];
 const QM_MCS_RANGE: Record<string, { min: number; max: number }> = { '2': { min: 0, max: 9 }, '4': { min: 10, max: 16 }, '6': { min: 17, max: 27 }, '8': { min: 28, max: 31 } };
 
 function parseConfig(json: string | null | undefined): Record<string, unknown> {
   try { return json ? JSON.parse(json) ?? {} : {}; } catch { return {}; }
 }
-function configForm(config: Record<string, unknown>): Record<string, string> {
+function configForm(config: Record<string, unknown>, isRc = false): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const key of CONFIG_KEYS) out[key] = config[key] == null ? '' : String(config[key]);
+  for (const key of CONFIG_KEYS) out[key] = key === 'puschTargetSnrDb'
+    ? (config.puschTargetSnrX10 == null ? '' : String(Number(config.puschTargetSnrX10) / 10))
+    : (config[key] == null ? '' : String(config[key]));
   if (!out.puschTargetMode) out.puschTargetMode = 'auto';
   if (!out.schedulerMode) out.schedulerMode = 'auto';
   if (!out.ulTrafficMbps) out.ulTrafficMbps = '5';
+  if (isRc) {
+    const chamber = (config.rcChamber || {}) as Record<string, unknown>;
+    for (const key of RC_KEYS) out[`rc.${key}`] = String(chamber[key] ?? RC_DEFAULTS[key]);
+    out.executionMode = String(config.executionMode ?? chamber.execution_mode ?? 'REAL_HARDWARE');
+  }
   return out;
 }
-function buildConfig(form: Record<string, string>): Record<string, unknown> {
+function buildConfig(form: Record<string, string>, isRc = false): Record<string, unknown> {
   const number = (key: string) => Number(form[key]);
   const config: Record<string, unknown> = {
     frequencyMHz: number('frequencyMHz'), bandwidthMHz: number('bandwidthMHz'), txGainDb: number('txGainDb'), rxGainDb: number('rxGainDb'),
     puschTargetMode: form.puschTargetMode, schedulerMode: form.schedulerMode, ulTrafficMbps: number('ulTrafficMbps'),
   };
-  if (form.puschTargetMode === 'manual') config.puschTargetSnrX10 = number('puschTargetSnrX10');
+  if (form.puschTargetMode === 'manual') config.puschTargetSnrX10 = Math.round(number('puschTargetSnrDb') * 10);
   if (form.schedulerMode === 'manual') Object.assign(config, { qm: number('qm'), mcs: number('mcs'), nPrb: number('nPrb') });
+  if (isRc) {
+    const chamber: Record<string, unknown> = {};
+    for (const key of RC_KEYS) chamber[key] = Number(form[`rc.${key}`]);
+    config.rcChamber = chamber;
+    config.executionMode = form.executionMode;
+  } else config.executionMode = 'REAL_HARDWARE';
   return config;
 }
-function validateConfig(form: Record<string, string>): Record<string, string> {
+function validateConfig(form: Record<string, string>, isRc = false): Record<string, string> {
   const errors: Record<string, string> = {};
   for (const key of ['frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb', 'ulTrafficMbps']) if (form[key] === '' || !Number.isFinite(Number(form[key]))) errors[key] = 'Enter a valid number.';
   if (!errors.frequencyMHz && Number(form.frequencyMHz) <= 0) errors.frequencyMHz = 'Must be greater than 0 MHz.';
@@ -62,9 +77,8 @@ function validateConfig(form: Record<string, string>): Record<string, string> {
   for (const key of ['txGainDb', 'rxGainDb']) if (!errors[key] && (Number(form[key]) < 0 || Number(form[key]) > 100)) errors[key] = 'Expected range: 0–100 dB.';
   if (Number(form.ulTrafficMbps) < 0) errors.ulTrafficMbps = 'Must be 0 or greater.';
   if (form.puschTargetMode === 'manual') {
-    const target = Number(form.puschTargetSnrX10);
-    if (form.puschTargetSnrX10 === '' || !Number.isFinite(target)) errors.puschTargetSnrX10 = 'Required in manual mode.';
-    else if (!Number.isInteger(target)) errors.puschTargetSnrX10 = 'Enter an integer in 0.1 dB units.';
+    const target = Number(form.puschTargetSnrDb);
+    if (form.puschTargetSnrDb === '' || !Number.isFinite(target)) errors.puschTargetSnrDb = 'Required in manual mode.';
   }
   if (form.schedulerMode === 'manual') {
     const range = QM_MCS_RANGE[form.qm]; const mcs = Number(form.mcs);
@@ -76,13 +90,26 @@ function validateConfig(form: Record<string, string>): Record<string, string> {
     if (form.nPrb === '' || !Number.isFinite(nPrb)) errors.nPrb = 'Required.';
     else if (!Number.isInteger(nPrb) || nPrb < 1 || nPrb > 273) errors.nPrb = 'Enter a whole number from 1 to 273.';
   }
+  if (isRc) for (const key of RC_KEYS) {
+    const value = Number(form[`rc.${key}`]);
+    if (!Number.isFinite(value)) errors[`rc.${key}`] = 'Enter a valid number.';
+    else if (['step_deg', 'n_steps', 'dwell_s', 'noise_frames'].includes(key) && value <= 0) errors[`rc.${key}`] = 'Must be greater than 0.';
+  }
+  if (isRc) {
+    const start = Number(form['rc.delay_window_start_ns']);
+    const end = Number(form['rc.delay_window_end_ns']);
+    if (start < 0) errors['rc.delay_window_start_ns'] = 'Cannot be negative.';
+    if (end < 0 || (end > 0 && end <= start)) errors['rc.delay_window_end_ns'] = 'Use 0 for auto, or a value above the start.';
+  }
   return errors;
 }
 function summary(config: Record<string, unknown>): [string, string][] {
   const snr = Number(config.puschTargetSnrX10);
   const pusch = config.puschTargetMode === 'manual' && Number.isFinite(snr) ? `Manual · ${(snr / 10).toFixed(1)} dB` : 'Auto';
   const scheduler = config.schedulerMode === 'manual' ? `Manual · Qm ${config.qm ?? '—'} · MCS ${config.mcs ?? '—'}` : 'Auto';
-  return [['Frequency', config.frequencyMHz == null ? '—' : `${config.frequencyMHz} MHz`], ['Bandwidth', config.bandwidthMHz == null ? '—' : `${config.bandwidthMHz} MHz`], ['TX / RX Gain', `${config.txGainDb ?? '—'} / ${config.rxGainDb ?? '—'} dB`], ['PUSCH', pusch], ['Scheduler', scheduler], ['UL Traffic', config.ulTrafficMbps == null ? '—' : `${config.ulTrafficMbps} Mbps`]];
+  const rows: [string, string][] = [['Frequency', config.frequencyMHz == null ? '—' : `${config.frequencyMHz} MHz`], ['Bandwidth', config.bandwidthMHz == null ? '—' : `${config.bandwidthMHz} MHz`], ['TX / RX Gain', `${config.txGainDb ?? '—'} / ${config.rxGainDb ?? '—'} dB`], ['PUSCH', pusch], ['Scheduler', scheduler], ['UL Traffic', config.ulTrafficMbps == null ? '—' : `${config.ulTrafficMbps} Mbps`]];
+  if (config.rcChamber) rows.push(['RC Chamber', `${(config.rcChamber as Record<string, unknown>).n_steps ?? '—'} samples · ${config.executionMode ?? '—'}`]);
+  return rows;
 }
 function statusTone(status: string | null | undefined): 'good' | 'warn' | 'bad' | 'muted' {
   const value = status?.toUpperCase();
@@ -108,6 +135,8 @@ export default function Experiments({ nav, initialExperimentId = '' }: { nav: (p
   const [environment, setEnvironment] = useState('ALL');
   const [sort, setSort] = useState('newest');
   const [page, setPage] = useState(1);
+  const [deleteTarget, setDeleteTarget] = useState('');
+  const [deleteText, setDeleteText] = useState('');
   const selected = experiments.data?.find((x) => x.experiment_id === initialExperimentId) ?? null;
 
   const filtered = useMemo(() => {
@@ -135,17 +164,18 @@ export default function Experiments({ nav, initialExperimentId = '' }: { nav: (p
     catch (error) { toast('err', error instanceof Error ? error.message : String(error)); }
   };
   const deleteExperiment = async (experimentId: string) => {
-    const typed = window.prompt(`This permanently deletes conditions, Runs, Configurations and derived files.\n\nType ${experimentId} to confirm.`);
-    if (typed !== experimentId) return;
     try { await api.delete(`/api/experiments/${encodeURIComponent(experimentId)}`); toast('ok', `Experiment ${experimentId} deleted.`); experiments.reload(); nav('/experiments'); }
     catch (error) { toast('err', error instanceof Error ? error.message : String(error)); }
+    finally { setDeleteTarget(''); setDeleteText(''); }
   };
+  const confirmDelete = (experimentId: string) => { setDeleteTarget(experimentId); setDeleteText(''); };
+  const deleteModal = deleteTarget && <Modal title="Delete Experiment?" sub="This removes conditions, Runs, Configurations and derived files." onClose={() => setDeleteTarget('')} footer={<><button className="btn" onClick={() => setDeleteTarget('')}>Cancel</button><button className="btn danger" disabled={deleteText !== deleteTarget} onClick={() => deleteExperiment(deleteTarget)}>Delete Experiment</button></>}><Field label={`Type ${deleteTarget} to confirm`}><input autoFocus value={deleteText} onChange={(event) => setDeleteText(event.target.value)} /></Field></Modal>;
 
   if (initialExperimentId) {
     if (experiments.loading && !experiments.data) return <Spinner label="Loading Experiment…" />;
     if (experiments.error) return <ErrorBox error={experiments.error} />;
     if (!selected) return <Card title="Experiment not found"><button className="btn" onClick={() => nav('/experiments')}>← Experiments</button></Card>;
-    return <ExperimentDetail experiment={selected} nav={nav} onReload={experiments.reload} onExport={() => exportExperiment(selected.experiment_id)} onDelete={() => deleteExperiment(selected.experiment_id)} />;
+    return <><ExperimentDetail experiment={selected} nav={nav} onReload={experiments.reload} onExport={() => exportExperiment(selected.experiment_id)} onDelete={() => confirmDelete(selected.experiment_id)} />{deleteModal}</>;
   }
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
@@ -165,7 +195,7 @@ export default function Experiments({ nav, initialExperimentId = '' }: { nav: (p
           <div className="row between"><div><h2 className="mono">{item.experiment_id}</h2><div className="card-sub">Created {fmtIso(item.created_utc)}</div></div><Badge tone={item.environment === 'RC' ? 'warn' : 'accent'}>{item.environment ?? '—'}</Badge></div>
           <div className="experiment-purpose">{item.purpose || 'No purpose recorded.'}</div><dl className="kv"><dt>Operator</dt><dd>{item.operator_name || '—'}</dd></dl>
           <div className="experiment-card-stats"><span><b>{item.configuration_count ?? 0}</b> Configurations</span><span><b>{item.run_count ?? 0}</b> Runs / History</span><span>Last result {result ? <Badge tone={statusTone(result)}>{result}</Badge> : '—'}</span><span>Last activity <b>{fmtTs(item.last_activity_utc_ms)}</b></span></div>
-          <div className="row between" style={{ marginTop: 16 }}><button className="btn primary" onClick={() => nav(`/experiments/${encodeURIComponent(item.experiment_id)}`)}>Manage Experiment</button><details className="more-menu"><summary aria-label={`More actions for ${item.experiment_id}`}>•••</summary><div><button onClick={() => exportExperiment(item.experiment_id)}>Export experiment</button><button className="danger-text" onClick={() => deleteExperiment(item.experiment_id)}>Delete experiment</button></div></details></div>
+          <div className="row between" style={{ marginTop: 16 }}><button className="btn primary" onClick={() => nav(`/experiments/${encodeURIComponent(item.experiment_id)}`)}>Manage Experiment</button><details className="more-menu"><summary aria-label={`More actions for ${item.experiment_id}`}>•••</summary><div><button onClick={() => exportExperiment(item.experiment_id)}>Export experiment</button><button className="danger-text" onClick={() => confirmDelete(item.experiment_id)}>Delete experiment</button></div></details></div>
         </article>;
       })}</div>
       <div className="pagination"><span>{filtered.length} Experiments · page {page} of {totalPages}</span><button className="btn sm" disabled={page === 1} onClick={() => setPage((x) => x - 1)}>Previous</button><button className="btn sm" disabled={page === totalPages} onClick={() => setPage((x) => x + 1)}>Next</button></div>
@@ -173,6 +203,7 @@ export default function Experiments({ nav, initialExperimentId = '' }: { nav: (p
     {showCreate && <Modal title="New Experiment" sub="Create the Experiment first, then manage its Configurations." onClose={() => setShowCreate(false)} footer={<><button className="btn" onClick={() => setShowCreate(false)}>Cancel</button><button className="btn primary" form="create-experiment" type="submit" disabled={creating}>{creating ? 'Creating…' : 'Create & Configure'}</button></>}>
       <form id="create-experiment" className="stack" onSubmit={create}>{createError && <ErrorBox error={createError} />}<div className="notice-box">A Default Configuration will be created automatically and shown explicitly after creation.</div><div className="grid cols-2"><Field label="Experiment ID"><input required autoFocus className="mono" value={form.experiment_id} onChange={(e) => setForm({ ...form, experiment_id: e.target.value })} /></Field><Field label="Environment"><select value={form.environment} onChange={(e) => setForm({ ...form, environment: e.target.value })}><option value="AC">AC</option><option value="RC">RC</option></select></Field><Field label="Operator"><input value={form.operator_name} onChange={(e) => setForm({ ...form, operator_name: e.target.value })} /></Field></div><Field label="Purpose"><textarea rows={2} value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })} /></Field><Field label="Flow"><textarea rows={2} value={form.flow} onChange={(e) => setForm({ ...form, flow: e.target.value })} /></Field><Field label="Notes"><textarea rows={2} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field></form>
     </Modal>}
+    {deleteModal}
   </div>;
 }
 
@@ -192,6 +223,7 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
   const [savingConfig, setSavingConfig] = useState(false);
   const [runPage, setRunPage] = useState(1);
   const [selectedRunId, setSelectedRunId] = useState('');
+  const [pending, setPending] = useState<{ title: string; body: string; action: () => void } | null>(null);
 
   useEffect(() => {
     const next = { operator_name: experiment.operator_name || '', purpose: experiment.purpose || '', flow: experiment.flow || '', notes: experiment.notes || '' };
@@ -204,9 +236,9 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
     const warn = (event: BeforeUnloadEvent) => { if (dirty) event.preventDefault(); };
     window.addEventListener('beforeunload', warn); return () => window.removeEventListener('beforeunload', warn);
   }, [dirty]);
-  const allowLeave = () => !dirty || window.confirm('Discard unsaved changes?');
-  const changeTab = (next: DetailTab) => { if (next === tab || allowLeave()) { setTab(next); setEditor(null); } };
-  const back = () => { if (allowLeave()) nav('/experiments'); };
+  const confirmOrRun = (action: () => void, title = 'Discard unsaved changes?', body = 'Your current editor changes have not been saved.') => dirty ? setPending({ title, body, action }) : action();
+  const changeTab = (next: DetailTab) => { if (next !== tab) confirmOrRun(() => { setTab(next); setEditor(null); }); };
+  const back = () => confirmOrRun(() => nav('/experiments'));
 
   const saveOverview = async () => {
     setSavingOverview(true); setOverviewError(null);
@@ -215,18 +247,18 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
     finally { setSavingOverview(false); }
   };
   const openConfiguration = (row?: Configuration, duplicate = false) => {
-    if (configDirty && !window.confirm('Discard unsaved changes?')) return;
-    const config = configForm(row ? parseConfig(row.config_json) : DEFAULT_CONFIGURATION);
-    const next = { id: duplicate ? null : row?.id ?? null, name: row ? `${row.name}${duplicate ? ' Copy' : ''}` : '', config };
-    setEditor({ ...next, original: JSON.stringify({ name: next.name, config: next.config }) }); setConfigErrors({}); setConfigApiError(null);
+    const open = () => { const config = configForm(row ? parseConfig(row.config_json) : DEFAULT_CONFIGURATION, experiment.environment === 'RC');
+      const next = { id: duplicate ? null : row?.id ?? null, name: row ? `${row.name}${duplicate ? ' Copy' : ''}` : '', config };
+      setEditor({ ...next, environment: experiment.environment || 'AC', original: JSON.stringify({ name: next.name, config: next.config }) }); setConfigErrors({}); setConfigApiError(null); };
+    if (configDirty) setPending({ title: 'Discard unsaved Configuration?', body: 'The current Configuration editor will be replaced.', action: open }); else open();
   };
   const saveConfiguration = async () => {
     if (!editor) return;
-    const errors = validateConfig(editor.config); if (!editor.name.trim()) errors.name = 'Configuration name is required.';
+    const errors = validateConfig(editor.config, editor.environment === 'RC'); if (!editor.name.trim()) errors.name = 'Configuration name is required.';
     setConfigErrors(errors); if (Object.keys(errors).length) return;
     setSavingConfig(true); setConfigApiError(null);
     try {
-      const body = { name: editor.name.trim(), config: buildConfig(editor.config) };
+      const body = { name: editor.name.trim(), config: buildConfig(editor.config, editor.environment === 'RC') };
       if (editor.id == null) await api.post(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates`, body);
       else await api.put(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates/${editor.id}`, body);
       setEditor(null); configurations.reload(); onReload(); toast('ok', 'Configuration saved.');
@@ -238,14 +270,16 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
     catch (error) { setConfigApiError(error instanceof Error ? error : new Error(String(error))); }
   };
   const archive = async (row: Configuration) => {
-    if (!window.confirm(`Archive Configuration “${row.name}”? Historical Run snapshots will remain unchanged.`)) return;
-    try { await api.delete(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates/${row.id}`); configurations.reload(); onReload(); toast('ok', 'Configuration archived.'); }
-    catch (error) { setConfigApiError(error instanceof Error ? error : new Error(String(error))); }
+    setPending({ title: `Archive “${row.name}”?`, body: 'Historical Run snapshots remain unchanged.', action: async () => {
+      try { await api.delete(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates/${row.id}`); configurations.reload(); onReload(); toast('ok', 'Configuration archived.'); }
+      catch (error) { setConfigApiError(error instanceof Error ? error : new Error(String(error))); }
+    }});
   };
   const removeRun = async (runId: string) => {
-    if (!window.confirm(`Delete Run ${runId} and its indexed records?`)) return;
-    try { await api.delete(`/api/runs/${encodeURIComponent(runId)}`); runs.reload(); setSelectedRunId(''); toast('ok', 'Run deleted.'); }
-    catch (error) { toast('err', error instanceof Error ? error.message : String(error)); }
+    setPending({ title: `Delete Run ${runId}?`, body: 'Runs with saved Clips require an explicit cascade and are blocked by the backend.', action: async () => {
+      try { await api.delete(`/api/runs/${encodeURIComponent(runId)}`); runs.reload(); setSelectedRunId(''); toast('ok', 'Run deleted.'); }
+      catch (error) { toast('err', error instanceof Error ? error.message : String(error)); }
+    }});
   };
   const defaultConfiguration = configurations.data?.find((x) => !!x.is_default);
   const totalRunPages = Math.max(1, Math.ceil((runs.data?.length ?? 0) / RUN_PAGE_SIZE));
@@ -263,14 +297,13 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
 
     {tab === 'configurations' && <div className="stack">
       {configApiError && <ErrorBox error={configApiError} />}
-      {experiment.environment === 'RC' && <Card title="RC Configuration" sub="Mechanical sampling and stirrer settings are part of this RC Experiment."><button className="btn" onClick={() => { if (allowLeave()) nav(`/experiments/${encodeURIComponent(experiment.experiment_id)}/rc`); }}>Open RC Setup</button></Card>}
       <Card title="Default Configuration" sub="Used for the next Run unless Dashboard explicitly selects another Configuration.">
         {configurations.loading && !configurations.data ? <Spinner /> : configurations.error ? <><ErrorBox error={configurations.error} /><button className="btn sm" onClick={configurations.reload}>Retry</button></> : defaultConfiguration ? <ConfigurationCard row={defaultConfiguration} onEdit={() => openConfiguration(defaultConfiguration)} onDuplicate={() => openConfiguration(defaultConfiguration, true)} /> : <EmptyState><b>Configuration required</b><br />Add a Configuration, then explicitly set it as default.</EmptyState>}
       </Card>
       <Card title="Saved Configurations" sub="Cards are read-only until an explicit action is selected." right={<button className="btn" onClick={() => openConfiguration()}>+ Add Configuration</button>}>
-        {configurations.loading && !configurations.data ? <Spinner /> : configurations.error ? <><ErrorBox error={configurations.error} /><button className="btn sm" onClick={configurations.reload}>Retry</button></> : !configurations.data?.length ? <EmptyState><b>No configurations</b><br />Add a Configuration before running this Experiment.</EmptyState> : <div className="stack">{configurations.data.map((row) => <ConfigurationCard key={row.id} row={row} onEdit={() => openConfiguration(row)} onDuplicate={() => openConfiguration(row, true)} onDefault={row.is_default ? undefined : () => setDefault(row)} onArchive={row.is_default ? undefined : () => archive(row)} />)}</div>}
+        {configurations.loading && !configurations.data ? <Spinner /> : configurations.error ? <><ErrorBox error={configurations.error} /><button className="btn sm" onClick={configurations.reload}>Retry</button></> : !configurations.data?.some((row) => !row.is_default) ? <EmptyState>No non-default Configurations.</EmptyState> : <div className="stack">{configurations.data.filter((row) => !row.is_default).map((row) => <ConfigurationCard key={row.id} row={row} onEdit={() => openConfiguration(row)} onDuplicate={() => openConfiguration(row, true)} onDefault={() => setDefault(row)} onArchive={() => archive(row)} />)}</div>}
       </Card>
-      {editor && <ConfigurationEditor editor={editor} setEditor={setEditor} errors={configErrors} apiError={configApiError} saving={savingConfig} onSave={saveConfiguration} onCancel={() => { if (!configDirty || window.confirm('Discard unsaved changes?')) setEditor(null); }} />}
+      {editor && <ConfigurationEditor editor={editor} setEditor={setEditor} errors={configErrors} apiError={configApiError} saving={savingConfig} onSave={saveConfiguration} onCancel={() => configDirty ? setPending({ title: 'Discard unsaved Configuration?', body: 'The current edits will be lost.', action: () => setEditor(null) }) : setEditor(null)} />}
     </div>}
 
     {tab === 'history' && <div className="stack"><Card title="Run History" sub="Newest first. Each Run uses its execution-time Configuration snapshot.">
@@ -278,6 +311,7 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
     </Card>{selectedRunId && <RunResultDetail runId={selectedRunId} nav={nav} onDelete={() => removeRun(selectedRunId)} onClose={() => setSelectedRunId('')} />}</div>}
 
     <details className="danger-zone"><summary>Danger Zone</summary><div className="row between"><div><b>Export or delete this Experiment</b><div className="muted-text">Deletion includes conditions, Runs, Configurations and derived files.</div></div><div className="row"><button className="btn" onClick={onExport}>Export everything</button><button className="btn danger" onClick={onDelete}>Delete Experiment</button></div></div></details>
+    {pending && <Modal title={pending.title} sub={pending.body} onClose={() => setPending(null)} footer={<><button className="btn" onClick={() => setPending(null)}>Cancel</button><button className="btn danger" onClick={() => { const action = pending.action; setPending(null); action(); }}>Confirm</button></>}><p>This action is explicit and will not alter frozen historical Run snapshots unless the action is Run deletion.</p></Modal>}
   </div>;
 }
 
@@ -286,7 +320,7 @@ function ConfigurationCard({ row, onEdit, onDuplicate, onDefault, onArchive }: {
 }) {
   const config = parseConfig(row.config_json);
   return <article className={`configuration-card ${row.is_default ? 'default' : ''}`}>
-    <div className="row between"><div><b>{row.name}</b><div className="muted-text">Created {fmtIso(row.created_utc)} · used by {row.used_by_runs ?? 0} Run(s)</div></div>{row.is_default ? <Badge tone="accent">DEFAULT FOR NEXT RUN</Badge> : null}</div>
+    <div className="row between"><div><b>{row.name} <span className="muted-text">v{row.version ?? 1}</span></b><div className="muted-text">Created {fmtIso(row.created_utc)} · used by {row.used_by_runs ?? 0} Run(s)</div></div><div className="row">{!!config.frequencyMHz && !!config.ulTrafficMbps && (!config.rcChamber || (config.rcChamber as Record<string, unknown>).noise_margin_db != null) ? <Badge tone="good">READY</Badge> : <Badge tone="warn">INCOMPLETE</Badge>}{row.is_default ? <Badge tone="accent">DEFAULT FOR NEXT RUN</Badge> : null}</div></div>
     <dl className="configuration-summary">{summary(config).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
     <details className="details"><summary>View full configuration</summary><div className="details-body"><ConfigValues data={config} /></div></details>
     <div className="row gap-sm" style={{ marginTop: 10 }}><button className="btn sm" onClick={onEdit}>Edit</button><button className="btn sm" onClick={onDuplicate}>Duplicate</button>{onDefault && <button className="btn sm" onClick={onDefault}>Set as default</button>}{onArchive && <button className="btn sm ghost" onClick={onArchive}>Archive</button>}</div>
@@ -304,9 +338,16 @@ function ConfigurationEditor({ editor, setEditor, errors, apiError, saving, onSa
   return <Card title={editor.id == null ? 'Add Configuration' : 'Edit Configuration'} sub="Unsaved changes are protected when you leave this editor."><div className="stack">
     {apiError && <ErrorBox error={apiError} />}<Field label="Configuration name"><input value={editor.name} onChange={(e) => setEditor({ ...editor, name: e.target.value })} />{errors.name && <span className="field-error">{errors.name}</span>}</Field>
     <section><h3>RF</h3><div className="grid cols-4">{input('Frequency', 'frequencyMHz', 'MHz')}{input('Bandwidth', 'bandwidthMHz', 'MHz')}{input('TX Gain', 'txGainDb', 'dB')}{input('RX Gain', 'rxGainDb', 'dB')}</div></section>
-    <section><h3>PUSCH</h3><div className="grid cols-3"><Field label="Mode"><select value={c.puschTargetMode} onChange={(e) => set('puschTargetMode', e.target.value)}><option value="auto">Auto</option><option value="manual">Manual</option></select></Field>{c.puschTargetMode === 'manual' && input('Target SNR', 'puschTargetSnrX10', `${c.puschTargetSnrX10 || '89'} → ${(Number(c.puschTargetSnrX10 || 89) / 10).toFixed(1)} dB`)}</div></section>
+    <section><h3>PUSCH</h3><div className="grid cols-3"><Field label="Mode"><select value={c.puschTargetMode} onChange={(e) => set('puschTargetMode', e.target.value)}><option value="auto">Auto</option><option value="manual">Manual</option></select></Field>{c.puschTargetMode === 'manual' && input('Target SNR', 'puschTargetSnrDb', 'dB · stored internally as ×10')}</div></section>
     <section><h3>UL Scheduler</h3><div className="grid cols-4"><Field label="Mode"><select value={c.schedulerMode} onChange={(e) => set('schedulerMode', e.target.value)}><option value="auto">Auto</option><option value="manual">Manual</option></select></Field>{c.schedulerMode === 'manual' && <><Field label="Modulation"><select value={c.qm} onChange={(e) => set('qm', e.target.value)}><option value="">Select…</option>{QM_OPTIONS.map((x) => <option key={x.value} value={x.value}>{x.label}</option>)}</select>{errors.qm && <span className="field-error">{errors.qm}</span>}</Field>{input('MCS', 'mcs', range ? `${range.min}–${range.max} for selected modulation` : 'Select modulation first')}{input('N_PRB', 'nPrb')}</>}</div></section>
     <section><h3>Traffic</h3><div className="grid cols-3">{input('UL Traffic', 'ulTrafficMbps', 'Mbps · values ≥100 request saturation')}</div></section>
+    {editor.environment === 'RC' && <section><h3>RC Chamber</h3>
+      <h4>Stirrer</h4><div className="grid cols-3">{input('Step angle', 'rc.step_deg', 'degrees')}{input('Samples', 'rc.n_steps')}</div>
+      <h4>Timing</h4><div className="grid cols-3">{input('Measurement dwell', 'rc.dwell_s', 'seconds')}{input('Mechanical settle', 'rc.settle_s', 'seconds')}{input('Servo settle', 'rc.servo_settle_s', 'seconds')}</div>
+      <h4>RSSP Servo</h4><div className="grid cols-4">{input('Target PUSCH RSSI', 'rc.target_rssp_db', 'dBFS')}{input('Tolerance', 'rc.rssp_tol_db', 'dB')}{input('PUSCH step', 'rc.pusch_step_x10', '×0.1 dB')}{input('Max iterations', 'rc.max_servo_iters')}</div>
+      <h4>CIR / Noise</h4><div className="grid cols-3">{input('Noise frames', 'rc.noise_frames')}{input('Noise margin', 'rc.noise_margin_db', 'dB')}{input('Peak prominence', 'rc.peak_prominence_db', 'dB')}{input('Delay window start', 'rc.delay_window_start_ns', 'ns')}{input('Delay window end', 'rc.delay_window_end_ns', 'ns · 0 = auto')}</div>
+      <h4>Execution Mode</h4><Field label="Mode"><select value={c.executionMode} onChange={(e) => set('executionMode', e.target.value)}><option value="REAL_HARDWARE">Real hardware</option><option value="SIMULATION">Simulation</option></select></Field>
+    </section>}
     <div className="row"><button className="btn primary" disabled={saving} onClick={onSave}>{saving ? 'Saving…' : 'Save Configuration'}</button><button className="btn" onClick={onCancel}>Cancel</button></div>
   </div></Card>;
 }
@@ -321,7 +362,7 @@ function RunResultDetail({ runId, nav, onDelete, onClose }: { runId: string; nav
     <div className="result-context"><div><span>Experiment</span><b>{item.experiment_id}</b></div><div><span>Run</span><b>{item.run_id}</b></div><div><span>Configuration</span><b>{item.configuration_name || (item.requested_config ? 'Recorded snapshot' : 'Snapshot unavailable')}</b></div><div><span>Status</span><Badge tone={statusTone(item.quality_status || item.state)}>{item.quality_status || item.state}</Badge></div></div>
     <section><h3>Run Summary</h3><dl className="config-values"><div><dt>Run ID</dt><dd>{item.run_id}</dd></div><div><dt>Experiment ID</dt><dd>{item.experiment_id}</dd></div><div><dt>Condition ID</dt><dd>{item.condition_id}</dd></div><div><dt>Started</dt><dd>{fmtTs(item.started_utc_ms)}</dd></div><div><dt>Completed</dt><dd>{fmtTs(item.ended_utc_ms)}</dd></div><div><dt>State</dt><dd>{item.state}</dd></div><div><dt>Quality</dt><dd>{item.quality_status || 'Not evaluated'}</dd></div></dl></section>
     <section><h3>Requested Configuration</h3><ConfigValues data={item.requested_config} /></section><section><h3>Applied / Verified Configuration</h3><ConfigValues data={item.actual_config} /></section>
-    <section><h3>Result</h3><div className="result-counts"><span>Phone records <b>{item.record_counts?.phone ?? 0}</b></span><span>gNB records <b>{item.record_counts?.gnb ?? 0}</b></span><span>CIR records <b>{item.record_counts?.cir ?? 0}</b></span><span>Clips <b>{item.record_counts?.clips ?? 0}</b></span></div>{item.last_error && <ErrorBox error={item.last_error} />}<button className="btn primary" onClick={() => nav(`/timeline/${encodeURIComponent(item.experiment_id)}/${encodeURIComponent(item.run_id)}`)}>Open Records & Clips</button></section>
+    <section><h3>Result</h3><div className="result-counts"><span>Phone records <b>{item.record_counts?.phone ?? 0}</b></span><span>gNB records <b>{item.record_counts?.gnb ?? 0}</b></span><span>CIR records <b>{item.record_counts?.cir ?? 0}</b></span><span>Clips <b>{item.record_counts?.clips ?? 0}</b></span></div>{item.last_error && <ErrorBox error={item.last_error} />}<button className="btn primary" onClick={() => nav(`/timeline/${encodeURIComponent(item.experiment_id)}/${encodeURIComponent(item.run_id)}`)}>Open Result Workspace</button></section>
     <details className="danger-zone"><summary>Run actions</summary><div className="row between"><span className="muted-text">Deleting removes this Run and its indexed records.</span><button className="btn danger" onClick={onDelete}>Delete Run</button></div></details>
   </div></Card>;
 }

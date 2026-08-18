@@ -302,6 +302,7 @@ class ExperimentManager:
         self.db.execute("DELETE FROM conditions WHERE experiment_id=?", (experiment_id,))
         for table in ("oai_templates", "experiment_acks", "collections", "clips"):
             self.db.execute(f"DELETE FROM {table} WHERE experiment_id=?", (experiment_id,))
+        self.db.execute("DELETE FROM configuration_apply_state WHERE experiment_id=?", (experiment_id,))
         self.db.execute("DELETE FROM experiments WHERE experiment_id=?", (experiment_id,))
 
         # filesystem cleanup (raw + processed artifacts)

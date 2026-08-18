@@ -555,12 +555,63 @@ pre.raw {
 .danger-zone > summary { cursor: pointer; color: var(--bad); font-weight: 700; }
 .danger-zone[open] > summary { margin-bottom: 12px; }
 
+/* ---- operator context / run control ---- */
+.context-bar { display: grid; grid-template-columns: 1.2fr .7fr 1.4fr 1.2fr .8fr .8fr; gap: 1px; margin: 0 24px; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; background: var(--border); }
+.context-bar > div { min-width: 0; padding: 8px 11px; background: var(--panel); display: flex; flex-direction: column; gap: 2px; }
+.context-bar span:first-child { color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.context-bar b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.configuration-state { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.configuration-state > div { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.configuration-state > div > span:first-child { color: var(--faint); font-size: 11px; }
+.diff-list { margin-top: 14px; border-top: 1px solid var(--border); }
+.diff-list > div { display: grid; grid-template-columns: 1fr 1.5fr 1.5fr auto; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--border); }
+.preflight-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.preflight-grid section { padding: 10px; border-radius: var(--radius-sm); background: var(--panel-2); }
+.preflight-grid h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; color: var(--muted); }
+.preflight-row { display: flex; gap: 8px; padding: 6px 0; font-size: 12px; }
+.preflight-row > span { width: 20px; height: 20px; flex: 0 0 20px; display: grid; place-items: center; border-radius: 50%; color: white; font-weight: 800; }
+.preflight-row.ok > span { background: var(--good); }
+.preflight-row.bad > span { background: var(--bad); }
+.link-btn { display: block; padding: 2px 0; border: 0; background: transparent; color: var(--accent); cursor: pointer; font: inherit; text-align: left; }
+.run-blocked { margin-bottom: 12px; padding: 12px; border: 1px solid #f1c7c2; border-radius: var(--radius-sm); background: var(--bad-soft); }
+.run-blocked ul { margin: 6px 0 0; }
+.activity-list > div { display: flex; gap: 12px; padding: 6px 0; border-top: 1px solid var(--border); }
+.activity-list time { color: var(--faint); font-family: var(--mono); font-size: 11px; }
+
+/* ---- result workspace ---- */
+.simulation-banner { padding: 10px 14px; border: 1px solid #f1c27d; border-radius: var(--radius-sm); background: var(--warn-soft); color: #8c5607; font-weight: 800; letter-spacing: .03em; }
+.alignment-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.alignment-grid > div { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; padding: 10px; background: var(--panel-2); border-radius: var(--radius-sm); font-size: 12px; }
+.rc-summary-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.kpi-list { margin: 0; }
+.kpi-list > div { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.kpi-list dt { color: var(--muted); }
+.kpi-list dd { margin: 0; font-weight: 700; text-align: right; }
+.sample-regions { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 5px; }
+.sample-regions button { min-width: 110px; display: flex; flex-direction: column; gap: 2px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel); color: var(--ink); cursor: pointer; text-align: left; }
+.sample-regions button.active { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 -3px 0 var(--accent); }
+.sample-regions small { color: var(--faint); font-size: 9px; letter-spacing: .06em; }
+.event-strip { display: flex; gap: 7px; overflow-x: auto; }
+.event-strip button { min-width: 145px; display: flex; flex-direction: column; gap: 2px; padding: 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel-2); color: var(--ink); cursor: pointer; text-align: left; }
+.event-strip small { color: var(--faint); font-size: 9px; }
+.timeline-toolbar, .selection-inspector { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.timeline-toolbar label { display: flex; align-items: center; gap: 4px; text-transform: capitalize; }
+.master-ruler { position: relative; height: 44px; margin: 15px 0 10px; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 7px; background: repeating-linear-gradient(90deg, var(--panel-2), var(--panel-2) calc(10% - 1px), var(--border) 10%); cursor: crosshair; touch-action: none; }
+.selection-band { position: absolute; top: 0; bottom: 0; background: rgba(59, 91, 219, .18); border: 1px solid rgba(59, 91, 219, .5); }
+.playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ink); }
+.selection-inspector span { padding: 5px 8px; border-radius: 6px; background: var(--panel-2); color: var(--muted); font-size: 11px; }
+.clip-composition-row { display: grid; grid-template-columns: auto minmax(160px, 1fr) minmax(130px, .8fr) minmax(120px, 1fr) repeat(4, auto); gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--border); border-left-width: 4px; border-radius: var(--radius-sm); }
+.clip-composition-row label { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 11px; }
+.clip-composition-row input[type=number] { min-width: 80px; }
+
 /* ---- responsive ---- */
 @media (max-width: 1080px) {
   .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cols-3, .cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .experiment-toolbar { grid-template-columns: 1fr 1fr; }
   .result-context { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .context-bar, .configuration-state, .preflight-grid, .alignment-grid, .rc-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .clip-composition-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 900px) {
   .app { flex-direction: column; }
@@ -573,4 +624,6 @@ pre.raw {
   .page { padding: 16px; }
   .topbar { padding: 12px 16px; }
   .experiment-toolbar, .configuration-summary, .config-values, .result-context { grid-template-columns: 1fr; }
+  .context-bar { margin: 0 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .configuration-state, .preflight-grid, .alignment-grid, .rc-summary-grid, .clip-composition-row { grid-template-columns: 1fr; }
 }

@@ -33,7 +33,24 @@ CREATE TABLE IF NOT EXISTS oai_templates (
     config_json TEXT NOT NULL,
     created_utc TEXT NOT NULL,
     updated_utc TEXT,
-    archived_utc TEXT
+    archived_utc TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    supersedes_id INTEGER
+);
+
+-- The gNB is shared by every Experiment, so "currently applied" is a
+-- platform fact rather than a property inferred from whichever page is open.
+CREATE TABLE IF NOT EXISTS configuration_apply_state (
+    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+    experiment_id TEXT,
+    configuration_id INTEGER,
+    configuration_version INTEGER,
+    configuration_name TEXT,
+    requested_config_json TEXT,
+    actual_config_json TEXT,
+    diff_json TEXT,
+    status TEXT,
+    verified_utc_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS experiment_acks (
@@ -68,8 +85,29 @@ CREATE TABLE IF NOT EXISTS clips (
     end_ms REAL,
     label TEXT,
     created_utc TEXT,
-    output_path TEXT
+    output_path TEXT,
+    updated_utc TEXT,
+    configuration_snapshot_json TEXT,
+    execution_mode TEXT,
+    time_origin_type TEXT,
+    time_origin_utc_ms INTEGER,
+    quality_status TEXT,
+    alignment_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS clip_segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    clip_id INTEGER NOT NULL,
+    source_run_id TEXT NOT NULL,
+    source_start_utc_ms INTEGER NOT NULL,
+    source_end_utc_ms INTEGER NOT NULL,
+    source_start_relative_ms REAL NOT NULL,
+    source_end_relative_ms REAL NOT NULL,
+    segment_order INTEGER NOT NULL,
+    label TEXT,
+    FOREIGN KEY(clip_id) REFERENCES clips(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_clip_segments_clip ON clip_segments(clip_id, segment_order);
 
 CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
@@ -105,7 +143,12 @@ CREATE TABLE IF NOT EXISTS runs (
     planned_order INTEGER, actual_order INTEGER, random_seed INTEGER,
     planned_start_utc_ms INTEGER, start_delay_s REAL,
     requested_config_json TEXT, actual_config_json TEXT,
-    configuration_id INTEGER, configuration_name TEXT,
+    configuration_id INTEGER, configuration_version INTEGER, configuration_name TEXT,
+    configuration_snapshot_json TEXT,
+    applied_configuration_id INTEGER, applied_config_snapshot_json TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'REAL_HARDWARE', simulation INTEGER NOT NULL DEFAULT 0,
+    time_origin_type TEXT, time_origin_utc_ms INTEGER,
+    alignment_json TEXT,
     started_utc_ms INTEGER, ended_utc_ms INTEGER,
     quality_status TEXT, quality_flags_json TEXT,
     FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id),
@@ -134,6 +177,9 @@ CREATE TABLE IF NOT EXISTS oai_snapshots (
     cqi INTEGER, ri INTEGER, pmi INTEGER, ul_ri INTEGER, tpmi INTEGER,
     ul_bler REAL, dl_bler REAL,
     harq_initial_tx_delta REAL, harq_retransmission_delta REAL, harq_retransmission_ratio REAL,
+    ul_harq_initial_tx_delta REAL, ul_harq_retransmission_delta REAL, ul_harq_retransmission_ratio REAL,
+    dl_harq_initial_tx_delta REAL, dl_harq_retransmission_delta REAL, dl_harq_retransmission_ratio REAL,
+    ul_harq_errors INTEGER, dl_harq_errors INTEGER,
     dtx INTEGER, ul_goodput_mbps REAL, dl_goodput_mbps REAL,
     collection_stale INTEGER, raw_json_path TEXT
 );
@@ -219,15 +265,23 @@ CREATE TABLE IF NOT EXISTS rc_samples (
     rssp_db REAL, target_rssp_db REAL, rssp_error_db REAL,
     noise_floor_db REAL, noise_margin_db REAL,
     tap_count INTEGER, tap_count_filtered INTEGER,
+    raw_delay_bin_count INTEGER, candidate_peak_count INTEGER,
+    effective_peak_count INTEGER, resolved_path_count INTEGER,
     rms_delay_ns REAL, rms_delay_ns_filtered REAL,
     mean_delay_ns REAL, k_factor_db REAL,
     peak_db REAL, peak_db_filtered REAL,
     started_utc_ms INTEGER, ended_utc_ms INTEGER,
     servo_iters INTEGER, servo_log TEXT,
     gnb_summary TEXT, raw_json_path TEXT,
+    analytics_json TEXT,
+    processing_status TEXT, processing_error TEXT,
+    detection_threshold_db REAL,
+    noise_std_db REAL, noise_frame_count INTEGER,
+    processing_algorithm TEXT, processing_version TEXT, noise_method TEXT,
+    data_complete INTEGER, alignment_status TEXT,
     created_utc TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_rc_samples_exp ON rc_samples(experiment_id, sample_index);
+CREATE INDEX IF NOT EXISTS idx_rc_samples_exp ON rc_samples(experiment_id, run_id, sample_index);
 
 CREATE INDEX IF NOT EXISTS idx_phone_samples_run ON phone_samples(run_id);
 CREATE INDEX IF NOT EXISTS idx_oai_snapshots_run ON oai_snapshots(run_id, ts_epoch_ns);
@@ -255,8 +309,36 @@ class Database:
                 except Exception:
                     pass
             for table, columns in (
-                ("oai_templates", (("updated_utc", "TEXT"), ("archived_utc", "TEXT"))),
-                ("runs", (("configuration_id", "INTEGER"), ("configuration_name", "TEXT"))),
+                ("oai_templates", (("updated_utc", "TEXT"), ("archived_utc", "TEXT"),
+                                   ("version", "INTEGER NOT NULL DEFAULT 1"), ("supersedes_id", "INTEGER"))),
+                ("runs", (("configuration_id", "INTEGER"), ("configuration_version", "INTEGER"),
+                          ("configuration_name", "TEXT"), ("configuration_snapshot_json", "TEXT"),
+                          ("applied_configuration_id", "INTEGER"), ("applied_config_snapshot_json", "TEXT"),
+                          ("execution_mode", "TEXT NOT NULL DEFAULT 'REAL_HARDWARE'"),
+                          ("simulation", "INTEGER NOT NULL DEFAULT 0"),
+                          ("time_origin_type", "TEXT"), ("time_origin_utc_ms", "INTEGER"),
+                          ("alignment_json", "TEXT"))),
+                ("clips", (("updated_utc", "TEXT"), ("configuration_snapshot_json", "TEXT"),
+                           ("execution_mode", "TEXT"), ("time_origin_type", "TEXT"),
+                           ("time_origin_utc_ms", "INTEGER"), ("quality_status", "TEXT"),
+                           ("alignment_json", "TEXT"))),
+                ("oai_snapshots", (("ul_harq_initial_tx_delta", "REAL"),
+                                   ("ul_harq_retransmission_delta", "REAL"),
+                                   ("ul_harq_retransmission_ratio", "REAL"),
+                                   ("dl_harq_initial_tx_delta", "REAL"),
+                                   ("dl_harq_retransmission_delta", "REAL"),
+                                   ("dl_harq_retransmission_ratio", "REAL"),
+                                   ("ul_harq_errors", "INTEGER"), ("dl_harq_errors", "INTEGER"))),
+                ("rc_samples", (("analytics_json", "TEXT"), ("processing_status", "TEXT"),
+                                ("processing_error", "TEXT"), ("detection_threshold_db", "REAL"),
+                                ("noise_std_db", "REAL"), ("noise_frame_count", "INTEGER"),
+                                ("processing_algorithm", "TEXT"), ("processing_version", "TEXT"),
+                                ("noise_method", "TEXT"), ("data_complete", "INTEGER"),
+                                ("alignment_status", "TEXT"),
+                                ("raw_delay_bin_count", "INTEGER"),
+                                ("candidate_peak_count", "INTEGER"),
+                                ("effective_peak_count", "INTEGER"),
+                                ("resolved_path_count", "INTEGER"))),
             ):
                 for col, typ in columns:
                     try:

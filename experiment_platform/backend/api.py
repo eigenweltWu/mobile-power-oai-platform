@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Optional
@@ -256,7 +257,14 @@ def create_experiment(payload: dict = Body(...)):
         payload.get("purpose", ""), payload.get("flow", ""),
         json.dumps(payload.get("initial_oai_config"), ensure_ascii=False) if payload.get("initial_oai_config") else None)
     try:
-        config = payload.get("initial_oai_config") or templates.DEFAULT_OAI_CONFIGURATION
+        config = dict(payload.get("initial_oai_config") or templates.DEFAULT_OAI_CONFIGURATION)
+        if payload.get("environment", "AC") == "RC" and "rcChamber" not in config:
+            from .rc_flow import RcConfig
+            config["rcChamber"] = RcConfig().as_dict()
+            config["rcChamber"].pop("execution_mode", None)
+            config["executionMode"] = "REAL_HARDWARE"
+        else:
+            config.setdefault("executionMode", "REAL_HARDWARE")
         row = _flow().add_template(exp["experiment_id"], "Default", config)
         _flow().set_default_template(exp["experiment_id"], row["id"])
         exp = _db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (exp["experiment_id"],))
@@ -318,6 +326,11 @@ def get_run(run_id: str):
     run["condition"] = cond
     run["requested_config"] = json.loads(run["requested_config_json"]) if run.get("requested_config_json") else None
     run["actual_config"] = json.loads(run["actual_config_json"]) if run.get("actual_config_json") else None
+    run["configuration_snapshot"] = (json.loads(run["configuration_snapshot_json"])
+                                     if run.get("configuration_snapshot_json") else None)
+    run["applied_config_snapshot"] = (json.loads(run["applied_config_snapshot_json"])
+                                      if run.get("applied_config_snapshot_json") else None)
+    run["alignment"] = json.loads(run["alignment_json"]) if run.get("alignment_json") else None
     run["quality_flags"] = json.loads(run["quality_flags_json"]) if run.get("quality_flags_json") else []
     err_rows = _db.query(
         "SELECT note FROM run_transitions WHERE run_id=? AND to_state='FAILED' ORDER BY utc_ms DESC LIMIT 1",
@@ -333,7 +346,10 @@ def get_run(run_id: str):
 
 
 @app.delete("/api/runs/{run_id}")
-def delete_run(run_id: str):
+def delete_run(run_id: str, cascade_clips: bool = False):
+    clips = _db.query_one("SELECT COUNT(*) n FROM clips WHERE run_id=?", (run_id,))["n"]
+    if clips and not cascade_clips:
+        raise HTTPException(409, f"This Run has {clips} saved Clip(s); confirm cascade_clips=true")
     for t in ("phone_samples", "oai_snapshots", "oai_events", "oai_channel", "oai_config",
               "sync_anchors", "run_transitions", "clips", "rc_samples"):
         _db.execute(f"DELETE FROM {t} WHERE run_id=?", (run_id,))
@@ -471,6 +487,28 @@ def export_experiment_zip(experiment_id: str):
     return FileResponse(p, media_type="application/zip", filename=p.name)
 
 
+@app.get("/api/experiments/{experiment_id}/export-preview")
+def export_experiment_preview(experiment_id: str):
+    experiment = _db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (experiment_id,))
+    if not experiment:
+        raise HTTPException(404, "Experiment not found")
+    runs = _db.query("SELECT * FROM runs WHERE experiment_id=?", (experiment_id,))
+    run_ids = [row["run_id"] for row in runs]
+    counts = {table: sum(_db.query_one(f"SELECT COUNT(*) n FROM {table} WHERE run_id=?", (run_id,))["n"]
+                         for run_id in run_ids)
+              for table in ("phone_samples", "oai_snapshots", "oai_channel", "rc_samples", "clips")}
+    files = _db.query("SELECT file_path,size_bytes FROM files")
+    relevant = [row for row in files if experiment_id in row["file_path"]]
+    starts = [row.get("started_utc_ms") for row in runs if row.get("started_utc_ms")]
+    ends = [row.get("ended_utc_ms") for row in runs if row.get("ended_utc_ms")]
+    return {"experiment_id": experiment_id, "runs": len(runs), "record_counts": counts,
+            "time_span": {"start_utc_ms": min(starts) if starts else None,
+                          "end_utc_ms": max(ends) if ends else None},
+            "files": relevant[:200], "estimated_size_bytes": sum(row.get("size_bytes") or 0 for row in relevant),
+            "contents": ["manifest.json", "configurations.csv", "runs.csv", "rc_samples.csv",
+                         "clips.csv", "clip_segments.csv", "raw/", "processed/"]}
+
+
 # --------------------------------------------------------------------------- #
 # Task flow: templates / push / start / stop / collect / timeline / clip
 # --------------------------------------------------------------------------- #
@@ -581,10 +619,71 @@ def apply_template(experiment_id: str, template_id: int, payload: dict = Body(de
         raise HTTPException(502, f"OAI apply_condition failed: {e}")
 
 
+def _configuration_readiness(config: dict) -> list[str]:
+    missing = [key for key in ("frequencyMHz", "bandwidthMHz", "txGainDb", "rxGainDb",
+                                "puschTargetMode", "schedulerMode", "ulTrafficMbps")
+               if config.get(key) is None]
+    return missing
+
+
+@app.get("/api/run-control/preflight")
+def run_control_preflight(experiment_id: str, configuration_id: int):
+    experiment = _db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (experiment_id,))
+    row = _db.query_one(
+        "SELECT * FROM oai_templates WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
+        (configuration_id, experiment_id))
+    if not experiment or not row:
+        raise HTTPException(404, "Experiment or Configuration not found")
+    config = json.loads(row["config_json"])
+    platform = platform_status()
+    applied = _db.query_one("SELECT * FROM configuration_apply_state WHERE singleton_id=1")
+    if applied:
+        for key in ("requested_config_json", "actual_config_json", "diff_json"):
+            applied[key.removesuffix("_json")] = json.loads(applied[key]) if applied.get(key) else None
+    missing = _configuration_readiness(config)
+    free_bytes = shutil.disk_usage(_settings.data_dir).free
+    checks = [
+        {"group": "Experiment", "key": "experiment", "ok": True,
+         "label": "Experiment selected", "action": None},
+        {"group": "Configuration", "key": "configuration", "ok": not missing,
+         "label": "Configuration complete" if not missing else f"Missing: {', '.join(missing)}",
+         "action": f"Open Experiment → Configurations"},
+        {"group": "gNB", "key": "oai", "ok": bool(platform["oai"]["healthy"]),
+         "label": "OAI control endpoint reachable", "action": "Open Advanced → Diagnostics"},
+        {"group": "Phone", "key": "phone", "ok": platform["phone"]["state"].upper() == "CONNECTED",
+         "label": "Phone Agent ready", "action": "Open Data Import / Phone diagnostics"},
+        {"group": "Storage", "key": "storage", "ok": free_bytes >= 100 * 1024 * 1024,
+         "label": "Storage available", "action": "Free at least 100 MB"},
+    ]
+    mode = _tf.execution_mode(config)
+    if experiment.get("environment") == "RC":
+        chamber = config.get("rcChamber") or {}
+        hardware_ok = mode == "SIMULATION"
+        hardware_reason = "Simulation mode confirmed"
+        if mode == "REAL_HARDWARE":
+            state = _stirrer(False).status()
+            hardware_ok = bool(state.get("dll_found") and state.get("exe_ready"))
+            hardware_reason = "Stirrer hardware available"
+        checks.append({"group": "RC Chamber", "key": "stirrer", "ok": hardware_ok,
+                       "label": hardware_reason, "action": "Open Advanced → RC Hardware"})
+    issues = [check for check in checks if not check["ok"]]
+    return {"ready": not issues, "checks": checks, "issues": issues,
+            "experiment": {"experiment_id": experiment_id, "environment": experiment["environment"]},
+            "selected": {"id": row["id"], "version": row.get("version") or 1,
+                         "name": row["name"], "config": config},
+            "applied": applied, "execution_mode": mode}
+
+
 @app.post("/api/experiments/{experiment_id}/start")
 def start_experiment(experiment_id: str, payload: dict = Body(...)):
     try:
-        return _flow().start_experiment(
+        configuration_id = payload.get("template_id")
+        if configuration_id is None:
+            raise ValueError("Configuration is required")
+        preflight = run_control_preflight(experiment_id, int(configuration_id))
+        if not preflight["ready"]:
+            raise HTTPException(409, {"message": "Run cannot start", "issues": preflight["issues"]})
+        result = _flow().start_experiment(
             experiment_id,
             payload.get("serial", ""),
             int(payload.get("pc_port", 8420)),
@@ -592,6 +691,23 @@ def start_experiment(experiment_id: str, payload: dict = Body(...)):
             idle_seconds=payload.get("idle_seconds"),
             template_id=payload.get("template_id"),
         )
+        if preflight["experiment"]["environment"] == "RC":
+            chamber = dict((preflight["selected"]["config"].get("rcChamber") or {}))
+            chamber["execution_mode"] = preflight["execution_mode"]
+            try:
+                _runner().start(_flow(), experiment_id, payload.get("serial", "53616213"),
+                                int(payload.get("pc_port", 8420)), chamber)
+            except Exception:
+                # An RC Run is one atomic execution. If chamber startup fails,
+                # tear down the just-created Run instead of leaving a phantom
+                # active Run that blocks all subsequent Preflight checks.
+                _flow().stop_experiment(experiment_id, payload.get("serial", "53616213"),
+                                        int(payload.get("pc_port", 8420)))
+                raise
+            result["rc_campaign_started"] = True
+        return result
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
 
@@ -599,6 +715,9 @@ def start_experiment(experiment_id: str, payload: dict = Body(...)):
 @app.post("/api/experiments/{experiment_id}/stop")
 def stop_experiment(experiment_id: str, payload: dict = Body(default={})):
     try:
+        campaign = _runner().status(experiment_id)
+        if campaign.get("running"):
+            _runner().stop(experiment_id)
         return _flow().stop_experiment(
             experiment_id,
             payload.get("serial", "53616213"),
@@ -616,8 +735,9 @@ def collect_experiment(experiment_id: str, payload: dict = Body(...)):
 
 
 @app.get("/api/experiments/{experiment_id}/timeline")
-def experiment_timeline(experiment_id: str, run_id: Optional[str] = None):
-    return _flow().timeline(experiment_id, run_id)
+def experiment_timeline(experiment_id: str, run_id: Optional[str] = None,
+                        include_channel: bool = False):
+    return _flow().timeline(experiment_id, run_id, include_channel)
 
 
 @app.post("/api/experiments/{experiment_id}/clip")
@@ -625,10 +745,45 @@ def clip_experiment(experiment_id: str, payload: dict = Body(...)):
     """Fused clip on the sync-zeroed axis: start_ms/end_ms are RELATIVE to the
     first pre-run clock sync (t=0); saves a fused CSV copy (phone+gNB+channel)."""
     try:
+        if payload.get("segments") is not None:
+            return _flow().save_clip(experiment_id, payload["run_id"], payload.get("name") or
+                                     payload.get("label") or "Clip", payload["segments"])
         return _flow().clip(experiment_id, payload.get("run_id"), float(payload["start_ms"]),
                             float(payload["end_ms"]), payload.get("label", ""))
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+
+@app.get("/api/clips/{clip_id}")
+def get_clip(clip_id: int):
+    row = _db.query_one("SELECT * FROM clips WHERE id=?", (clip_id,))
+    if not row:
+        raise HTTPException(404, "Clip not found")
+    row["segments"] = _db.query(
+        "SELECT * FROM clip_segments WHERE clip_id=? ORDER BY segment_order", (clip_id,))
+    return row
+
+
+@app.put("/api/clips/{clip_id}")
+def update_clip(clip_id: int, payload: dict = Body(...)):
+    row = _db.query_one("SELECT * FROM clips WHERE id=?", (clip_id,))
+    if not row:
+        raise HTTPException(404, "Clip not found")
+    try:
+        return _flow().save_clip(row["experiment_id"], row["run_id"],
+                                 payload.get("name") or payload.get("label") or row["label"],
+                                 payload["segments"], clip_id=clip_id)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.delete("/api/clips/{clip_id}")
+def delete_clip(clip_id: int):
+    if not _db.query_one("SELECT id FROM clips WHERE id=?", (clip_id,)):
+        raise HTTPException(404, "Clip not found")
+    _db.execute("DELETE FROM clip_segments WHERE clip_id=?", (clip_id,))
+    _db.execute("DELETE FROM clips WHERE id=?", (clip_id,))
+    return {"ok": True}
 
 
 @app.get("/api/clips/{clip_id}/download")
@@ -748,16 +903,9 @@ def rc_campaign_status(experiment_id: str):
 
 
 @app.get("/api/rc/samples")
-def rc_samples(experiment_id: str):
-    rows = _runner().samples(experiment_id)
-    for r in rows:
-        for col in ("servo_log", "gnb_summary"):
-            if r.get(col):
-                try:
-                    r[col] = json.loads(r[col])
-                except Exception:
-                    pass
-    return {"ok": True, "experiment_id": experiment_id, "samples": rows}
+def rc_samples(experiment_id: Optional[str] = None, run_id: Optional[str] = None):
+    rows = _runner().samples(experiment_id=experiment_id, run_id=run_id)
+    return {"ok": True, "experiment_id": experiment_id, "run_id": run_id, "samples": rows}
 
 
 # --------------------------------------------------------------------------- #

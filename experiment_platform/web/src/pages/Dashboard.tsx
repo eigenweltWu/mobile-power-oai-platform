@@ -1,546 +1,123 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import type { Experiment, PlatformStatus } from '../types';
 import { Badge, Card, ErrorBox, Spinner, StatCard, toast } from '../components/ui';
 import { fmtBytes } from '../format';
+import { useOperatorContext } from '../context';
 
-const DEFAULT_COLLECTION_SECONDS = 120;
+type Configuration = { id: number; name: string; config_json: string; is_default?: number; version?: number };
+type Check = { group: string; key: string; ok: boolean; label: string; action?: string | null };
+type Applied = { configuration_id: number; configuration_name: string; configuration_version: number; status: string; actual_config?: Record<string, unknown>; diff?: Record<string, { requested: unknown; actual: unknown }> };
+type Preflight = { ready: boolean; checks: Check[]; issues: Check[]; execution_mode: string; selected: { id: number; name: string; version: number; config: Record<string, any> }; applied: Applied | null };
+type Campaign = { running: boolean; state: string; samples_done?: number; n_steps?: number; current_angle_deg?: number | null; last_rssp_db?: number | null; log?: { ms: number; stage: string; msg: string }[] };
 
-/* ------------------------------------------------------------------ */
-/* OAI radio detail (extracted, never raw JSON dumps)                 */
-/* ------------------------------------------------------------------ */
+const RUNNING = ['PREPARING', 'ARMED', 'RUNNING', 'STOPPING'];
+const parse = (json: string) => { try { return JSON.parse(json) as Record<string, any>; } catch { return {}; } };
 
-interface OaiDetail {
-  radio: Record<string, unknown> | null;      // /api/oai/status → radio
-  gnbRunning: boolean | null;
-  ueCount: number;
-  ulScheduler: Record<string, unknown> | null; // /api/oai/controls → ulScheduler
-  puschTarget: Record<string, unknown> | null; // /api/oai/controls → puschTarget
-}
-
-function fmtNum(v: unknown, unit = '', digits = 1): string {
-  if (v === null || v === undefined || v === '') return '—';
-  const n = Number(v);
-  if (!Number.isFinite(n)) return String(v);
-  if (Number.isInteger(n)) return `${n}${unit}`;
-  return `${n.toFixed(digits)}${unit}`;
-}
-
-/** Parse a config JSON string; never throws. */
-function parseConfig(json: string | null | undefined): Record<string, unknown> | null {
-  if (!json) return null;
-  try { return JSON.parse(json) as Record<string, unknown>; } catch { return null; }
-}
-
-/** Compact key/value rendering of an OAI config (known keys first, rest after). */
-const CONFIG_KEY_ORDER = [
-  'frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb',
-  'puschTargetMode', 'puschTargetSnrX10', 'schedulerMode', 'mcs', 'qm', 'nPrb',
-];
-
-function ConfigFields({ cfg }: { cfg: Record<string, unknown> | null }) {
-  if (!cfg) return <div style={{ fontSize: 12, color: 'var(--muted)' }}>（无配置字段）</div>;
-  const keys = [
-    ...CONFIG_KEY_ORDER.filter((k) => cfg[k] !== undefined && cfg[k] !== null),
-    ...Object.keys(cfg).filter((k) => !CONFIG_KEY_ORDER.includes(k) && cfg[k] !== null && cfg[k] !== undefined),
-  ];
-  if (!keys.length) return <div style={{ fontSize: 12, color: 'var(--muted)' }}>（无配置字段）</div>;
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '2px 10px', fontSize: 12 }}>
-      {keys.map((k) => (
-        <Fragment key={k}>
-          <span style={{ color: 'var(--muted)' }}>{k}</span>
-          <span style={{ fontFamily: 'var(--mono)' }}>{String(cfg[k])}</span>
-        </Fragment>
-      ))}
-    </div>
-  );
-}
-
-/** 关键可调参数（apply_condition 支持的 keys）分三组展示。 */
-function OaiParamsCard({ detail, onRefresh }: { detail: OaiDetail; onRefresh: () => void }) {
-  const r = detail.radio ?? {};
-  const ul = detail.ulScheduler ?? {};
-  const pt = detail.puschTarget ?? {};
-  const row = (label: string, value: string, tag?: string) => (
-    <Fragment key={label}>
-      <dt>{label}</dt>
-      <dd>
-        {value}
-        {tag ? <span className="badge muted" style={{ marginLeft: 8 }}>{tag}</span> : null}
-      </dd>
-    </Fragment>
-  );
-  return (
-    <Card
-      title="OAI Radio 设置"
-      sub={`当前 gNB 生效配置 · UE 数 ${detail.ueCount}`}
-      right={<button className="btn" onClick={onRefresh}>刷新</button>}
-    >
-      <div className="grid cols-3" style={{ rowGap: 24 }}>
-        <div>
-          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8, color: 'var(--muted)' }}>射频（可调）</div>
-          <div className="kv">
-            {row('frequencyMHz', fmtNum(r.frequencyMHz, ' MHz'))}
-            {row('bandwidthMHz', fmtNum(r.bandwidthMHz, ' MHz'))}
-            {row('txGainDb', fmtNum(r.txGainDb, ' dB'))}
-            {row('rxGainDb', fmtNum(r.rxGainDb, ' dB'))}
-          </div>
-        </div>
-        <div>
-          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8, color: 'var(--muted)' }}>PUSCH 功控（可调）</div>
-          <div className="kv">
-            {row('puschTargetMode', String(pt.mode ?? '—'))}
-            {row('puschTargetSnrX10', fmtNum(pt.targetSnrX10, '', 0))}
-            {row('targetSnrDb', fmtNum(pt.targetSnrDb, ' dB'))}
-          </div>
-          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8, marginTop: 16, color: 'var(--muted)' }}>UL 调度器（可调）</div>
-          <div className="kv">
-            {row('schedulerMode', String(ul.mode ?? '—'))}
-            {row('mcs', fmtNum(ul.mcs, '', 0))}
-            {row('qm', fmtNum(ul.qm, '', 0))}
-            {row('nPrb', fmtNum(ul.nPrb, '', 0))}
-          </div>
-        </div>
-        <div>
-          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8, color: 'var(--muted)' }}>载波信息（只读）</div>
-          <div className="kv">
-            {row('band', fmtNum(r.band, '', 0))}
-            {row('arfcn', fmtNum(r.arfcn, '', 0))}
-            {row('carrierPrb', fmtNum(r.carrierPrb, ' PRB', 0))}
-            {row('subcarrierSpacingKhz', fmtNum(r.subcarrierSpacingKhz, ' kHz', 0))}
-            {row('supportedBandwidthMHz', Array.isArray(r.supportedBandwidthMHz) ? (r.supportedBandwidthMHz as number[]).join(' / ') + ' MHz' : '—')}
-          </div>
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Throughput · rolling 1-minute chart (hand-rolled SVG, no deps)      */
-/* ------------------------------------------------------------------ */
-
-interface ThpPoint { t: number; dl: number; ul: number }
-
-function ThpChart({ history }: { history: ThpPoint[] }) {
-  const W = 640, H = 180, PAD_L = 44, PAD_B = 20, PAD_T = 10, PAD_R = 10;
-  const now = history[history.length - 1].t;
-  const t0 = now - 60_000;
-  const maxV = Math.max(1, ...history.map((p) => Math.max(p.dl, p.ul)));
-  const yMax = Math.ceil(maxV * 1.15);
-  const x = (t: number) => PAD_L + ((t - t0) / 60_000) * (W - PAD_L - PAD_R);
-  const y = (v: number) => PAD_T + (1 - v / yMax) * (H - PAD_T - PAD_B);
-  const path = (key: 'dl' | 'ul') => history.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.t).toFixed(1)},${y(p[key]).toFixed(1)}`).join(' ');
-  const yTicks = [0, yMax / 2, yMax];
-  return (
-    <div>
-      <div className="row" style={{ gap: 16, fontSize: 12, marginBottom: 6 }}>
-        <span className="row" style={{ gap: 6 }}><span style={{ width: 10, height: 3, background: 'var(--accent)' }} />DL Mbps</span>
-        <span className="row" style={{ gap: 6 }}><span style={{ width: 10, height: 3, background: '#2e9e5b' }} />UL Mbps</span>
-      </div>
-      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: 'auto', display: 'block' }} role="img">
-        {yTicks.map((v) => (
-          <g key={v}>
-            <line x1={PAD_L} x2={W - PAD_R} y1={y(v)} y2={y(v)} stroke="var(--border)" strokeWidth={1} />
-            <text x={PAD_L - 6} y={y(v) + 4} textAnchor="end" fontSize={10} fill="var(--muted)">{v.toFixed(0)}</text>
-          </g>
-        ))}
-        {[0, 15, 30, 45, 60].map((s) => (
-          <text key={s} x={x(now - s * 1000)} y={H - 6} textAnchor="middle" fontSize={10} fill="var(--muted)">-{s}s</text>
-        ))}
-        <path d={path('dl')} fill="none" stroke="var(--accent)" strokeWidth={2} />
-        <path d={path('ul')} fill="none" stroke="#2e9e5b" strokeWidth={2} />
-      </svg>
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Dashboard                                                          */
-/* ------------------------------------------------------------------ */
-
-export default function Dashboard() {
+export default function Dashboard({ nav }: { nav: (path: string) => void }) {
+  const { value: context, update: updateContext } = useOperatorContext();
   const [status, setStatus] = useState<PlatformStatus | null>(null);
-  const [error, setError] = useState<Error | null>(null);
-  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
-
   const [experiments, setExperiments] = useState<Experiment[]>([]);
-  const [selectedExperimentId, setSelectedExperimentId] = useState<string>('');
-  const [collectionSeconds, setCollectionSeconds] = useState<number>(DEFAULT_COLLECTION_SECONDS);
+  const [experimentId, setExperimentId] = useState(context.experimentId);
+  const [configurations, setConfigurations] = useState<Configuration[]>([]);
+  const [configurationId, setConfigurationId] = useState<number | null>(context.configurationId);
+  const [preflight, setPreflight] = useState<Preflight | null>(null);
+  const [campaign, setCampaign] = useState<Campaign | null>(null);
+  const [busy, setBusy] = useState<'apply' | 'start' | 'stop' | ''>('');
+  const [error, setError] = useState<Error | null>(null);
 
-  const [templates, setTemplates] = useState<Array<{ id: number; name: string; config_json: string; created_utc: string }>>([]);
-  const [selectedTemplate, setSelectedTemplate] = useState<string>('');
+  const experiment = experiments.find((row) => row.experiment_id === experimentId);
+  const configuration = configurations.find((row) => row.id === configurationId);
+  const latestRun = status?.experiment.latest_run;
+  const running = !!latestRun && RUNNING.includes(latestRun.state);
 
-  const [oai, setOai] = useState<OaiDetail>({ radio: null, gnbRunning: null, ueCount: 0, ulScheduler: null, puschTarget: null });
-
-  const [starting, setStarting] = useState(false);
-  const [stopping, setStopping] = useState(false);
-  const [applying, setApplying] = useState(false);
-
-  /** Rolling 1-minute throughput samples (pushed on every status poll). */
-  const [thpHistory, setThpHistory] = useState<Array<{ t: number; dl: number; ul: number }>>([]);
-
-  /* ---- loading ---- */
-  const loadStatus = useCallback(() => {
-    api.get<PlatformStatus>('/api/platform/status')
-      .then((s) => {
-        setStatus(s); setError(null); setLastUpdated(Date.now());
-        const tp = s.oai?.throughput;
-        if (tp) {
-          const now = Date.now();
-          setThpHistory((prev) => [...prev, { t: now, dl: tp.dlMbps, ul: tp.ulMbps }]
-            .filter((p) => now - p.t <= 60_000));
-        }
-      })
-      .catch((e) => { setError(e instanceof Error ? e : new Error(String(e))); });
+  const load = useCallback(async () => {
+    try {
+      const [platform, list] = await Promise.all([api.get<PlatformStatus>('/api/platform/status'), api.get<Experiment[]>('/api/experiments')]);
+      setStatus(platform); setExperiments(list); setError(null);
+      setExperimentId((old) => old && list.some((row) => row.experiment_id === old) ? old : (list[0]?.experiment_id || ''));
+    } catch (cause) { setError(cause instanceof Error ? cause : new Error(String(cause))); }
   }, []);
-
-  const loadExperiments = useCallback(() => {
-    api.get<Experiment[]>('/api/experiments')
-      .then((list) => {
-        setExperiments(list);
-        setSelectedExperimentId((prev) => (prev && list.some((e) => e.experiment_id === prev)) ? prev : (list[0]?.experiment_id ?? ''));
-      })
-      .catch(() => {});
-  }, []);
-
-  const loadOai = useCallback(() => {
-    Promise.allSettled([
-      api.get<Record<string, unknown>>('/api/oai/status'),
-      api.get<Record<string, unknown>>('/api/oai/controls'),
-    ]).then(([s, c]) => {
-      const st = s.status === 'fulfilled' ? s.value : null;
-      const ct = c.status === 'fulfilled' ? c.value : null;
-      const ues = (st?.ues ?? []) as unknown[];
-      setOai({
-        radio: (st?.radio ?? null) as Record<string, unknown> | null,
-        gnbRunning: st ? Boolean((st.gnb as Record<string, unknown> | undefined)?.running) : null,
-        ueCount: Array.isArray(ues) ? ues.length : 0,
-        ulScheduler: (ct?.ulScheduler ?? null) as Record<string, unknown> | null,
-        puschTarget: (ct?.puschTarget ?? null) as Record<string, unknown> | null,
-      });
-    });
-  }, []);
+  useEffect(() => { load(); const timer = window.setInterval(load, 3000); return () => window.clearInterval(timer); }, [load]);
 
   useEffect(() => {
-    loadStatus();
-    loadExperiments();
-    loadOai();
-    const t = setInterval(loadStatus, 3000);
-    return () => clearInterval(t);
-  }, [loadStatus, loadExperiments, loadOai]);
+    if (!experimentId) return;
+    api.get<Configuration[]>(`/api/experiments/${encodeURIComponent(experimentId)}/templates`).then((rows) => {
+      setConfigurations(rows);
+      setConfigurationId((old) => rows.some((row) => row.id === old) ? old : (rows.find((row) => row.is_default)?.id ?? rows[0]?.id ?? null));
+    }).catch((cause) => setError(cause instanceof Error ? cause : new Error(String(cause))));
+  }, [experimentId]);
 
-  /* ---- templates: default-select the one matching the stored startup
-     config (initial_oai_config is itself one of the templates), else the
-     first template. There is no separate "initial config" pseudo-entry. ---- */
-  const selectedExperiment = useMemo(
-    () => experiments.find((e) => e.experiment_id === selectedExperimentId) ?? null,
-    [experiments, selectedExperimentId],
-  );
-
-  const initialConfig = useMemo(() => {
-    if (!selectedExperiment?.initial_oai_config) return null;
-    try { return JSON.parse(selectedExperiment.initial_oai_config) as Record<string, unknown>; } catch { return null; }
-  }, [selectedExperiment]);
+  const loadPreflight = useCallback(async () => {
+    if (!experimentId || configurationId == null) { setPreflight(null); return; }
+    try { setPreflight(await api.get(`/api/run-control/preflight?experiment_id=${encodeURIComponent(experimentId)}&configuration_id=${configurationId}`)); }
+    catch (cause) { setError(cause instanceof Error ? cause : new Error(String(cause))); }
+  }, [experimentId, configurationId]);
+  useEffect(() => { loadPreflight(); const timer = window.setInterval(loadPreflight, 4000); return () => window.clearInterval(timer); }, [loadPreflight]);
 
   useEffect(() => {
-    if (!selectedExperimentId) { setTemplates([]); return; }
-    api.get<Array<{ id: number; name: string; config_json: string; created_utc: string }>>(
-      `/api/experiments/${encodeURIComponent(selectedExperimentId)}/templates`,
-    ).then((list) => {
-      setTemplates(list);
-      setSelectedTemplate((prev) => {
-        if (prev && list.some((t) => String(t.id) === prev)) return prev;
-        if (initialConfig) {
-          const match = list.find((t) => {
-            try {
-              const cfg = JSON.parse(t.config_json || '{}') as Record<string, unknown>;
-              return JSON.stringify(cfg) === JSON.stringify(initialConfig);
-            } catch { return false; }
-          });
-          if (match) return String(match.id);
-        }
-        return list[0] ? String(list[0].id) : '';
-      });
-    }).catch(() => setTemplates([]));
-  }, [selectedExperimentId, initialConfig]);
+    if (experiment?.environment !== 'RC') { setCampaign(null); return; }
+    const poll = () => api.get<Campaign>(`/api/rc/campaign/status?experiment_id=${encodeURIComponent(experimentId)}`).then(setCampaign).catch(() => undefined);
+    poll(); const timer = window.setInterval(poll, 2000); return () => window.clearInterval(timer);
+  }, [experimentId, experiment?.environment]);
 
-  /* ---- actions ---- */
-  const startExperiment = async () => {
-    if (!selectedExperimentId) { toast('err', '请先选择实验'); return; }
-    setStarting(true);
+  useEffect(() => updateContext({ experimentId, environment: experiment?.environment || '', configurationId,
+    configurationName: configuration ? `${configuration.name} v${configuration.version ?? 1}` : '',
+    runId: latestRun?.experiment_id === experimentId ? latestRun.run_id : '',
+    status: latestRun?.experiment_id === experimentId ? latestRun.state : '',
+  }), [experimentId, experiment?.environment, configurationId, configuration, latestRun, updateContext]);
+
+  const apply = async () => {
+    if (configurationId == null) return;
+    setBusy('apply'); setError(null);
     try {
-      const r = await api.post<{ gnb_running?: boolean; ue_in_sync?: boolean; run_id?: string }>(
-        `/api/experiments/${encodeURIComponent(selectedExperimentId)}/start`,
-        {
-          collection_seconds: Number(collectionSeconds),
-          template_id: selectedTemplate === '' ? null : Number(selectedTemplate),
-        },
-      );
-      const tplName = templates.find((t) => String(t.id) === selectedTemplate)?.name;
-      const parts: string[] = ['下行探测已启动'];
-      if (tplName) parts.push(`模板「${tplName}」`);
-      if (r.gnb_running) parts.push('gNB 运行中');
-      if (r.ue_in_sync) parts.push('UE 同步');
-      toast('ok', `${parts.join('·')}·请手机点击「开始实验」`);
-      // Optimistic update: show the stop button immediately.
-      if (r.run_id) {
-        setStatus((prev) => (prev ? {
-          ...prev,
-          experiment: { latest_run: { run_id: r.run_id as string, experiment_id: selectedExperimentId, condition_id: '', state: 'PREPARING', last_error: null } },
-        } : prev));
-      }
-      setThpHistory([]);
-      loadStatus(); loadOai();
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    } finally { setStarting(false); }
+      const result = await api.post<any>(`/api/experiments/${encodeURIComponent(experimentId)}/templates/${configurationId}/apply`, { serial: status?.phone.serial || '' });
+      if (result.verification_status === 'VERIFIED') toast('ok', 'Configuration applied and verified.');
+      else setError(new Error(`Applied with differences: ${JSON.stringify(result.diff)}`));
+      await Promise.all([load(), loadPreflight()]);
+    } catch (cause) { setError(cause instanceof Error ? cause : new Error(String(cause))); }
+    finally { setBusy(''); }
+  };
+  const start = async () => {
+    if (!preflight?.ready || configurationId == null) return;
+    setBusy('start'); setError(null);
+    try {
+      const result = await api.post<any>(`/api/experiments/${encodeURIComponent(experimentId)}/start`, { template_id: configurationId, serial: status?.phone.serial || '' });
+      updateContext({ runId: result.run_id, status: 'PREPARING' });
+      toast('ok', result.rc_campaign_started ? 'Run started; RC is waiting for post-restart UE sync.' : 'gNB restarted; waiting for post-restart UE sync.');
+      await load();
+    } catch (cause) { setError(cause instanceof Error ? cause : new Error(String(cause))); }
+    finally { setBusy(''); }
+  };
+  const stop = async () => {
+    setBusy('stop'); setError(null); updateContext({ status: 'STOPPING' });
+    try { await api.post(`/api/experiments/${encodeURIComponent(latestRun?.experiment_id || experimentId)}/stop`, { serial: status?.phone.serial || '' }); toast('ok', 'Run stopped after backend confirmation.'); await load(); }
+    catch (cause) { setError(cause instanceof Error ? cause : new Error(String(cause))); }
+    finally { setBusy(''); }
   };
 
-  const stopExperiment = async () => {
-    const eid = status?.experiment.latest_run?.experiment_id ?? selectedExperimentId;
-    if (!eid) { toast('err', '没有可停止的实验'); return; }
-    setStopping(true);
-    try {
-      const r = await api.post<{ pc_stop_ms?: number; phone_stop_ms?: number; discarded?: boolean }>(
-        `/api/experiments/${encodeURIComponent(eid)}/stop`, {});
-      const parts: string[] = [];
-      if (r.pc_stop_ms) parts.push(`PC ${new Date(r.pc_stop_ms).toLocaleTimeString()}`);
-      if (r.phone_stop_ms) parts.push(`手机 ${new Date(r.phone_stop_ms).toLocaleTimeString()}`);
-      toast('ok', r.discarded ? '未完成对时，本次实验已舍弃' : (parts.length ? `已停止·${parts.join('，')}` : '已停止'));
-      // Optimistic update: flip to the start button immediately (the stop
-      // request itself may take seconds while the backend probes the phone).
-      setStatus((prev) => (prev && prev.experiment.latest_run
-        ? { ...prev, experiment: { latest_run: r.discarded ? null : { ...prev.experiment.latest_run, state: 'STOPPED' } } }
-        : prev));
-      setThpHistory([]);
-      loadStatus();
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    } finally { setStopping(false); }
-  };
+  const groups = useMemo(() => Object.entries((preflight?.checks || []).reduce((out, check) => ({ ...out, [check.group]: [...(out[check.group] || []), check] }), {} as Record<string, Check[]>)), [preflight]);
+  if (!status) return error ? <ErrorBox error={error} /> : <Spinner label="Loading Run Control…" />;
+  const requested = preflight?.selected.config || (configuration ? parse(configuration.config_json) : {});
+  const applied = preflight?.applied;
+  const selectedApplied = applied?.configuration_id === configurationId &&
+    applied.configuration_version === (configuration?.version ?? 1) &&
+    applied.status === 'VERIFIED';
 
-  const applyTemplate = async () => {
-    if (selectedTemplate === '') { toast('err', '请先选择 Template'); return; }
-    setApplying(true);
-    try {
-      const ph = (status?.phone ?? null) as Record<string, unknown> | null;
-      const r = await api.post(
-        `/api/experiments/${encodeURIComponent(selectedExperimentId)}/templates/${selectedTemplate}/apply`,
-        { serial: (ph?.serial as string) || '53616213', pc_port: (ph?.pc_port as number) || 8420 },
-      ) as unknown as Record<string, any>;
-      const res = (r?.result ?? {}) as Record<string, any>;
-      const sa = res.startedAt as { before?: string; after?: string } | undefined;
-      const ver = res.restart_verified === true
-        ? `gNB 已真重启（进程启动时间 ${sa?.before ?? '?'} → ${sa?.after ?? '?'}）`
-        : 'gNB 重启（未返回验证信息）';
-      toast('ok', `Template 已应用·${ver}·重新触发 idle→loaded→idle`);
-      loadOai(); loadStatus();
-    } catch (e) {
-      toast('err', e instanceof Error ? e.message : String(e));
-    } finally { setApplying(false); }
-  };
+  return <div className="stack">
+    <div className="page-head"><div><div className="title">Run Control</div><div className="subtitle">Select a Configuration, check external dependencies, then Start. Every Start applies it and force-restarts gNB.</div></div><button className="btn" onClick={() => { load(); loadPreflight(); }}>Refresh</button></div>
+    {error && <ErrorBox error={error} />}
+    <div className="stat-grid"><StatCard label="Phone" value={status.phone.state} sub={status.phone.device || 'Device unavailable'} tone={status.phone.state === 'CONNECTED' ? 'good' : 'bad'} /><StatCard label="gNB Current State" value={status.oai.gnb_running ? 'RUNNING' : 'STOPPED'} sub="Start always applies Selected and restarts gNB" tone={status.oai.gnb_running ? 'good' : 'muted'} /><StatCard label="UE Sync" value={status.oai.ue_in_sync ? 'CURRENTLY SYNCED' : 'WAITING'} sub="Established after Start and recorded as the Run time anchor" tone={status.oai.ue_in_sync ? 'good' : 'muted'} /><StatCard label="Storage" value={fmtBytes(status.storage.bytes)} sub={`${status.storage.n_files} indexed files`} tone="muted" /></div>
 
-  /* ---- render ---- */
-  if (!status && !error) return <Spinner label="loading platform status…" />;
-  if (error && !status) return <ErrorBox error={error} />;
-  if (!status) return null;
+    <Card title="Run Context" sub="A fresh Run ID and standard timing values are generated automatically on every Start."><div className="grid cols-2"><label className="field"><span>Experiment</span><select value={experimentId} disabled={running} onChange={(event) => setExperimentId(event.target.value)}>{experiments.map((row) => <option key={row.experiment_id} value={row.experiment_id}>{row.experiment_id} · {row.environment}</option>)}</select></label><label className="field"><span>Selected for next Run</span><select value={configurationId ?? ''} disabled={running} onChange={(event) => setConfigurationId(Number(event.target.value))}>{configurations.map((row) => <option key={row.id} value={row.id}>{row.name} v{row.version ?? 1}{row.is_default ? ' · Default' : ''}</option>)}</select></label></div></Card>
 
-  const phone = status.phone;
-  const phoneConnected = phone.state?.toUpperCase() === 'CONNECTED';
-  const phoneAttached = phone.usb_attached === true;
-  const latestRun = status.experiment.latest_run ?? null;
-  const storage = status.storage ?? { n_files: 0, bytes: 0 };
-  const phonePhase = ((phone.status ?? null) as Record<string, unknown> | null)?.phase;
+    <Card title="Configuration State" sub="Applied is informational. Start always reapplies Selected and force-restarts gNB." right={<button className="btn" disabled={busy !== '' || running || configurationId == null} onClick={apply}>{busy === 'apply' ? 'Applying & verifying…' : 'Apply without starting'}</button>}><div className="configuration-state"><div><span>Default</span><b>{configurations.find((row) => row.is_default)?.name || '—'}</b></div><div><span>Selected</span><b>{configuration?.name || '—'} v{configuration?.version ?? '—'}</b><Badge tone="accent">SELECTED FOR NEXT RUN</Badge></div><div><span>Currently Applied</span><b>{applied ? `${applied.configuration_name} v${applied.configuration_version}` : 'Unknown'}</b><Badge tone={selectedApplied ? 'good' : 'muted'}>{selectedApplied ? 'CURRENT MATCH' : 'WILL APPLY ON START'}</Badge></div><div><span>Active Run Snapshot</span><b>{running ? context.configurationName : '—'}</b></div></div>{applied?.diff && Object.keys(applied.diff).length > 0 && <div className="diff-list"><h3>Requested vs Applied</h3>{Object.entries(applied.diff).map(([key, values]) => <div key={key}><span>{key}</span><code>Requested {String(values.requested)}</code><code>Applied {String(values.actual)}</code><Badge tone="warn">DIFFERENT</Badge></div>)}</div>}</Card>
 
-  const runningStates = ['PREPARING', 'ARMED', 'RUNNING'];
-  const isRunning = !!latestRun && runningStates.includes(latestRun.state);
-  const selectedTemplateName = templates.find((t) => String(t.id) === selectedTemplate)?.name;
-  // Template switch is only allowed in the idle phase (or with no run in
-  // flight). The backend re-checks this — here we just disable the button
-  // early so the operator gets immediate feedback.
-  const switchBlocked = isRunning && phonePhase !== 'IDLE';
+    <Card title="Preflight Checklist" sub={preflight?.ready ? 'Ready to Start · gNB restart and UE synchronization happen after Start' : `${preflight?.issues.length || 0} external dependency issue(s) need attention`}><div className="preflight-grid">{groups.map(([group, checks]) => <section key={group}><h3>{group}</h3>{checks.map((check) => <div className={`preflight-row ${check.ok ? 'ok' : 'bad'}`} key={check.key}><span>{check.ok ? '✓' : '!'}</span><div><b>{check.label}</b>{!check.ok && check.action && <button className="link-btn" onClick={() => check.action?.includes('Experiment') ? nav(`/experiments/${encodeURIComponent(experimentId)}`) : check.action?.includes('Data Import') ? nav('/sync') : nav('/advanced')}>{check.action}</button>}</div></div>)}</section>)}</div></Card>
 
-  return (
-    <div className="stack">
-      <div className="page-head">
-        <div>
-          <div className="title">Platform Dashboard</div>
-          <div className="subtitle">
-            {lastUpdated ? `updated ${new Date(lastUpdated).toLocaleTimeString()}` : 'OAI gNB · 手机 · 空口对时 实时总览'}
-          </div>
-        </div>
-        <button className="btn" onClick={() => { loadStatus(); loadOai(); }}>Refresh</button>
-      </div>
+    <Card title="Run Summary" sub="Review the selected conditions before execution. Run ID is assigned only when Start is accepted." right={running ? <button className="btn danger" disabled={busy !== ''} onClick={stop}>{busy === 'stop' ? 'Stopping…' : 'Stop Run'}</button> : <button className="btn primary" disabled={busy !== '' || !preflight?.ready} onClick={start}>{busy === 'start' ? 'Restarting gNB…' : 'Start Run'}</button>}>{!preflight?.ready && <div className="run-blocked"><b>Run cannot start</b><span>{preflight?.issues.length || 0} issue(s) need attention:</span><ul>{preflight?.issues.map((issue) => <li key={issue.key}>{issue.label}</li>)}</ul></div>}<dl className="config-values"><div><dt>Experiment</dt><dd>{experimentId || '—'}</dd></div><div><dt>Configuration</dt><dd>{configuration?.name || '—'} v{configuration?.version ?? '—'}</dd></div><div><dt>Environment</dt><dd>{experiment?.environment || '—'}</dd></div><div><dt>Execution Mode</dt><dd>{preflight?.execution_mode || '—'}</dd></div><div><dt>Run ID</dt><dd>Generated automatically on Start</dd></div><div><dt>Radio</dt><dd>{requested.frequencyMHz || '—'} MHz · {requested.bandwidthMHz || '—'} MHz BW</dd></div></dl></Card>
 
-      {error && <ErrorBox error={error} />}
-
-      <div className="stat-grid">
-        <StatCard
-          label="Phone"
-          value={
-            <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
-              {phoneConnected ? <Badge tone="good">CONNECTED</Badge> : null}
-              {!phoneConnected && phoneAttached ? <Badge tone="accent">ATTACHED</Badge> : null}
-              {!phoneConnected && !phoneAttached ? <Badge tone="muted">OFFLINE</Badge> : null}
-            </div>
-          }
-          sub={phone.device ?? 'no USB, no 5G link'}
-          tone={phoneConnected ? 'good' : phoneAttached ? 'accent' : 'muted'}
-          icon="play"
-        />
-        <StatCard
-          label="OAI Core"
-          value={status.oai.healthy ? 'HEALTHY' : 'UNREACHABLE'}
-          sub={`${status.oai.gnb_running ? 'gNB running' : 'gNB stopped'} · ${status.oai.ue_in_sync ? 'UE in-sync' : 'UE out-of-sync'}`}
-          tone={status.oai.healthy ? 'good' : 'bad'}
-          icon="flask"
-        />
-        <StatCard label="Storage" value={fmtBytes(storage.bytes)} sub={`${storage.n_files} files`} tone="accent" icon="data" />
-      </div>
-
-      {/* ---- active experiment ---- */}
-      <Card
-        title="Active Experiment"
-        sub="选择实验 · 采集时间 · 开始/停止 · 空口握手进度"
-        right={
-          isRunning ? (
-            <button className="btn danger" disabled={stopping} onClick={stopExperiment}>
-              {stopping ? 'Stopping…' : '停止实验'}
-            </button>
-          ) : (
-            <button className="btn primary" disabled={starting || !selectedExperimentId} onClick={startExperiment}>
-              {starting ? 'Starting…' : '开始实验'}
-            </button>
-          )
-        }
-      >
-        <div className="grid cols-2">
-          <div className="kv">
-            <dt>实验</dt>
-            <dd>
-              <select className="field" style={{ width: '100%' }} value={selectedExperimentId}
-                disabled={isRunning}
-                onChange={(e) => setSelectedExperimentId(e.target.value)}>
-                <option value="">— 选择 —</option>
-                {experiments.map((e) => (
-                  <option key={e.experiment_id} value={e.experiment_id}>{e.experiment_id}</option>
-                ))}
-              </select>
-            </dd>
-            <dt>采集时间（秒）</dt>
-            <dd>
-              <input type="number" className="field" style={{ width: 160 }} min={1} disabled={isRunning}
-                value={collectionSeconds} onChange={(e) => setCollectionSeconds(Number(e.target.value))} />
-            </dd>
-            <dt>阶段计划</dt>
-            <dd style={{ fontSize: 12, color: 'var(--muted)' }}>
-              idle(空载) → loaded({collectionSeconds}s 满载) → idle(持续记录到停止)
-            </dd>
-          </div>
-          <div className="kv">
-            <dt>状态</dt>
-            <dd>
-              {latestRun ? (
-                <span className="row" style={{ gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <Badge tone={latestRun.state === 'FAILED' ? 'bad' : isRunning ? 'good' : 'muted'}>{latestRun.state}</Badge>
-                  <code style={{ fontSize: 12 }}>{latestRun.run_id}</code>
-                </span>
-              ) : <span style={{ color: 'var(--muted)' }}>暂无</span>}
-            </dd>
-            {phonePhase ? (
-              <>
-                <dt>手机当前阶段</dt>
-                <dd>{String(phonePhase)}</dd>
-              </>
-            ) : null}
-            {status.clock.delay_ms != null && isRunning ? (
-              <>
-                <dt>通信时延</dt>
-                <dd>{status.clock.delay_ms.toFixed(1)} ms</dd>
-              </>
-            ) : null}
-            {latestRun && latestRun.state === 'FAILED' && latestRun.last_error ? (
-              <>
-                <dt>error</dt>
-                <dd style={{ color: 'var(--bad)', fontSize: 12 }}>{latestRun.last_error}</dd>
-              </>
-            ) : null}
-          </div>
-        </div>
-      </Card>
-
-      {/* ---- live throughput (rolling 1 minute) ---- */}
-      <Card
-        title="Throughput · 近 1 分钟"
-        sub={(() => {
-          const last = thpHistory[thpHistory.length - 1];
-          return last ? `DL ${last.dl.toFixed(2)} Mbps · UL ${last.ul.toFixed(2)} Mbps · ${thpHistory.length} 采样` : '实验运行后开始记录';
-        })()}
-      >
-        {thpHistory.length < 2 ? (
-          <div className="empty-state">暂无吞吐数据（gNB 运行并接入 UE 后显示）</div>
-        ) : (
-          <ThpChart history={thpHistory} />
-        )}
-      </Card>
-
-      {/* ---- OAI radio key params (structured, editable keys only) ---- */}
-      <OaiParamsCard detail={oai} onRefresh={loadOai} />
-
-      {/* ---- OAI template (selectable card list) ---- */}
-      <Card
-        title="OAI Template"
-        sub={`点击卡片选择 · 当前选中：${selectedTemplateName ?? '无'} · 开始实验时应用所选模板${switchBlocked ? ` · 仅 idle 阶段可切换（当前：${phonePhase ?? '未知'}）` : ''}`}
-        right={
-          <button
-            className="btn"
-            disabled={applying || selectedTemplate === '' || switchBlocked}
-            onClick={applyTemplate}
-            title={switchBlocked ? '实验运行中，仅 idle 阶段可切换 Template' : undefined}
-          >
-            {applying ? '切换中…' : '切换（重启 gNB）'}
-          </button>
-        }
-      >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {templates.map((t) => {
-            const selected = selectedTemplate === String(t.id);
-            return (
-              <div
-                key={t.id}
-                onClick={() => setSelectedTemplate(String(t.id))}
-                style={{
-                  cursor: 'pointer', padding: '10px 14px', borderRadius: 'var(--radius-sm)',
-                  border: `2px solid ${selected ? 'var(--accent)' : 'var(--border)'}`,
-                  background: selected ? 'var(--accent-soft)' : 'var(--panel)',
-                }}
-              >
-                <div className="row" style={{ justifyContent: 'space-between', marginBottom: 6 }}>
-                  <strong style={{ fontSize: 13 }}>{t.name}</strong>
-                  {selected ? <span className="badge accent" style={{ fontSize: 11 }}>已选中</span> : null}
-                </div>
-                <ConfigFields cfg={parseConfig(t.config_json)} />
-              </div>
-            );
-          })}
-          {!templates.length ? (
-            <div className="empty-state">本实验尚未添加 Template，请在 Experiments 页编辑任务添加。</div>
-          ) : null}
-        </div>
-      </Card>
-
-      <Card title="Legend">
-        <div className="row" style={{ fontSize: 12, color: 'var(--muted)', gap: 16, flexWrap: 'wrap' }}>
-          <div className="row" style={{ gap: 6 }}><Badge tone="good">CONNECTED</Badge><span>手机 agent 可达（USB 或 5G 控制通道）</span></div>
-          <div className="row" style={{ gap: 6 }}><Badge tone="accent">ATTACHED</Badge><span>USB 已连接·agent 未启动</span></div>
-          <div className="row" style={{ gap: 6 }}><Badge tone="muted">OFFLINE</Badge><span>控制通道均不通</span></div>
-        </div>
-        <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 8 }}>
-          对时握手通过 5G 空口完成（PC 下行探测 → 手机空口 ACK → sync-confirm），USB 仅作为控制/数据通道。
-        </div>
-      </Card>
-    </div>
-  );
+    {running && <Card title="Active Run" sub="Stopping remains visible until backend confirmation."><div className="configuration-state"><div><span>Run</span><b>{latestRun?.run_id}</b></div><div><span>Status</span><Badge tone="warn">{busy === 'stop' ? 'STOPPING' : latestRun?.state}</Badge></div>{experiment?.environment === 'RC' && <><div><span>RC Stage</span><b>{campaign?.state || 'Preparing'}</b></div><div><span>Sample</span><b>{campaign?.samples_done ?? 0} / {campaign?.n_steps ?? requested.rcChamber?.n_steps ?? '—'}</b></div><div><span>Stirrer</span><b>{campaign?.current_angle_deg == null ? '—' : `${campaign.current_angle_deg.toFixed(1)}°`}</b></div><div><span>RSSP</span><b>{campaign?.last_rssp_db == null ? '—' : `${campaign.last_rssp_db.toFixed(1)} dBFS`}</b></div></>}</div>{campaign?.log?.length ? <div className="activity-list"><h3>Latest activity</h3>{campaign.log.slice(-3).reverse().map((item) => <div key={`${item.ms}-${item.msg}`}><time>{new Date(item.ms).toLocaleTimeString()}</time><span>{item.msg}</span></div>)}</div> : null}</Card>}
+    <Card title="Live Throughput" sub="Live monitoring only · not the authoritative Run Result"><div className="muted-text">UL {status.oai.throughput?.ulMbps?.toFixed(2) ?? '—'} Mbps · DL {status.oai.throughput?.dlMbps?.toFixed(2) ?? '—'} Mbps</div></Card>
+  </div>;
 }

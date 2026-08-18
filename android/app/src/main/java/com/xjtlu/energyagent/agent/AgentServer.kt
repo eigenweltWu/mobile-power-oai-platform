@@ -9,6 +9,7 @@ import com.xjtlu.energyagent.db.AppDatabase
 import com.xjtlu.energyagent.export.CsvExporter
 import com.xjtlu.energyagent.run.ExperimentPlan
 import com.xjtlu.energyagent.run.RunEngine
+import com.xjtlu.energyagent.run.WorkloadEngine
 import com.xjtlu.energyagent.service.ExperimentService
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
@@ -24,6 +25,7 @@ import org.json.JSONObject
 class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
 
     @Volatile private var nettestProcess: Process? = null
+    @Volatile private var nettestUsesWorkload = false
 
     override fun serve(session: IHTTPSession): Response {
         val uri = session.uri.trimEnd('/')
@@ -116,6 +118,7 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
     }.toString()
 
     private fun abort(): JSONObject {
+        nettestStop()
         val intent = Intent(context, ExperimentService::class.java).setAction(ExperimentService.ACTION_STOP)
         context.startService(intent)
         return JSONObject().apply { put("ok", true); put("state", "ABORTED") }
@@ -149,6 +152,7 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
     }
 
     private fun taskStop(): JSONObject {
+        nettestStop()
         val intent = Intent(context, ExperimentService::class.java).setAction(ExperimentService.ACTION_STOP)
         context.startService(intent)
         return JSONObject().apply { put("ok", true); put("state", "STOPPED"); put("stopUtcMs", System.currentTimeMillis()) }
@@ -218,7 +222,7 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
         }
     }
 
-    /** Start the fixed local nc workload used by the OAI control-center.
+    /** Start the fixed local workload used by the OAI control-center.
      *  Only typed, validated fields are accepted; callers cannot supply shell
      *  commands. Control and traffic both travel over the UE's 5G PDU link. */
     @Synchronized
@@ -229,24 +233,38 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
         val host = body.optString("host")
         val port = body.optInt("port")
         val limitSeconds = body.optInt("limitSeconds", 300).coerceIn(1, 300)
+        val rateMbps = body.optDouble("rateMbps", 0.0)
         require(direction == "downlink" || direction == "uplink") { "invalid direction" }
         require(protocol == "tcp" || protocol == "udp") { "invalid protocol" }
         require(validIpv4(host)) { "invalid host" }
         require(port in 1..65535) { "invalid port" }
+        require(rateMbps.isFinite() && rateMbps >= 0.0) { "invalid rateMbps" }
 
         nettestStop()
-        val command = when {
-            protocol == "tcp" && direction == "uplink" ->
-                "dd if=/dev/zero bs=65536 2>/dev/null | nc -w 8 $host $port"
-            protocol == "tcp" -> "nc -w 8 $host $port"
-            direction == "uplink" ->
-                "dd if=/dev/zero bs=65000 2>/dev/null | nc -u -w 8 $host $port"
-            else -> "(echo hi; tail -f /dev/null) | nc -u -w 8 $host $port"
+        if (protocol == "udp" && direction == "uplink") {
+            val engine = AgentState.workload ?: WorkloadEngine(context).also {
+                AgentState.workload = it
+            }
+            val mode = if (rateMbps <= 0.0) WorkloadEngine.Mode.UL_SATURATION
+                else WorkloadEngine.Mode.UL_CBR
+            engine.start(mode, rateMbps, host, port)
+            nettestUsesWorkload = true
+        } else {
+            val command = when {
+                protocol == "tcp" && direction == "uplink" ->
+                    "dd if=/dev/zero bs=65536 2>/dev/null | nc -w 8 $host $port"
+                protocol == "tcp" -> "nc -w 8 $host $port"
+                else -> "(echo hi; tail -f /dev/null) | nc -u -w 8 $host $port"
+            }
+            nettestProcess = ProcessBuilder("timeout", limitSeconds.toString(), "sh", "-c", command)
+                .redirectOutput(ProcessBuilder.Redirect.to(java.io.File("/dev/null")))
+                .redirectError(ProcessBuilder.Redirect.to(java.io.File("/dev/null")))
+                .start()
         }
-        nettestProcess = ProcessBuilder("timeout", limitSeconds.toString(), "sh", "-c", command)
-            .redirectOutput(ProcessBuilder.Redirect.to(java.io.File("/dev/null")))
-            .redirectError(ProcessBuilder.Redirect.to(java.io.File("/dev/null")))
-            .start()
+        AgentState.nettestRunning = true
+        AgentState.nettestDirection = direction
+        AgentState.nettestProtocol = protocol
+        AgentState.nettestTargetMbps = rateMbps
         return JSONObject().apply {
             put("started", true)
             put("direction", direction)
@@ -264,6 +282,12 @@ class AgentServer(private val context: Context) : NanoHTTPD("0.0.0.0", 8420) {
             if (process.isAlive) process.destroyForcibly()
         }
         nettestProcess = null
+        if (nettestUsesWorkload) AgentState.workload?.stop()
+        nettestUsesWorkload = false
+        AgentState.nettestRunning = false
+        AgentState.nettestDirection = ""
+        AgentState.nettestProtocol = ""
+        AgentState.nettestTargetMbps = 0.0
         return JSONObject().apply { put("stopped", true) }
     }
 

@@ -45,7 +45,11 @@ def _now_ms() -> int:
 
 
 def _tap_powers_db(cir: dict) -> list[float]:
-    """|h(tau)|^2 per tap in dB from a channel-daemon CIR payload."""
+    """PDP power per delay sample from the cached 8787 PHY snapshot."""
+    cached = cir.get("cir") or []
+    if cached:
+        return [float(point["powerDb"]) for point in cached
+                if isinstance(point, dict) and point.get("powerDb") is not None]
     re = cir.get("cirRe") or []
     im = cir.get("cirIm") or []
     n = min(len(re), len(im))
@@ -390,6 +394,7 @@ class RcCampaign(threading.Thread):
         self.error: Optional[str] = None
         self.started_ms = _now_ms()
         self.run_id: Optional[str] = None
+        self.current_sample_index = 0
 
     # ---- helpers ------------------------------------------------------------ #
     def _say(self, stage: str, msg: str) -> None:
@@ -397,12 +402,12 @@ class RcCampaign(threading.Thread):
         self.log = self.log[-200:]
 
     def _cir(self, timeout_s: float = 10.0) -> Optional[dict]:
-        """Fresh CIR from the channel daemon (ok + non-empty graph data)."""
+        """Fresh CIR from the 8787 cached PHY snapshot."""
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline and not self._stop.is_set():
             try:
                 raw = self.oai.channel_cir()
-                if raw.get("ok") and (raw.get("cirRe") or []):
+                if raw.get("ok") and (raw.get("cir") or raw.get("cirRe") or []):
                     return raw
             except Exception:
                 pass
@@ -418,9 +423,14 @@ class RcCampaign(threading.Thread):
         measured uplink ``puschRssi`` and its unit, so use that authoritative
         receive-power observation instead.
         """
-        raw = self.oai.research_ues_raw()
+        raw = self.oai.telemetry_ues_raw()
+        if (raw.get("collection") or {}).get("stale"):
+            return None
         values = []
         for ue in raw.get("ues") or []:
+            age = ue.get("ageSeconds")
+            if age is None or float(age) > 5.0:
+                continue
             uplink = ue.get("uplink") or {}
             value = uplink.get("puschRssi")
             if value is not None and uplink.get("puschRssiUnit") == "dBFS":
@@ -523,7 +533,11 @@ class RcCampaign(threading.Thread):
             try:
                 # restart=false ALWAYS: a per-sample gNB restart (~40 s, UE
                 # re-attach) would destroy the sampled measurement cadence.
-                r = self.oai.gnb_pusch_target_snr("manual", new_x10, restart=False)
+                r = self.oai.gnb_pusch_target_snr(
+                    "manual", new_x10, restart=False,
+                    request_id=self.oai.new_request_id(
+                        getattr(self, "run_id", None),
+                        f"rc-{getattr(self, 'current_sample_index', 0)}-servo-{it + 1}"))
                 if not r.get("runtimeApplied"):
                     raise StirrerError(
                         "PUSCH target update was not applied to the running gNB; "
@@ -545,7 +559,9 @@ class RcCampaign(threading.Thread):
             return
         value = self.initial_pusch_x10 if self.initial_pusch_mode == "manual" else None
         result = self.oai.gnb_pusch_target_snr(
-            self.initial_pusch_mode, value, restart=False)
+            self.initial_pusch_mode, value, restart=False,
+            request_id=self.oai.new_request_id(
+                getattr(self, "run_id", None), "rc-restore-pusch"))
         changed = bool((result.get("target") or {}).get("effectiveChanged"))
         if changed and not result.get("runtimeApplied"):
             raise StirrerError(
@@ -801,6 +817,7 @@ class RcCampaign(threading.Thread):
                 if self._stop.is_set():
                     break
                 self.state = "moving"
+                self.current_sample_index = i + 1
                 self._say("stirrer", f"sample {i + 1}/{self.cfg.n_steps}: move +{self.cfg.step_deg}°")
                 mv = stirrer.move_rel_and_wait(self.cfg.step_deg, timeout_s=180.0)
                 if not mv.get("ok"):

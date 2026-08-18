@@ -70,9 +70,10 @@ def _insert_config(db: Database, run_id: str):
 def test_snapshot_collector_preserves_ul_and_dl_harq_contracts(tmp_path):
     _, db, settings = _make_manager(tmp_path)
     client = MagicMock()
-    client.research_ues_raw.return_value = {
+    client.telemetry_ues_raw.return_value = {
         "collection": {"stale": False},
-        "ues": [{"uplink": {"bler": .1, "harqInitialTxDelta": 10,
+        "ues": [{"ageSeconds": 0.5,
+                 "uplink": {"bler": .1, "harqInitialTxDelta": 10,
                               "harqRetransmissionDelta": 2,
                               "harqRetransmissionRatio": 2 / 12, "harqErrors": 1},
                  "downlink": {"bler": .2, "harqInitialTxDelta": 20,

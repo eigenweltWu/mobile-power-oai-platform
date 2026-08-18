@@ -86,6 +86,8 @@ def _servo_campaign(runtime_applied: bool) -> RcCampaign:
         "runtimeApplied": runtime_applied,
         "target": {"effectiveChanged": True},
     }
+    campaign.oai.new_request_id.side_effect = (
+        lambda prefix, action: f"{prefix or 'pc'}-{action}-id")
     campaign.cfg = RcConfig({
         "target_rssp_db": 20,
         "rssp_tol_db": 1,
@@ -94,6 +96,8 @@ def _servo_campaign(runtime_applied: bool) -> RcCampaign:
         "servo_settle_s": 0,
     })
     campaign._stop = threading.Event()
+    campaign.run_id = "R1"
+    campaign.current_sample_index = 1
     campaign.pusch_x10 = None
     campaign.last_rssp_db = None
     campaign.log = []
@@ -107,7 +111,7 @@ def test_servo_reads_nested_target_and_requires_hot_apply():
     log = campaign.servo_pusch(Mock())
 
     campaign.oai.gnb_pusch_target_snr.assert_called_once_with(
-        "manual", 190, restart=False)
+        "manual", 190, restart=False, request_id="R1-rc-1-servo-1-id")
     assert campaign.pusch_x10 == 190
     assert log[0]["pusch_x10"] == 200
 
@@ -128,7 +132,7 @@ def test_campaign_restores_initial_target_without_restart():
     campaign.restore_pusch_target()
 
     campaign.oai.gnb_pusch_target_snr.assert_called_once_with(
-        "auto", None, restart=False)
+        "auto", None, restart=False, request_id="R1-rc-restore-pusch-id")
     assert campaign.pusch_x10 == 200
 
 

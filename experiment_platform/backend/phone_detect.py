@@ -145,5 +145,9 @@ def detect_phone(settings: Settings, serial: str = "53616213",
     if result["state"] == "OFFLINE" and result["usb_attached"]:
         result["state"] = "ATTACHED"
 
+    latest = _load(settings)
+    if result["state"] == "OFFLINE" and latest.get("pdu_ip") != result["pdu_ip"]:
+        result["pdu_ip"] = latest.get("pdu_ip")
+        result["last_seen_ms"] = latest.get("last_seen_ms")
     _save(settings, {"pdu_ip": result["pdu_ip"], "last_seen_ms": result["last_seen_ms"]})
     return result

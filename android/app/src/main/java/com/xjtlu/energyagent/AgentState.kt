@@ -32,6 +32,10 @@ object AgentState {
     @Volatile var syncDelayMs: Double? = null
 
     @Volatile var serverStarted = false
+    @Volatile var nettestRunning = false
+    @Volatile var nettestDirection = ""
+    @Volatile var nettestProtocol = ""
+    @Volatile var nettestTargetMbps = 0.0
 
     private const val MAX_DISPLAY = 360  // ~1 min at 5 Hz plus margin
     private val displayBuffer = ArrayDeque<DisplaySample>()

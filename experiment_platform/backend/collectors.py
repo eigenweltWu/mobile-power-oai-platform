@@ -7,6 +7,7 @@ CSV rows.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -62,7 +63,7 @@ class SnapshotCollector(Collector):
         super().__init__(run_id, settings, db, client, interval_s)
 
     def collect_once(self) -> dict:
-        raw = self.client.research_ues_raw()
+        raw = self.client.telemetry_ues_raw()
         out_dir = self.settings.raw_dir / "oai" / "snapshots"
         out_dir.mkdir(parents=True, exist_ok=True)
         fetched = _now_ms()
@@ -70,7 +71,13 @@ class SnapshotCollector(Collector):
         path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
         self.db.record_file(path)
 
+        collection_stale = bool((raw.get("collection") or {}).get("stale"))
+        if collection_stale:
+            return raw
         for ue in raw.get("ues", []):
+            age = ue.get("ageSeconds")
+            if age is None or float(age) > 5.0:
+                continue
             dl = ue.get("downlink") or {}
             ul = ue.get("uplink") or {}
             pc = ue.get("powerControl") or {}
@@ -105,7 +112,7 @@ class SnapshotCollector(Collector):
                     ul.get("harqErrors"), dl.get("harqErrors"),
                     dl.get("dtx"),
                     ul.get("goodputMbps"), dl.get("goodputMbps"),
-                    1 if (raw.get("collection") or {}).get("stale") else 0,
+                    0,
                     str(path),
                 ),
             )
@@ -125,7 +132,7 @@ class EventCollector(Collector):
         return f"{ts}:{ev.get('rnti')}:{ev.get('frame')}:{ev.get('slot')}"
 
     def collect_once(self) -> int:
-        raw = self.client.research_events_raw(limit=self.limit)
+        raw = self.client.telemetry_events_raw(limit=self.limit)
         out_dir = self.settings.raw_dir / "oai" / "events"
         out_dir.mkdir(parents=True, exist_ok=True)
         fetched = _now_ms()
@@ -172,6 +179,12 @@ class ChannelCollector(Collector):
         if not raw.get("ok"):
             return raw
         m = raw.get("metrics") or {}
+        pdp = [float(point["powerDb"]) for point in (raw.get("cir") or [])
+               if isinstance(point, dict) and point.get("powerDb") is not None]
+        peak_db = m.get("peakDb")
+        if peak_db is None and pdp:
+            peak_db = max(pdp)
+        resolved_count = len(raw.get("paths") or [])
         self.db.execute(
             """INSERT INTO oai_channel(
                run_id, fetched_utc_ms, ts_utc, n_samples, dt_ns,
@@ -180,10 +193,49 @@ class ChannelCollector(Collector):
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 self.run_id, fetched, raw.get("tsUtc"), raw.get("nSamples"), raw.get("dtNs"),
-                m.get("peakDb"), m.get("noiseDb"), m.get("rmsDelayNs"), m.get("kFactorDb"),
-                m.get("tapCount"), m.get("peakIdx"), m.get("meanDelayNs"), str(path),
+                peak_db, m.get("noiseDb"), m.get("rmsDelayNs"), m.get("kFactorDb"),
+                m.get("tapCount", resolved_count), m.get("peakIdx"), m.get("meanDelayNs"), str(path),
             ),
         )
+        return raw
+
+
+class ConfigurationCollector(Collector):
+    """Persist OAI's bounded in-memory configuration timeline per Run."""
+    name = "configuration-collector"
+
+    def __init__(self, run_id, settings, db, client, interval_s: float = 5.0):
+        super().__init__(run_id, settings, db, client, interval_s)
+
+    def collect_once(self) -> dict:
+        raw = self.client.configuration_history(limit=100)
+        pending = []
+        for event in raw.get("events", []):
+            request_id = str(event.get("requestId") or "")
+            if request_id != self.run_id and not request_id.startswith(f"{self.run_id}-"):
+                continue
+            encoded = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            key = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            if not self.db.query_one(
+                    "SELECT 1 FROM oai_configuration_events WHERE run_id=? AND event_key=?",
+                    (self.run_id, key)):
+                pending.append((event, encoded, key))
+        if not pending:
+            return raw
+        out_dir = self.settings.raw_dir / "oai" / "configuration_history"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fetched = _now_ms()
+        path = out_dir / f"{self.run_id}__{fetched}.json"
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        self.db.record_file(path)
+        for event, encoded, key in pending:
+            self.db.execute(
+                "INSERT OR IGNORE INTO oai_configuration_events("
+                "run_id,event_key,request_id,ts_utc,event_json,raw_json_path) VALUES(?,?,?,?,?,?)",
+                (self.run_id, key, event.get("requestId"),
+                 event.get("timestamp") or event.get("timestampUtc") or event.get("updatedAt"),
+                 encoded, str(path)),
+            )
         return raw
 
 
@@ -194,7 +246,7 @@ def save_config_provenance(run_id: str, stage: str, settings: Settings, db: Data
     payloads = {
         "status": client.status_raw(),
         "controls": client.gnb_controls().model_dump(),
-        "config": client.research_config_raw(),
+        "config": client.telemetry_config_raw(),
     }
     path = out_dir / f"gnb_{stage}.json"
     path.write_text(json.dumps(payloads, ensure_ascii=False, indent=2), encoding="utf-8")

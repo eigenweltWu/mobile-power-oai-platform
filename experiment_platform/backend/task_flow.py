@@ -10,7 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
-from .collectors import ChannelCollector, EventCollector, SnapshotCollector, save_config_provenance
+from .collectors import (ChannelCollector, ConfigurationCollector, EventCollector,
+                         SnapshotCollector, save_config_provenance)
 from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
@@ -53,9 +54,15 @@ def radio_config(config: dict) -> dict:
 def config_diff(requested: dict, actual: dict) -> dict:
     """Compare only authoritative fields returned by the OAI config API."""
     aliases = {"schedulerMode": "ulSchedulerMode"}
+    scheduler = ((actual.get("controls") or {}).get("ulScheduler") or {})
+    scheduler_values = {
+        "mcs": actual.get("ulManualMcs", scheduler.get("mcs")),
+        "qm": scheduler.get("qm"),
+        "nPrb": actual.get("ulManualPrb", scheduler.get("nPrb")),
+    }
     diff = {}
     for key, wanted in radio_config(requested).items():
-        got = actual.get(key, actual.get(aliases.get(key, "")))
+        got = scheduler_values.get(key, actual.get(key, actual.get(aliases.get(key, ""))))
         if isinstance(wanted, (int, float)) and isinstance(got, (int, float)):
             same = abs(float(wanted) - float(got)) < 1e-6
         else:
@@ -210,6 +217,12 @@ class DownlinkLoop:
         self.last_sync_confirm: Optional[dict] = None
         self._last_shake_ms = 0.0
         self.last_shake: Optional[dict] = None
+        self._nettest_session_id = ""
+        self._nettest_active = False
+        self._nettest_attempted_phase = False
+        self._nettest_thread: Optional[threading.Thread] = None
+        self.last_nettest: Optional[dict] = None
+        self._phase_anchor_monotonic: Optional[float] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -221,6 +234,106 @@ class DownlinkLoop:
         self._stop.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=12)
+        if self._nettest_thread and self._nettest_thread is not threading.current_thread():
+            self._nettest_thread.join(timeout=12)
+        self._stop_nettest()
+
+    def _sync_nettest(self, phase: Optional[str]) -> None:
+        target_mbps = float(self.plan.get("ulTrafficMbps") or 0.0)
+        should_run = (phase or "").upper() == "LOADED" and target_mbps > 0.0
+        if should_run and not self._nettest_attempted_phase:
+            self._nettest_attempted_phase = True
+            try:
+                response = self.oai.nettest_start("uplink", "udp", target_mbps)
+                session = response.get("session") or response.get("state") or {}
+                self._nettest_session_id = str(session.get("sessionId") or "")
+                self._nettest_active = bool(
+                    session.get("running") or session.get("state") in {"STARTING", "RUNNING"})
+                if not self._nettest_active:
+                    raise RuntimeError("OAI NetworkTest did not enter STARTING or RUNNING")
+                self.last_nettest = session
+            except Exception as exc:
+                self.last_nettest = {
+                    "state": "FAILED", "errorCode": getattr(exc, "code", ""),
+                    "error": str(exc),
+                }
+                raise
+        elif should_run and self._nettest_active:
+            self.last_nettest = self.oai.nettest_status().get("session") or {}
+            self._nettest_active = bool(
+                self.last_nettest.get("running") or
+                self.last_nettest.get("state") in {"STARTING", "RUNNING"})
+        elif not should_run:
+            if self._nettest_active:
+                self._stop_nettest()
+            self._nettest_attempted_phase = False
+
+    def _planned_phase(self) -> Optional[str]:
+        """Return the phone phase from the synchronized local plan clock.
+
+        NetworkTest control must not depend on /agent/status while the uplink
+        itself is congested. Sync-confirm arms the phone and establishes this
+        anchor at the same instant, so the PC can start/stop traffic from the
+        immutable phase plan even when phone HTTP responses are delayed.
+        """
+        if self._phase_anchor_monotonic is None:
+            return None
+        elapsed = time.monotonic() - self._phase_anchor_monotonic
+        elapsed -= float(self.plan.get("startDelaySeconds") or 0.0)
+        if elapsed < 0:
+            return None
+        for phase in self.plan.get("phases") or []:
+            name = str(phase.get("name") or "")
+            duration = float(phase.get("durationSeconds") or 0.0)
+            if duration <= 0 or elapsed < duration:
+                return name
+            elapsed -= duration
+        return None
+
+    def _nettest_window(self) -> Optional[tuple[float, float]]:
+        """Delay from sync-confirm and duration of the first loaded phase."""
+        delay = float(self.plan.get("startDelaySeconds") or 0.0)
+        for phase in self.plan.get("phases") or []:
+            duration = float(phase.get("durationSeconds") or 0.0)
+            if str(phase.get("name") or "").upper() == "LOADED":
+                return (delay, duration) if duration > 0 else None
+            if duration <= 0:
+                return None
+            delay += duration
+        return None
+
+    def _start_nettest_schedule(self) -> None:
+        window = self._nettest_window()
+        if window is None or float(self.plan.get("ulTrafficMbps") or 0.0) <= 0.0:
+            return
+
+        def run() -> None:
+            delay, duration = window
+            if self._stop.wait(delay):
+                return
+            try:
+                self._sync_nettest("LOADED")
+            except Exception:
+                return
+            self._stop.wait(duration)
+            self._sync_nettest("IDLE")
+
+        self._nettest_thread = threading.Thread(
+            target=run, daemon=True, name=f"nettest-{self.experiment_id}")
+        self._nettest_thread.start()
+
+    def _stop_nettest(self) -> None:
+        if not self._nettest_active:
+            return
+        try:
+            current = (self.oai.nettest_status().get("session") or {})
+            if not self._nettest_session_id or current.get("sessionId") == self._nettest_session_id:
+                self.last_nettest = self.oai.nettest_stop()
+        except Exception:
+            pass
+        finally:
+            self._nettest_active = False
+            self._nettest_session_id = ""
 
     def _resolve_agent(self):
         """Return (PhoneAgent, None) when a 5G PDU IP is known, else (None, None).
@@ -238,7 +351,10 @@ class DownlinkLoop:
 
     def _gnb_timestamp_ms(self) -> int:
         """gNB-side data timestamp (ms) captured at sync-confirm for alignment."""
-        ues = self.oai.research_ues()
+        ues = self.oai.telemetry_ues()
+        if not ues.collection or ues.collection.stale or not any(
+                ue.ageSeconds is not None and ue.ageSeconds <= 5.0 for ue in ues.ues):
+            raise RuntimeError("OAI telemetry is stale")
         ns = ues.timestampEpochNs
         return int(ns // 1_000_000) if ns else int(time.time() * 1000)
 
@@ -328,6 +444,7 @@ class DownlinkLoop:
             r = agent.sync_confirm(pc_ts, gnb_ts, self.plan)
             if not r.get("ok"):
                 return
+            self._phase_anchor_monotonic = time.monotonic()
             # record the sync_confirm ack row (carries the gNB data timestamp)
             self.db.execute(
                 "INSERT INTO experiment_acks(experiment_id,run_id,seq,direction,pc_send_ms,phone_recv_ms,phone_send_ms,pc_recv_ms,rtt_ms,gnb_data_timestamp_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -335,6 +452,7 @@ class DownlinkLoop:
                  r.get("phone_timestamp_ms"), None, None, None, gnb_ts))
             self.sync_confirmed = True
             self.last_sync_confirm = r
+            self._start_nettest_schedule()
             if self.run_id:
                 self.db.transition(self.run_id, "ARMED", "phone sync-confirm received")
                 self.db.transition(self.run_id, "RUNNING", "phone armed after handshake")
@@ -349,7 +467,7 @@ class TaskFlow:
         self.db = db
         self.oai = oai
         self.downlinks: dict[str, DownlinkLoop] = {}
-        # OAI research collectors per experiment (SnapshotCollector writes
+        # OAI telemetry collectors per experiment (SnapshotCollector writes
         # ul/dl_goodput_mbps + PUSCH stats into oai_snapshots every second).
         self.collectors: dict[str, list] = {}
 
@@ -383,15 +501,23 @@ class TaskFlow:
             pass  # provenance is best-effort; the run itself may proceed
         snap = SnapshotCollector(run_id, self.s, self.db, self.oai, interval_s=1.0)
         ev = EventCollector(run_id, self.s, self.db, self.oai, interval_s=2.0)
-        # ChannelCollector persists complex-CIR multipath metrics + the raw
-        # power-delay profile into oai_channel (feeds the Timeline CIR charts).
-        # The OAI producer now snapshots on demand, so continuous polling is
-        # safe for both AC and RC while RcCampaign still stores settled samples.
-        ch = ChannelCollector(run_id, self.s, self.db, self.oai, interval_s=1.0)
+        cfg = ConfigurationCollector(run_id, self.s, self.db, self.oai, interval_s=5.0)
+        environment_row = self.db.query_one(
+            "SELECT environment FROM experiments WHERE experiment_id=?",
+            (experiment_id,))
+        is_rc = str((environment_row or {}).get("environment") or "").upper() == "RC"
         snap.start()
         ev.start()
-        ch.start()
-        self.collectors[experiment_id] = [snap, ev, ch]
+        cfg.start()
+        collectors = [snap, ev, cfg]
+        # CIR is an RC-only observable. Polling the scope during an AC power
+        # run needlessly re-opens its single WebSocket producer and can crash
+        # the gNB webscope process under sustained reconnect churn.
+        if is_rc:
+            ch = ChannelCollector(run_id, self.s, self.db, self.oai, interval_s=1.0)
+            ch.start()
+            collectors.append(ch)
+        self.collectors[experiment_id] = collectors
 
     def _stop_collectors(self, experiment_id: str) -> None:
         for c in self.collectors.pop(experiment_id, []):
@@ -402,6 +528,7 @@ class TaskFlow:
         """Delete a Run that never reached the phone, including its indexed data."""
         path_columns = (
             ("oai_snapshots", "raw_json_path"), ("oai_events", "raw_json_path"),
+            ("oai_configuration_events", "raw_json_path"),
             ("oai_channel", "raw_json_path"), ("oai_config", "config_json_path"),
             ("clips", "output_path"), ("rc_samples", "raw_json_path"),
         )
@@ -414,7 +541,7 @@ class TaskFlow:
         paths.update(r["file_path"] for r in self.db.query("SELECT file_path FROM files")
                      if run_id in Path(r["file_path"]).parts or run_id in Path(r["file_path"]).name)
 
-        for table in ("phone_samples", "oai_snapshots", "oai_events", "oai_channel", "oai_config",
+        for table in ("phone_samples", "oai_snapshots", "oai_events", "oai_channel", "oai_config", "oai_configuration_events",
                       "sync_anchors", "run_transitions", "clips", "rc_samples"):
             self.db.execute(f"DELETE FROM {table} WHERE run_id=?", (run_id,))
         self.db.execute("DELETE FROM experiment_acks WHERE run_id=?", (run_id,))
@@ -576,7 +703,10 @@ class TaskFlow:
         if quiesced:
             time.sleep(2.0)
         try:
-            result = self.oai.apply_condition(radio_config(cfg), force_restart=True)
+            request_prefix = (run["run_id"] if run else
+                              f"{experiment_id}-config-{template_id}-{int(time.time() * 1000)}")
+            result = self.oai.apply_condition(
+                radio_config(cfg), force_restart=True, request_prefix=request_prefix)
         finally:
             if quiesced:
                 quiesce_phone(serial, False)
@@ -611,7 +741,7 @@ class TaskFlow:
                     rearm.update(agent.rearm())
             except Exception as e:
                 rearm["error"] = str(e)
-        actual_raw = self.oai.research_config_raw()
+        actual_raw = self.oai.telemetry_config_raw()
         actual = actual_raw if isinstance(actual_raw, dict) else {}
         differences = config_diff(cfg, actual)
         verified_ms = int(time.time() * 1000)
@@ -756,8 +886,9 @@ class TaskFlow:
         if quiesced:
             time.sleep(2.0)
         try:
-            self.oai.apply_condition(radio_config(initial or {}), force_restart=True)
-            actual_raw = self.oai.research_config_raw()
+            self.oai.apply_condition(
+                radio_config(initial or {}), force_restart=True, request_prefix=run_id)
+            actual_raw = self.oai.telemetry_config_raw()
             actual = actual_raw if isinstance(actual_raw, dict) else {}
         except Exception as e:
             self.db.transition(run_id, "ERROR", f"start_experiment: gNB restart failed: {e}")
@@ -790,8 +921,7 @@ class TaskFlow:
         st = self.oai.status()
         ready = bool(st.gnb and st.gnb.running)
         try:
-            ues = self.oai.research_ues()
-            in_sync = bool(ues.ues) and bool(ues.collection and not ues.collection.stale)
+            in_sync = bool(self.oai.fresh_ues())
         except Exception:
             in_sync = False
 
@@ -801,6 +931,25 @@ class TaskFlow:
         #    the DownlinkLoop keeps re-shaking every 10 s while the phone is
         #    unreachable, so the start call never blocks on the UE.
         shake = shake_and_refresh(self.s, self.oai, self.db, experiment_id, run_id, n_exchanges=1)
+        ue_ip = shake.get("ue_ip") if isinstance(shake, dict) else None
+        if ue_ip:
+            try:
+                agent = PhoneAgent(base_url=f"http://{ue_ip}:8420")
+                phone_status = agent.status()
+                stale_run = phone_status.get("runId") not in {None, "", run_id}
+                if stale_run:
+                    agent.stop_task()
+                    time.sleep(1.0)
+                    phone_status = agent.status()
+                if not phone_status.get("monitoring"):
+                    agent.start_task(experiment_id)
+                    shake = shake_and_refresh(
+                        self.s, self.oai, self.db, experiment_id, run_id,
+                        n_exchanges=1)
+            except Exception:
+                # DownlinkLoop will keep retrying/re-shaking if the UE briefly
+                # disappears while its stale task is being reset.
+                pass
 
         # 5. Start the downlink loop (records ACKs, triggers sync-confirm on the
         #    first ACK — the phone arms itself, the PC never arms directly)
@@ -808,7 +957,7 @@ class TaskFlow:
         loop.start()
         self.downlinks[experiment_id] = loop
 
-        # 6. OAI research collectors — record per-UE ul/dl_goodput_mbps, PUSCH
+        # 6. OAI telemetry collectors — record per-UE ul/dl_goodput_mbps, PUSCH
         #    SNR/MCS/PRB into oai_snapshots (1 s) and scheduler events into
         #    oai_events (2 s) for THIS run, so the platform stores the gNB-side
         #    goodput alongside the phone telemetry.
@@ -817,7 +966,8 @@ class TaskFlow:
                 "ue_in_sync": in_sync, "config_applied": initial,
                 "configuration_id": configuration_id, "configuration_name": configuration_name,
                 "downlink_started": True,
-                "sync_pending": True, "run_id": run_id, "shake": shake}
+                "sync_pending": True, "run_id": run_id, "phase_plan": plan,
+                "shake": shake}
 
     def stop_experiment(self, experiment_id: str, serial: str = "53616213",
                         pc_port: int = 8420, requested_run_id: Optional[str] = None) -> dict:
@@ -832,7 +982,7 @@ class TaskFlow:
         run_id = loop.run_id if loop else requested_run_id
         if loop:
             loop.stop()
-        # Stop the OAI research collectors FIRST (before the gNB goes down) so
+        # Stop the OAI telemetry collectors FIRST (before the gNB goes down) so
         # the last goodput samples are flushed with a reachable API.
         self._stop_collectors(experiment_id)
         if run_id is None:
@@ -873,11 +1023,32 @@ class TaskFlow:
         except Exception:
             pass  # phone already offline / unplugged — PC stop still recorded
 
-        # 3. Stop the gNB
+        # 3. Stop the gNB. Local teardown still completes if infrastructure
+        # stopping fails, but the result and Run transition retain that fact.
+        gnb_stop = {"ok": False, "error": "gNB stop was not attempted"}
         try:
-            self.oai.gnb_service("stop")
-        except Exception:
-            pass
+            stop = self.oai.gnb_service(
+                "stop", request_id=self.oai.new_request_id(run_id or experiment_id, "stop"))
+            rid = self.oai.extract_request_id(stop)
+            if rid:
+                progress = self.oai.wait_for_restart(rid, timeout_s=120.0)
+                if progress.failed:
+                    raise RuntimeError(progress.error or progress.message or "gNB stop failed")
+                if not progress.done:
+                    raise RuntimeError(
+                        f"gNB stop did not complete: phase={progress.phase or 'unknown'}")
+                gnb_stop = {"ok": True, "response": stop, "progress": progress.model_dump()}
+            elif stop.get("ok") is True:
+                gnb_stop = {"ok": True, "response": stop}
+            else:
+                raise RuntimeError("gNB stop did not return ok=true")
+        except Exception as exc:
+            gnb_stop = {"ok": False, "error": str(exc)}
+        if run_id:
+            try:
+                ConfigurationCollector(run_id, self.s, self.db, self.oai).collect_once()
+            except Exception:
+                pass
 
         # 4. Mark the run STOPPED
         discarded = False
@@ -885,13 +1056,16 @@ class TaskFlow:
         removed_files = 0
         if run_id and synchronized:
             self.db.execute("UPDATE runs SET ended_utc_ms=? WHERE run_id=?", (stop_ms, run_id))
-            self.db.transition(run_id, "STOPPED", "stopped by user", utc_ms=stop_ms)
+            note = ("stopped by user" if gnb_stop["ok"] else
+                    f"stopped locally; gNB stop failed: {gnb_stop['error']}")
+            self.db.transition(run_id, "STOPPED", note, utc_ms=stop_ms)
         elif run_id:
             result = self.discard_run(run_id)
             discarded = True
             discard_reason = result["discard_reason"]
             removed_files = result["removed_files"]
         return {"ok": True, "pc_stop_ms": stop_ms, "phone_stop_ms": phone_stop_ms,
+                "gnb_stop": gnb_stop,
                 "run_id": run_id, "discarded": discarded, "discard_reason": discard_reason,
                 "removed_files": removed_files}
 
@@ -908,11 +1082,11 @@ class TaskFlow:
             "flow": exp.get("flow") or "",
             "templates": [{"name": t["name"], "config": json.loads(t["config_json"])} for t in templates],
         }
-        with self._phone(serial, pc_port) as (agent, _ph):
+        with self._phone_usb(serial, pc_port) as agent:
             return agent.push_task(task)
 
     def list_phone_tasks(self, serial: str, pc_port: int = 8420) -> dict:
-        with self._phone(serial, pc_port) as (agent, _ph):
+        with self._phone_usb(serial, pc_port) as agent:
             return agent.list_tasks()
 
     @contextmanager
@@ -942,7 +1116,7 @@ class TaskFlow:
     def collect_from_phone(self, experiment_id: str, serial: str, hostname: str, pc_port: int = 8420) -> dict:
         dest = self.s.raw_dir / "phone" / experiment_id
         dest.mkdir(parents=True, exist_ok=True)
-        with self._phone(serial, pc_port) as (agent, _ph):
+        with self._phone_usb(serial, pc_port) as agent:
             files = agent.export(dest)
             # mark collected on the phone (records time + hostname + count)
             agent.mark_collected(experiment_id, hostname)
@@ -1177,6 +1351,16 @@ class TaskFlow:
                 " dl_harq_initial_tx_delta,dl_harq_retransmission_delta,dl_harq_retransmission_ratio,"
                 " collection_stale"
                 " FROM oai_snapshots WHERE run_id=? ORDER BY fetched_utc_ms", (rid,))
+        configuration_events = []
+        for rid in run_ids:
+            for event in self.db.query(
+                    "SELECT run_id,request_id,ts_utc,event_json FROM oai_configuration_events "
+                    "WHERE run_id=? ORDER BY id", (rid,)):
+                try:
+                    event["event"] = json.loads(event.pop("event_json"))
+                except (TypeError, json.JSONDecodeError):
+                    event["event"] = None
+                configuration_events.append(event)
         # CIR multipath metrics time-series (oai_channel table).
         channel = []
         if load_channel:
@@ -1303,6 +1487,7 @@ class TaskFlow:
             ]
         return {"environment": environment, "samples": rows, "acks": acks, "clips": clips, "runs": runs,
                 "gnb": gnb, "channel": channel, "cir": cir, "rc_samples": rc_samples,
+                "configuration_events": configuration_events,
                 "events": [event for event in events if event.get("timestamp_utc_ms")],
                 "master": master, "alignment": sources, **origin}
 

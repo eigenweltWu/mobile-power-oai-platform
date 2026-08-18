@@ -9,7 +9,8 @@ from typing import Optional
 import pandas as pd
 
 from . import fusion, quality, state_machine as sm
-from .collectors import ChannelCollector, EventCollector, SnapshotCollector, save_config_provenance
+from .collectors import (ChannelCollector, ConfigurationCollector, EventCollector,
+                         SnapshotCollector, save_config_provenance)
 from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
@@ -89,14 +90,15 @@ class ExperimentManager:
 
         # Step 3: apply config (single-restart optimization)
         self._transition(run_id, "WAITING_GNB")
-        results = self.oai.apply_condition(requested_config)
+        results = self.oai.apply_condition(
+            requested_config, force_restart=True, request_prefix=run_id)
         progress = results.get("progress")
 
         # Step 3b: ensure the gNB is actually running (shared helper on OaiClient)
-        self.oai.ensure_gnb_running()
+        self.oai.ensure_gnb_running(request_prefix=run_id)
 
         # Step 5: verify
-        actual = self.oai.research_config_raw()
+        actual = self.oai.telemetry_config_raw()
         self.db.set_json(run_id, "actual_config_json", actual)
         verify = self._verify_ready(actual, results)
         if verify["ok"]:
@@ -111,13 +113,11 @@ class ExperimentManager:
         status = self.oai.status()
         if not status.gnb or not status.gnb.running:
             problems.append("gNB not running")
-        # UE in-sync (research ues may be stale if no traffic; only flag when collection available+stale)
-        ues = self.oai.research_ues()
-        coll = ues.collection
-        if coll and coll.available and coll.stale:
-            problems.append("research collection stale")
-        if coll and coll.available and not coll.stale and not ues.ues:
-            problems.append("no in-sync UE in research snapshot")
+        try:
+            if not self.oai.fresh_ues():
+                problems.append("no fresh in-sync UE telemetry")
+        except RuntimeError as exc:
+            problems.append(str(exc))
         return {"ok": not problems, "problems": problems}
 
     # ---------------------------------------------------- phone sync + arm
@@ -153,15 +153,24 @@ class ExperimentManager:
         self._transition(run_id, "RUNNING")
         snap = SnapshotCollector(run_id, self.settings, self.db, self.oai, interval_s=1.0)
         ev = EventCollector(run_id, self.settings, self.db, self.oai, interval_s=2.0)
-        ch = ChannelCollector(run_id, self.settings, self.db, self.oai, interval_s=1.0)
-        for c in (snap, ev, ch):
+        cfg = ConfigurationCollector(run_id, self.settings, self.db, self.oai, interval_s=5.0)
+        run = self.db.get_run(run_id)
+        exp = self.db.query_one(
+            "SELECT environment FROM experiments WHERE experiment_id=?",
+            (run["experiment_id"],))
+        collectors = [snap, ev, cfg]
+        if str(exp["environment"]).upper() == "RC":
+            collectors.append(ChannelCollector(
+                run_id, self.settings, self.db, self.oai, interval_s=1.0))
+        for c in collectors:
             c.start()
-        self.collectors[run_id] = [snap, ev, ch]
+        self.collectors[run_id] = collectors
 
     def stop_collectors(self, run_id: str) -> None:
-        for c in self.collectors.pop(run_id, []):
+        collectors = self.collectors.pop(run_id, [])
+        for c in collectors:
             c.stop()
-        for c in self.collectors.get(run_id, []):
+        for c in collectors:
             c.join(timeout=5)
 
     # ------------------------------------------------------- finish + import
@@ -294,6 +303,7 @@ class ExperimentManager:
         # run-scoped tables (children of runs)
         for rid in run_ids:
             for table in ("sync_anchors", "oai_snapshots", "oai_events", "oai_channel",
+                          "oai_configuration_events",
                           "oai_config", "run_transitions", "phone_samples", "rc_samples"):
                 self.db.execute(f"DELETE FROM {table} WHERE run_id=?", (rid,))
 

@@ -100,9 +100,16 @@ export interface PlatformStatus {
     ue_in_sync: boolean;
     frequency_mhz: number | null;
     bandwidth_mhz: number | null;
+    telemetry_stale: boolean | null;
     research_stale: boolean | null;
     /** Aggregated gNB goodput sample for the live throughput chart. */
     throughput?: { epochMs: number | null; dlMbps: number; ulMbps: number; nUes: number } | null;
+    /** OAI's single shared NetworkTest session. */
+    nettest?: {
+      sessionId?: string; initiator?: string; state?: string; running?: boolean;
+      direction?: string; protocol?: string; requestedMbps?: number; actualMbps?: number;
+      averageMbps?: number; errorCode?: string; error?: string;
+    } | null;
   };
   clock: { offset_ms: number | null; state: string; delay_ms?: number | null; rtt_min_ms?: number | null };
   experiment: { latest_run: LatestRun | null };

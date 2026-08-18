@@ -8,14 +8,50 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from experiment_platform.backend.config import Settings
 from experiment_platform.backend.db import Database
-from experiment_platform.backend.task_flow import DEFAULT_PHASES, DownlinkLoop
+from experiment_platform.backend.task_flow import DEFAULT_PHASES, DownlinkLoop, config_diff
+
+
+@pytest.fixture(autouse=True)
+def _isolate_unit_tests_from_usb_phone(monkeypatch):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def no_phone(_self, _serial, _pc_port=8420):
+        raise RuntimeError("phone unavailable in unit test")
+        yield
+
+    monkeypatch.setattr(
+        "experiment_platform.backend.task_flow.quiesce_phone",
+        lambda _serial, _enable: False,
+    )
+    monkeypatch.setattr(
+        "experiment_platform.backend.task_flow.DownlinkLoop._resolve_agent",
+        lambda _self: (None, None),
+    )
+    monkeypatch.setattr(
+        "experiment_platform.backend.task_flow.TaskFlow._phone",
+        no_phone,
+    )
 
 
 class FakeUes:
     # 1.7e15 ns -> 1.7e9 ms when integer-divided by 1e6
     timestampEpochNs = 1_700_000_000_000_000
+    collection = type("Collection", (), {"stale": False})()
+    ues = [type("Ue", (), {"ageSeconds": 0.5})()]
+
+
+def test_config_diff_reads_manual_scheduler_from_telemetry_controls():
+    requested = {"schedulerMode": "manual", "mcs": 5, "qm": 4, "nPrb": 5}
+    actual = {
+        "ulSchedulerMode": "manual", "ulManualMcs": 5, "ulManualPrb": 5,
+        "controls": {"ulScheduler": {"mode": "manual", "mcs": 5, "qm": 4, "nPrb": 5}},
+    }
+    assert config_diff(requested, actual) == {}
 
 
 def _make_loop(tmp_path) -> tuple[DownlinkLoop, Database, MagicMock]:
@@ -34,9 +70,12 @@ def _make_loop(tmp_path) -> tuple[DownlinkLoop, Database, MagicMock]:
     db.upsert_run({"run_id": "R1", "experiment_id": "EXP", "condition_id": "C1",
                    "state": "PREPARING"})
     oai = MagicMock()
-    oai.research_ues.return_value = FakeUes()
+    oai.telemetry_ues.return_value = FakeUes()
     oai.shake.return_value = {"ok": False, "ue_ip": None, "error": "no UE PDU session"}
     oai.oai_pc_offset_ms.return_value = 0.0
+    oai.gnb_service.return_value = {"ok": True}
+    oai.extract_request_id.return_value = None
+    oai.configuration_history.return_value = {"ok": True, "events": []}
     plan = {"experimentId": "EXP", "runId": "R1", "conditionId": "C1",
             "environment": "AC", "startDelaySeconds": 1.0, "phases": DEFAULT_PHASES}
     loop = DownlinkLoop("EXP", "53616213", 8420, db, s, oai, plan,
@@ -78,6 +117,78 @@ def test_sync_confirm_failure_leaves_unconfirmed(tmp_path):
     # no sync_confirm ack row recorded
     rows = db.query("SELECT direction FROM experiment_acks WHERE direction='sync_confirm'")
     assert rows == []
+    db.close()
+
+
+def test_shared_nettest_follows_loaded_phase(tmp_path):
+    loop, db, oai = _make_loop(tmp_path)
+    loop.plan["ulTrafficMbps"] = 20.0
+    oai.nettest_start.return_value = {
+        "ok": True,
+        "state": {"sessionId": "S1", "running": True, "state": "RUNNING"},
+    }
+    oai.nettest_status.return_value = {
+        "ok": True,
+        "session": {"sessionId": "S1", "running": True, "state": "RUNNING"},
+    }
+    oai.nettest_stop.return_value = {
+        "ok": True,
+        "session": {"sessionId": "S1", "running": False, "state": "STOPPED"},
+    }
+
+    loop._sync_nettest("LOADED")
+    oai.nettest_start.assert_called_once_with("uplink", "udp", 20.0)
+    loop._sync_nettest("IDLE")
+    oai.nettest_stop.assert_called_once_with()
+    db.close()
+
+
+def test_planned_phase_uses_sync_anchor_not_phone_status(tmp_path, monkeypatch):
+    loop, db, _oai = _make_loop(tmp_path)
+    loop._phase_anchor_monotonic = 100.0
+    monkeypatch.setattr("experiment_platform.backend.task_flow.time.monotonic", lambda: 100.5)
+    assert loop._planned_phase() is None  # one-second start delay
+    monkeypatch.setattr("experiment_platform.backend.task_flow.time.monotonic", lambda: 102.0)
+    assert loop._planned_phase().upper() == "IDLE"
+    monkeypatch.setattr("experiment_platform.backend.task_flow.time.monotonic", lambda: 117.0)
+    assert loop._planned_phase().upper() == "LOADED"
+    monkeypatch.setattr("experiment_platform.backend.task_flow.time.monotonic", lambda: 237.0)
+    assert loop._planned_phase().upper() == "IDLE"  # continuous tail
+    db.close()
+
+
+def test_shared_nettest_has_independent_sync_anchored_schedule(tmp_path, monkeypatch):
+    loop, db, oai = _make_loop(tmp_path)
+    loop.plan["ulTrafficMbps"] = 5.0
+    loop.plan["startDelaySeconds"] = 1.0
+    loop.plan["phases"] = [
+        {"name": "idle", "durationSeconds": 2.0},
+        {"name": "loaded", "durationSeconds": 3.0},
+        {"name": "idle", "durationSeconds": 0.0},
+    ]
+    oai.nettest_start.return_value = {
+        "ok": True,
+        "session": {"sessionId": "S1", "running": True, "state": "RUNNING"},
+    }
+    oai.nettest_status.return_value = {
+        "ok": True,
+        "session": {"sessionId": "S1", "running": True, "state": "RUNNING"},
+    }
+    waits = []
+
+    def wait(seconds):
+        waits.append(seconds)
+        return False
+
+    monkeypatch.setattr(loop._stop, "wait", wait)
+
+    assert loop._nettest_window() == (3.0, 3.0)
+    loop._start_nettest_schedule()
+    loop._nettest_thread.join(timeout=1)
+
+    assert waits == [3.0, 3.0]
+    oai.nettest_start.assert_called_once_with("uplink", "udp", 5.0)
+    oai.nettest_stop.assert_called_once_with()
     db.close()
 
 
@@ -260,14 +371,17 @@ def _make_template_flow(tmp_path):
     oai.shake.return_value = {"ok": True, "ue_ip": "10.0.1.99", "rtt_ms": 12.0,
                               "offset_ms": 1.5, "exchanges": []}
     oai.oai_pc_offset_ms.return_value = 0.0
+    oai.gnb_service.return_value = {"ok": True}
+    oai.extract_request_id.return_value = None
+    oai.configuration_history.return_value = {"ok": True, "events": []}
     flow = TaskFlow(s, db, oai)
     flow.add_template("EXP3", "T1", {"bandwidthMHz": 20, "txGainDb": 70})
     tid = flow.list_templates("EXP3")[0]["id"]
     flow.set_default_template("EXP3", tid)
     actual = {"bandwidthMHz": 20, "txGainDb": 70}
-    oai.research_config_raw.return_value = actual
+    oai.telemetry_config_raw.return_value = actual
     oai.status.return_value.gnb.running = True
-    oai.research_ues.side_effect = RuntimeError("no ues yet")
+    oai.fresh_ues.side_effect = RuntimeError("no ues yet")
     db.execute(
         "INSERT OR REPLACE INTO configuration_apply_state("
         "singleton_id,experiment_id,configuration_id,configuration_version,configuration_name,"
@@ -483,8 +597,10 @@ def test_start_experiment_force_restarts_gnb(tmp_path):
     db.execute("DELETE FROM configuration_apply_state")
     oai.status.return_value.gnb.running = False
     flow.start_experiment("EXP3", "53616213")
-    oai.apply_condition.assert_called_once_with(
-        {"bandwidthMHz": 20, "txGainDb": 70}, force_restart=True)
+    oai.apply_condition.assert_called_once()
+    assert oai.apply_condition.call_args.args[0] == {"bandwidthMHz": 20, "txGainDb": 70}
+    assert oai.apply_condition.call_args.kwargs["force_restart"] is True
+    assert oai.apply_condition.call_args.kwargs["request_prefix"].startswith("EXP3_r")
     oai.ensure_gnb_running.assert_not_called()
     applied = db.query_one("SELECT * FROM configuration_apply_state")
     assert applied["configuration_id"] == tid
@@ -500,7 +616,7 @@ def test_configuration_update_versions_and_keeps_run_snapshot(tmp_path):
     original = {"bandwidthMHz": 20, "txGainDb": 70}
     applied = {"bandwidthMHz": 20, "txGainDb": 70}
     flow.set_default_template("EXP3", tid)
-    oai.research_config_raw.return_value = applied
+    oai.telemetry_config_raw.return_value = applied
 
     result = flow.start_experiment("EXP3", "53616213")
     run = db.get_run(result["run_id"])
@@ -547,17 +663,19 @@ def test_start_experiment_restart_failure_marks_run_error(tmp_path):
     db.close()
 
 
-def test_start_experiment_mounts_channel_collector(tmp_path):
-    """Every run must mount the ChannelCollector — without it the complex-CIR
-    multipath metrics never reach oai_channel and the Timeline CIR charts
-    stay empty even though the frontend implements them."""
+def test_channel_collector_is_rc_only(tmp_path):
+    """AC power runs must not reconnect the gNB scope; RC still records CIR."""
     from experiment_platform.backend.collectors import ChannelCollector
 
     flow, db, oai, _tid = _make_template_flow(tmp_path)
-    flow.start_experiment("EXP3", "53616213")
+    result = flow.start_experiment("EXP3", "53616213")
     mounted = flow.collectors.get("EXP3", [])
-    assert any(isinstance(c, ChannelCollector) for c in mounted), \
-        "ChannelCollector not mounted: CIR charts on Timeline will never fill"
-    # stop the threads the start spun up
+    assert not any(isinstance(c, ChannelCollector) for c in mounted)
+
+    flow._stop_collectors("EXP3")
+    db.execute("UPDATE experiments SET environment='RC' WHERE experiment_id='EXP3'")
+    flow._start_collectors(result["run_id"], "EXP3")
+    mounted = flow.collectors.get("EXP3", [])
+    assert any(isinstance(c, ChannelCollector) for c in mounted)
     flow._stop_collectors("EXP3")
     db.close()

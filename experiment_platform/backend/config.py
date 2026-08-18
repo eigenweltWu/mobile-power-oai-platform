@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULTS = {
     "oai_host": "192.168.31.119",
     "oai_port": 8787,
-    "oai_channel_port": 8091,         # oai_channel_daemon (scope 8090 -> HTTP 8091)
     "oai_control_token": "",          # optional; empty == not sent
     "oai_timeout_s": 8.0,
     "data_dir": str(ROOT / "experiment_platform" / "data"),
@@ -46,7 +45,6 @@ def _load_local_config() -> dict:
 class Settings:
     oai_host: str = DEFAULTS["oai_host"]
     oai_port: int = DEFAULTS["oai_port"]
-    oai_channel_port: int = DEFAULTS["oai_channel_port"]
     oai_control_token: str = DEFAULTS["oai_control_token"]
     oai_timeout_s: float = DEFAULTS["oai_timeout_s"]
     data_dir: Path = Path(DEFAULTS["data_dir"])
@@ -59,10 +57,6 @@ class Settings:
     @property
     def oai_base_url(self) -> str:
         return f"http://{self.oai_host}:{self.oai_port}"
-
-    @property
-    def channel_base_url(self) -> str:
-        return f"http://{self.oai_host}:{self.oai_channel_port}"
 
     @property
     def control_headers(self) -> dict[str, str]:
@@ -106,7 +100,6 @@ def load_settings() -> Settings:
     return Settings(
         oai_host=os.environ.get("OAI_HOST", local.get("oai_host", DEFAULTS["oai_host"])),
         oai_port=int(os.environ.get("OAI_PORT", local.get("oai_port", DEFAULTS["oai_port"]))),
-        oai_channel_port=int(os.environ.get("OAI_CHANNEL_PORT", local.get("oai_channel_port", DEFAULTS["oai_channel_port"]))),
         oai_control_token=os.environ.get("OAI_CONTROL_TOKEN", local.get("oai_control_token", "")),
         oai_timeout_s=float(os.environ.get("OAI_TIMEOUT_S", local.get("oai_timeout_s", DEFAULTS["oai_timeout_s"]))),
         data_dir=Path(os.environ.get("PLATFORM_DATA_DIR", local.get("data_dir", DEFAULTS["data_dir"]))),

@@ -30,6 +30,15 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _oai_error_response(exc: OaiError) -> JSONResponse:
+    try:
+        detail = json.loads(exc.body)
+    except Exception:
+        detail = {"code": exc.code or "OAI_REQUEST_FAILED", "error": str(exc)}
+    status = exc.status if 400 <= exc.status <= 599 else 502
+    return JSONResponse(status_code=status, content=detail)
+
+
 def _compute_clock_status(db: Database, experiment_id: str | None = None) -> dict:
     """Derive the PC↔phone clock offset from recorded downlink ACKs.
 
@@ -105,20 +114,28 @@ def platform_status():
         oai_ok = False
         status = None
     ues = None
+    nettest = None
     try:
-        ues = _oai.research_ues()
+        ues = _oai.telemetry_ues()
         coll = ues.collection
     except Exception:  # noqa: BLE001
         coll = None
+    try:
+        nettest = (_oai.nettest_status().get("session") or {})
+    except Exception:
+        nettest = None
     # Rolling throughput sample for the dashboard's 1-minute live chart.
     throughput = None
-    if ues and ues.ues:
+    fresh_ues = ([ue for ue in ues.ues
+                  if ue.ageSeconds is not None and ue.ageSeconds <= 5.0]
+                 if ues and coll and not coll.stale else [])
+    if fresh_ues:
         try:
             throughput = {
                 "epochMs": int((ues.timestampEpochNs or 0) / 1e6) or None,
-                "dlMbps": round(sum(u.downlink.goodputMbps or 0.0 for u in ues.ues if u.downlink), 3),
-                "ulMbps": round(sum(u.uplink.goodputMbps or 0.0 for u in ues.ues if u.uplink), 3),
-                "nUes": len(ues.ues),
+                "dlMbps": round(sum(u.downlink.goodputMbps or 0.0 for u in fresh_ues if u.downlink), 3),
+                "ulMbps": round(sum(u.uplink.goodputMbps or 0.0 for u in fresh_ues if u.uplink), 3),
+                "nUes": len(fresh_ues),
             }
         except Exception:  # noqa: BLE001
             throughput = None
@@ -153,11 +170,13 @@ def platform_status():
             "gnb_status": status.gnb.status if status and status.gnb else None,
             "core_running": status.core.running if status and status.core else None,
             "core_total": status.core.total if status and status.core else None,
-            "ue_in_sync": bool(status.ues) if status else None,
+            "ue_in_sync": bool(fresh_ues) if ues is not None else None,
             "frequency_mhz": status.radio.frequencyMHz if status and status.radio else None,
             "bandwidth_mhz": status.radio.bandwidthMHz if status and status.radio else None,
+            "telemetry_stale": coll.stale if coll else None,
             "research_stale": coll.stale if coll else None,
             "throughput": throughput,
+            "nettest": nettest,
         },
         "clock": clock,
         "experiment": {"latest_run": latest_run},
@@ -178,19 +197,25 @@ def oai_controls():
     return _oai.gnb_controls().model_dump()
 
 
-@app.get("/api/oai/research/ues")
-def oai_research_ues():
-    return _oai.research_ues_raw()
+@app.get("/api/oai/telemetry/ues")
+def oai_telemetry_ues():
+    return _oai.telemetry_ues_raw()
 
 
-@app.get("/api/oai/research/config")
-def oai_research_config():
-    return _oai.research_config_raw()
+@app.get("/api/oai/telemetry/config")
+def oai_telemetry_config():
+    return _oai.telemetry_config_raw()
 
 
-@app.get("/api/oai/research/events")
-def oai_research_events(limit: int = Query(200, ge=1, le=1000)):
-    return _oai.research_events_raw(limit=limit)
+@app.get("/api/oai/telemetry/events")
+def oai_telemetry_events(limit: int = Query(200, ge=1, le=1000)):
+    return _oai.telemetry_events_raw(limit=limit)
+
+
+# Compatibility aliases for existing platform consumers.
+app.add_api_route("/api/oai/research/ues", oai_telemetry_ues, methods=["GET"])
+app.add_api_route("/api/oai/research/config", oai_telemetry_config, methods=["GET"])
+app.add_api_route("/api/oai/research/events", oai_telemetry_events, methods=["GET"])
 
 
 @app.get("/api/oai/calibration")
@@ -201,6 +226,30 @@ def oai_calibration(device: Optional[str] = None, frequencyMHz: Optional[float] 
 @app.get("/api/oai/progress")
 def oai_progress(id: Optional[str] = None):
     return _oai.progress(id).model_dump()
+
+
+@app.get("/api/oai/nettest/status")
+def oai_nettest_status():
+    return _oai.nettest_status()
+
+
+@app.post("/api/oai/nettest")
+def oai_nettest(payload: dict = Body(...)):
+    try:
+        if payload.get("action") == "stop":
+            return _oai.nettest_stop()
+        return _oai.nettest_start(
+            str(payload.get("direction") or "uplink"),
+            str(payload.get("protocol") or "udp"),
+            payload.get("rateMbps") or 0.0,
+        )
+    except OaiError as exc:
+        return _oai_error_response(exc)
+
+
+@app.get("/api/oai/history/configuration")
+def oai_configuration_history(limit: int = Query(100, ge=1, le=1000)):
+    return _oai.configuration_history(limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -390,15 +439,15 @@ def prepare_run(run_id: str, payload: dict = Body(...)):
     requested = payload.get("requested_config", payload)
     try:
         return _manager.prepare_run(run_id, requested)
-    except OaiError as e:
-        raise HTTPException(502, str(e))
+    except OaiError as exc:
+        return _oai_error_response(exc)
 
 
 @app.post("/api/runs/{run_id}/prepare-config")
 def preview_config(payload: dict = Body(...)):
     """Compute requested vs actual WITHOUT applying (dry-run comparison)."""
     requested = payload.get("requested_config", payload)
-    actual = _oai.research_config_raw()
+    actual = _oai.telemetry_config_raw()
     return {"requested": requested, "actual": actual,
             "diff": {k: {"requested": requested.get(k), "actual": actual.get(k)}
                      for k in requested if requested.get(k) is not None and actual.get(k) != requested.get(k)}}
@@ -615,8 +664,8 @@ def apply_template(experiment_id: str, template_id: int, payload: dict = Body(de
         raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(404, str(e))
-    except OaiError as e:
-        raise HTTPException(502, f"OAI apply_condition failed: {e}")
+    except OaiError as exc:
+        return _oai_error_response(exc)
 
 
 def _configuration_readiness(config: dict) -> list[str]:
@@ -650,8 +699,10 @@ def run_control_preflight(experiment_id: str, configuration_id: int):
          "action": f"Open Experiment → Configurations"},
         {"group": "gNB", "key": "oai", "ok": bool(platform["oai"]["healthy"]),
          "label": "OAI control endpoint reachable", "action": "Open Advanced → Diagnostics"},
-        {"group": "Phone", "key": "phone", "ok": platform["phone"]["state"].upper() == "CONNECTED",
-         "label": "Phone Agent ready", "action": "Open Data Import / Phone diagnostics"},
+        {"group": "Phone", "key": "phone", "ok": not bool(platform["phone"].get("usb_attached")),
+         "label": ("USB removed; Phone/UE sync starts after gNB restart"
+                   if not platform["phone"].get("usb_attached") else "Unplug USB before Start"),
+         "action": "Unplug USB before Start"},
         {"group": "Storage", "key": "storage", "ok": free_bytes >= 100 * 1024 * 1024,
          "label": "Storage available", "action": "Free at least 100 MB"},
     ]
@@ -708,6 +759,8 @@ def start_experiment(experiment_id: str, payload: dict = Body(...)):
         return result
     except HTTPException:
         raise
+    except OaiError as exc:
+        return _oai_error_response(exc)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
 

@@ -7,7 +7,9 @@ failures and support a configurable timeout.
 """
 from __future__ import annotations
 
+import json
 import time
+import uuid
 from typing import Any, Optional
 
 import httpx
@@ -23,6 +25,10 @@ class OaiError(RuntimeError):
         super().__init__(f"OAI {method} {url} -> HTTP {status}: {body}")
         self.status = status
         self.body = body
+        try:
+            self.code = json.loads(body).get("code", "")
+        except Exception:
+            self.code = ""
 
 
 class OaiClient:
@@ -48,7 +54,10 @@ class OaiClient:
         r = self._client.post(path, json=payload)
         if r.status_code >= 400:
             raise OaiError("POST", path, r.status_code, r.text)
-        return r.json()
+        result = r.json()
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise OaiError("POST", path, r.status_code, r.text)
+        return result
 
     # ---- GET ------------------------------------------------------------- #
     def health(self) -> dict:
@@ -63,23 +72,56 @@ class OaiClient:
     def gnb_controls(self) -> m.GnbControls:
         return m.GnbControls.model_validate(self._get("/api/gnb/controls"))
 
-    def research_ues(self) -> m.ResearchUes:
-        return m.ResearchUes.model_validate(self._get("/api/research/ues"))
+    def telemetry_ues(self) -> m.ResearchUes:
+        return m.ResearchUes.model_validate(self._get("/api/telemetry/ues"))
 
-    def research_ues_raw(self) -> dict:
-        return self._get("/api/research/ues")
+    def telemetry_ues_raw(self) -> dict:
+        return self._get("/api/telemetry/ues")
 
-    def research_config(self) -> m.ResearchConfig:
-        return m.ResearchConfig.model_validate(self._get("/api/research/config"))
+    def telemetry_config(self) -> m.ResearchConfig:
+        return m.ResearchConfig.model_validate(self._get("/api/telemetry/config"))
 
-    def research_config_raw(self) -> dict:
-        return self._get("/api/research/config")
+    def telemetry_config_raw(self) -> dict:
+        return self._get("/api/telemetry/config")
 
-    def research_events(self, limit: int = 200) -> m.ResearchEvents:
-        return m.ResearchEvents.model_validate(self._get("/api/research/events", limit=limit))
+    def telemetry_events(self, limit: int = 200) -> m.ResearchEvents:
+        return m.ResearchEvents.model_validate(self._get("/api/telemetry/events", limit=limit))
 
-    def research_events_raw(self, limit: int = 200) -> dict:
-        return self._get("/api/research/events", limit=limit)
+    def telemetry_events_raw(self, limit: int = 200) -> dict:
+        return self._get("/api/telemetry/events", limit=limit)
+
+    def fresh_ues(self, max_age_s: float = 5.0) -> list[m.ResearchUe]:
+        payload = self.telemetry_ues()
+        if not payload.collection or payload.collection.stale:
+            raise RuntimeError("OAI telemetry is stale")
+        return [ue for ue in payload.ues
+                if ue.ageSeconds is not None and ue.ageSeconds <= max_age_s]
+
+    # Compatibility names for older internal callers and third-party imports.
+    research_ues = telemetry_ues
+    research_ues_raw = telemetry_ues_raw
+    research_config = telemetry_config
+    research_config_raw = telemetry_config_raw
+    research_events = telemetry_events
+    research_events_raw = telemetry_events_raw
+
+    def nettest_status(self) -> dict:
+        return self._get("/api/nettest/status")
+
+    def nettest_start(self, direction: str, protocol: str = "udp",
+                      rate_mbps: float = 0.0) -> dict:
+        payload: dict[str, Any] = {
+            "action": "start", "direction": direction, "protocol": protocol,
+        }
+        if protocol == "udp":
+            payload["rateMbps"] = rate_mbps
+        return self._post("/api/nettest", payload)
+
+    def nettest_stop(self) -> dict:
+        return self._post("/api/nettest", {"action": "stop"})
+
+    def configuration_history(self, limit: int = 100) -> dict:
+        return self._get("/api/history/configuration", limit=limit)
 
     def rf_calibration(self, device: Optional[str] = None, frequencyMHz: Optional[float] = None) -> dict:
         params: dict[str, Any] = {}
@@ -94,17 +136,27 @@ class OaiClient:
         return m.Progress.model_validate(self._get("/api/gnb/progress", **params))
 
     def channel_cir(self) -> dict:
-        """Fetch the latest complex UL channel impulse response + multipath
-        metrics from the oai_channel_daemon (gNB scope 8090 -> HTTP 8091)."""
-        url = f"http://{self.s.oai_host}:{self.s.oai_channel_port}/channel"
-        r = self._client.get(url)
-        if r.status_code >= 400:
-            raise OaiError("GET", url, r.status_code, r.text)
-        return r.json()
+        """Read the control backend's cached PHY snapshot.
+
+        External clients must never connect to WebScope (8090) or its legacy
+        8091 proxy.  The 8787 backend owns the sole WebSocket and refreshes its
+        in-memory snapshot at 1 Hz; repeated reads here never trigger capture.
+        """
+        raw = self._get("/api/scope/snapshot")
+        age = raw.get("ageSeconds")
+        fresh = (raw.get("connection") == "live" and age is not None and
+                 float(age) <= 3.0)
+        return {
+            **raw,
+            "ok": fresh,
+            "tsUtc": raw.get("updatedAt"),
+            "nSamples": raw.get("cirPointCount"),
+            "error": "" if fresh else "PHY snapshot is not live/fresh",
+        }
 
     # ---- POST control ---------------------------------------------------- #
-    def gnb_service(self, action: str) -> dict:
-        """POST /api/gnb/service — fire the action, never block on it.
+    def gnb_service(self, action: str, request_id: Optional[str] = None) -> dict:
+        """POST /api/gnb/service and preserve its synchronous success semantics.
 
         The OAI handler executes service actions SYNCHRONOUSLY (quiesce UE,
         docker stop, host preflight, docker start, NG-setup wait, UE restore
@@ -115,23 +167,26 @@ class OaiClient:
         the caller follows the action via :meth:`wait_for_restart` polling
         ``/api/gnb/progress`` instead of holding the POST open.
         """
-        rid = f"pc-{int(time.time() * 1000)}"
+        rid = request_id or f"pc-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         try:
             r = self._client.post("/api/gnb/service",
-                                  json={"action": action, "requestId": rid})
-            if r.status_code >= 400:
+                                  json={"action": action, "requestId": rid},
+                                  timeout=max(70.0, self.s.oai_timeout_s))
+            if r.status_code != 200:
                 raise OaiError("POST", "/api/gnb/service", r.status_code, r.text)
             resp = r.json()
+            if resp.get("ok") is False:
+                raise OaiError("POST", "/api/gnb/service", r.status_code, r.text)
             # Fast path (< timeout): the action already finished server-side.
             if not resp.get("requestId"):
                 resp["requestId"] = rid
             return resp
-        except httpx.TimeoutException:
+        except httpx.ReadTimeout:
             # The request reached the OAI host; its handler thread continues
             # the (long) action. Surface the requestId so wait_for_restart()
             # can follow the progress.
-            return {"ok": True, "message": f"{action} initiated (async)",
-                    "requestId": rid}
+            return {"ok": None, "pending": True,
+                    "message": f"{action} pending; follow progress", "requestId": rid}
 
     def shake(self, n_exchanges: int = 3) -> dict:
         """POST /api/shake — OAI 主机代发 UE downlink 探测.
@@ -176,23 +231,41 @@ class OaiClient:
             return 0.0
         return ((t0 + t1) / 2.0) - oai_ms
 
-    def gnb_bandwidth(self, bandwidth_mhz: int, restart: bool) -> dict:
-        return self._post("/api/gnb/bandwidth", {"bandwidthMHz": bandwidth_mhz, "restart": restart})
+    @staticmethod
+    def _with_request_id(payload: dict[str, Any], request_id: Optional[str]) -> dict[str, Any]:
+        payload["requestId"] = request_id or OaiClient.new_request_id("pc", "control")
+        return payload
 
-    def gnb_frequency(self, frequency_mhz: float, restart: bool) -> dict:
-        return self._post("/api/gnb/frequency", {"frequencyMHz": frequency_mhz, "restart": restart})
+    @staticmethod
+    def new_request_id(prefix: Optional[str], action: str) -> str:
+        root = prefix or "pc"
+        return f"{root}-{action}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
 
-    def gnb_gains(self, tx_gain_db: float, rx_gain_db: float, restart: bool) -> dict:
-        return self._post("/api/gnb/gains", {"txGainDb": tx_gain_db, "rxGainDb": rx_gain_db, "restart": restart})
+    def gnb_bandwidth(self, bandwidth_mhz: int, restart: bool,
+                      request_id: Optional[str] = None) -> dict:
+        return self._post("/api/gnb/bandwidth", self._with_request_id(
+            {"bandwidthMHz": bandwidth_mhz, "restart": restart}, request_id))
 
-    def gnb_pusch_target_snr(self, mode: str, pusch_target_snr_x10: Optional[int], restart: bool) -> dict:
+    def gnb_frequency(self, frequency_mhz: float, restart: bool,
+                      request_id: Optional[str] = None) -> dict:
+        return self._post("/api/gnb/frequency", self._with_request_id(
+            {"frequencyMHz": frequency_mhz, "restart": restart}, request_id))
+
+    def gnb_gains(self, tx_gain_db: float, rx_gain_db: float, restart: bool,
+                  request_id: Optional[str] = None) -> dict:
+        return self._post("/api/gnb/gains", self._with_request_id(
+            {"txGainDb": tx_gain_db, "rxGainDb": rx_gain_db, "restart": restart}, request_id))
+
+    def gnb_pusch_target_snr(self, mode: str, pusch_target_snr_x10: Optional[int], restart: bool,
+                             request_id: Optional[str] = None) -> dict:
         payload: dict[str, Any] = {"mode": mode, "restart": restart}
         if pusch_target_snr_x10 is not None:
             payload["puschTargetSnrX10"] = pusch_target_snr_x10
-        return self._post("/api/gnb/pusch-target-snr", payload)
+        return self._post("/api/gnb/pusch-target-snr", self._with_request_id(payload, request_id))
 
     def gnb_ul_scheduler(self, mode: str, mcs: Optional[int] = None, qm: Optional[int] = None,
-                         prb: Optional[int] = None, restart: bool = True) -> dict:
+                         prb: Optional[int] = None, restart: bool = True,
+                         request_id: Optional[str] = None) -> dict:
         payload: dict[str, Any] = {"mode": mode, "restart": restart}
         if mcs is not None:
             payload["mcs"] = mcs
@@ -200,7 +273,7 @@ class OaiClient:
             payload["qm"] = qm
         if prb is not None:
             payload["prb"] = prb
-        return self._post("/api/gnb/ul-scheduler", payload)
+        return self._post("/api/gnb/ul-scheduler", self._with_request_id(payload, request_id))
 
     # ---- helpers --------------------------------------------------------- #
     def extract_request_id(self, resp: dict) -> Optional[str]:
@@ -235,7 +308,8 @@ class OaiClient:
 
     def apply_condition(self, requested: "dict[str, Any]", on_update=None,
                         restart_timeout_s: float = 300.0,
-                        force_restart: bool = False) -> dict[str, Any]:
+                        force_restart: bool = False,
+                        request_prefix: Optional[str] = None) -> dict[str, Any]:
         """Apply a full condition while minimizing restarts (task §11).
 
         ``requested`` keys (all optional): ``bandwidthMHz``, ``txGainDb``,
@@ -255,6 +329,7 @@ class OaiClient:
         never restarted".
         """
         results: dict[str, Any] = {}
+        operation_id = self.new_request_id(request_prefix, "apply")
         needs_restart = False
 
         def _maybe_restart(resp: dict) -> None:
@@ -263,20 +338,25 @@ class OaiClient:
                 needs_restart = True
 
         if requested.get("bandwidthMHz") is not None:
-            r = self.gnb_bandwidth(int(requested["bandwidthMHz"]), restart=False)
+            r = self.gnb_bandwidth(int(requested["bandwidthMHz"]), restart=False,
+                                   request_id=f"{operation_id}-bandwidth")
             results["bandwidth"] = r
             _maybe_restart(r)
         if requested.get("frequencyMHz") is not None:
-            r = self.gnb_frequency(float(requested["frequencyMHz"]), restart=False)
+            r = self.gnb_frequency(float(requested["frequencyMHz"]), restart=False,
+                                   request_id=f"{operation_id}-frequency")
             results["frequency"] = r
             _maybe_restart(r)
         if requested.get("txGainDb") is not None or requested.get("rxGainDb") is not None:
-            r = self.gnb_gains(float(requested.get("txGainDb", 60)), float(requested.get("rxGainDb", 40)), restart=False)
+            r = self.gnb_gains(float(requested.get("txGainDb", 60)), float(requested.get("rxGainDb", 40)),
+                               restart=False, request_id=f"{operation_id}-gains")
             results["gains"] = r
             _maybe_restart(r)
         if requested.get("puschTargetMode") is not None:
             x10 = requested.get("puschTargetSnrX10")
-            r = self.gnb_pusch_target_snr(requested["puschTargetMode"], x10, restart=False)
+            r = self.gnb_pusch_target_snr(
+                requested["puschTargetMode"], x10, restart=False,
+                request_id=f"{operation_id}-pusch-target")
             results["puschTarget"] = r
             _maybe_restart(r)
         if requested.get("schedulerMode") is not None:
@@ -284,6 +364,7 @@ class OaiClient:
                 requested["schedulerMode"],
                 mcs=requested.get("mcs"), qm=requested.get("qm"), prb=requested.get("nPrb"),
                 restart=False,
+                request_id=f"{operation_id}-scheduler",
             )
             results["ulScheduler"] = r
             _maybe_restart(r)
@@ -291,7 +372,8 @@ class OaiClient:
         if needs_restart or force_restart:
             # Objective before-evidence: the gNB process start timestamp.
             before = self._gnb_started_at() if force_restart else None
-            r = self.gnb_service("restart")
+            r = self.gnb_service(
+                "restart", request_id=f"{operation_id}-restart")
             results["restart"] = r
             rid = self.extract_request_id(r)
             prog = self.wait_for_restart(rid, timeout_s=restart_timeout_s, on_update=on_update)
@@ -344,7 +426,8 @@ class OaiClient:
             time.sleep(poll_s)
         return False, after, running
 
-    def ensure_gnb_running(self, timeout_s: float = 300.0, wait_ue: bool = True) -> bool:
+    def ensure_gnb_running(self, timeout_s: float = 300.0, wait_ue: bool = True,
+                           request_prefix: Optional[str] = None) -> bool:
         """Start the gNB if it is stopped, then (optionally) wait until gNB
         running + UE in-sync (research collection fresh).
 
@@ -355,7 +438,8 @@ class OaiClient:
         st = self.status()
         if not (st.gnb and st.gnb.running):
             try:
-                resp = self.gnb_service("start")
+                resp = self.gnb_service(
+                    "start", request_id=self.new_request_id(request_prefix, "start"))
                 rid = self.extract_request_id(resp)
                 try:
                     self.wait_for_restart(rid, timeout_s=timeout_s)
@@ -373,8 +457,7 @@ class OaiClient:
             st = self.status()
             if st.gnb and st.gnb.running:
                 try:
-                    ues = self.research_ues()
-                    if ues.collection and ues.collection.available and not ues.collection.stale and ues.ues:
+                    if self.fresh_ues():
                         return True
                 except Exception:
                     pass

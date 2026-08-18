@@ -184,18 +184,13 @@ class ExperimentService : Service() {
 
         val phase = AgentState.runEngine.update(elapsedNs) { marker -> recordMarker(plan, marker) }
 
-        // workload control: start high-traffic uplink when we enter the LOADED
-        // phase, stop whenever we leave it (idle before / idle tail after /
-        // abort). Matches the platform plan: idle → loaded → idle.
+        // Traffic is owned by OAI's shared NetworkTest session. The PC follows
+        // this phase over the 5G Agent channel and starts/stops the single
+        // shared session, so Web UI, external clients and this Run agree.
         val wl = workload
-        if (wl != null && AgentState.runEngine.state == com.xjtlu.energyagent.run.RunEngine.State.RUNNING) {
-            val p = (phase ?: "").uppercase()
-            if (p == "LOADED" && wl.mode == WorkloadEngine.Mode.IDLE) {
-                startWorkloadIfNeeded()
-            } else if (p != "LOADED" && wl.mode != WorkloadEngine.Mode.IDLE) {
-                wl.stop()
-            }
-        }
+        val networkTestType = if (AgentState.nettestRunning)
+            "NETWORKTEST_${AgentState.nettestProtocol.uppercase()}_${AgentState.nettestDirection.uppercase()}"
+        else null
 
         val charging = battery["battery_status"] as? Int
         val statusBattery = charging
@@ -238,9 +233,11 @@ class ExperimentService : Service() {
             wifiState = confounders["wifi_state"] as? String,
             bluetoothState = confounders["bluetooth_state"] as? String,
             airplaneMode = confounders["airplane_mode"] as? Int,
-            workloadType = wl?.mode?.name,
-            workloadTargetMbps = wl?.targetMbps,
-            workloadActualMbps = wl?.actualUplinkMbps(),
+            workloadType = networkTestType ?: wl?.mode?.name,
+            workloadTargetMbps = if (AgentState.nettestRunning) AgentState.nettestTargetMbps else wl?.targetMbps,
+            // OAI telemetry is authoritative for NetworkTest actualMbps; the
+            // nc process is not charged to the app UID by Android TrafficStats.
+            workloadActualMbps = if (AgentState.nettestRunning) null else wl?.actualUplinkMbps(),
             appTxBytes = wl?.appUidTxBytes,
             appRxBytes = wl?.appUidRxBytes,
             sampleQualityFlags = null,
@@ -404,23 +401,6 @@ class ExperimentService : Service() {
                 Log.e(TAG, "recordDownlinkAck error", e)
             }
         }
-    }
-
-    private fun startWorkloadIfNeeded() {
-        // Server address comes from the phone's Settings dialog (Settings → 测试站),
-        // defaulting to the OAI external-DN sink. Verify reachability there with
-        // the "测试连通" button before running a loaded phase.
-        val prefs = getSharedPreferences("agent_settings", Context.MODE_PRIVATE)
-        val host = prefs.getString("server_host", "192.168.70.129") ?: "192.168.70.129"
-        val port = prefs.getInt("server_port", 5201)
-        // UL target from the PC plan (template's ulTrafficMbps) wins; fall back
-        // to the local settings value. >= threshold → saturation (blast UDP).
-        val planMbps = AgentState.currentPlan?.ulTrafficMbps ?: 0.0
-        val mbps = if (planMbps > 0.0) planMbps else prefs.getFloat("target_mbps", 5.0f).toDouble()
-        val mode = if (mbps >= com.xjtlu.energyagent.run.ExperimentPlan.UL_SATURATION_THRESHOLD_MBPS)
-            WorkloadEngine.Mode.UL_SATURATION else WorkloadEngine.Mode.UL_CBR
-        Log.i(TAG, "startWorkload $mode ${mbps}Mbps -> $host:$port")
-        workload?.start(mode, mbps, host, port)
     }
 
     private fun noSignalSeconds(): Long {

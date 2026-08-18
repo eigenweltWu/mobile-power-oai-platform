@@ -217,6 +217,17 @@ CREATE TABLE IF NOT EXISTS oai_config (
     sha256 TEXT
 );
 
+CREATE TABLE IF NOT EXISTS oai_configuration_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    event_key TEXT NOT NULL,
+    request_id TEXT,
+    ts_utc TEXT,
+    event_json TEXT NOT NULL,
+    raw_json_path TEXT,
+    UNIQUE(run_id, event_key)
+);
+
 CREATE TABLE IF NOT EXISTS files (
     file_path TEXT PRIMARY KEY,
     size_bytes INTEGER,
@@ -286,6 +297,7 @@ CREATE INDEX IF NOT EXISTS idx_rc_samples_exp ON rc_samples(experiment_id, run_i
 CREATE INDEX IF NOT EXISTS idx_phone_samples_run ON phone_samples(run_id);
 CREATE INDEX IF NOT EXISTS idx_oai_snapshots_run ON oai_snapshots(run_id, ts_epoch_ns);
 CREATE INDEX IF NOT EXISTS idx_oai_events_run ON oai_events(run_id, ts_epoch_ns);
+CREATE INDEX IF NOT EXISTS idx_oai_configuration_events_run ON oai_configuration_events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_sync_run ON sync_anchors(run_id, direction);
 """
 

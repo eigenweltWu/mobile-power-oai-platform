@@ -66,6 +66,42 @@ def test_progress_done_semantics():
     assert p3.failed
 
 
+def test_fresh_ues_rejects_stale_and_filters_age(monkeypatch, tmp_path):
+    from experiment_platform.backend.config import Settings
+    from experiment_platform.backend.oai_client import OaiClient
+
+    client = OaiClient(Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web"))
+    payload = m.ResearchUes(
+        collection=m.Collection(stale=False),
+        ues=[m.ResearchUe(rnti="fresh", ageSeconds=5.0),
+             m.ResearchUe(rnti="old", ageSeconds=5.1)],
+    )
+    monkeypatch.setattr(client, "telemetry_ues", lambda: payload)
+    assert [ue.rnti for ue in client.fresh_ues()] == ["fresh"]
+
+
+def test_channel_cir_uses_only_cached_8787_scope_snapshot(monkeypatch, tmp_path):
+    from experiment_platform.backend.config import Settings
+    from experiment_platform.backend.oai_client import OaiClient
+
+    client = OaiClient(Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web"))
+    calls = []
+
+    def fake_get(path, **_params):
+        calls.append(path)
+        return {
+            "connection": "live", "ageSeconds": 0.4,
+            "updatedAt": "2026-08-18T08:00:00Z", "cirPointCount": 4096,
+            "cir": [{"sample": 0, "powerDb": -21.3}],
+        }
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    snapshot = client.channel_cir()
+    assert calls == ["/api/scope/snapshot"]
+    assert snapshot["ok"] is True
+    assert snapshot["nSamples"] == 4096
+
+
 def test_apply_condition_force_restart_always_restarts(monkeypatch, tmp_path):
     """force_restart=True must issue a REAL gnb restart even when every
     parameter write answers restarted:false (plain persist, no restart hint),
@@ -308,7 +344,7 @@ def test_gnb_service_transport_timeout_returns_request_id(monkeypatch, tmp_path)
 
     monkeypatch.setattr(client, "_client", SimpleNamespace(post=slow_post))
     resp = client.gnb_service("restart")
-    assert resp["ok"] is True
+    assert resp["ok"] is None and resp["pending"] is True
     assert resp["requestId"].startswith("pc-")
 
     # fast path: response arrives within the timeout — id echoed/attached back

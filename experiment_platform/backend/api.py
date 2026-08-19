@@ -960,6 +960,13 @@ _stirrer_agents: dict[str, StirrerAgent] = {}
 
 def _stirrer(simulate: bool = False, com_port: Optional[str] = None) -> StirrerAgent:
     selected = (com_port or "").upper()
+    if not simulate and not selected:
+        # resolve the saved port so connect(port=...) and later portless calls
+        # (status/disconnect) map to the same cached agent — otherwise the real
+        # helper process holding the COM port would leak and block reopen
+        saved = _settings.data_dir / "stirrer_port.txt"
+        if saved.exists():
+            selected = saved.read_text(encoding="utf-8").strip().upper()
     key = "sim" if simulate else f"hardware:{selected or 'saved'}"
     with _stirrer_lock:
         if key not in _stirrer_agents:

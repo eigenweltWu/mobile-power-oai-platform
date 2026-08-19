@@ -108,17 +108,33 @@ public static class StirrerAgent
                     if (steps != 0)
                     {
                         int speed = Math.Min(Math.Abs(steps), 2000);
-                        string result = Motor.RotateV(steps, speed, 138, 138);
+                        // Drive both paddle channels concurrently: RotateV/RotateH block
+                        // until their axis finishes, so run H on a worker thread and V on
+                        // the calling thread — the vendor driver and controller handle the
+                        // two axes independently (verified: two 500-step moves overlap).
+                        string hResult = null;
+                        Exception hError = null;
+                        var hThread = new System.Threading.Thread(delegate()
+                        {
+                            try { hResult = Motor.RotateH(steps, speed, 138, 138); }
+                            catch (Exception ex) { hError = ex; }
+                        });
+                        hThread.Start();
+                        string vResult = Motor.RotateV(steps, speed, 138, 138);
+                        hThread.Join();
+                        if (hError != null) throw hError;
                         _positionDeg += delta;
-                        var moved = Ok(null); moved["steps"] = steps; moved["driver_result"] = result; return Json(moved);
+                        var moved = Ok(null); moved["steps"] = steps;
+                        moved["driver_result"] = "V:" + vResult + " H:" + hResult; return Json(moved);
                     }
                     var unchanged = Ok(null); unchanged["steps"] = 0; return Json(unchanged);
                 }
                 case "stop":
                 {
                     if (!_opened) return Err("not_open");
-                    string result = Motor.StopVStirrer();
-                    var d = Ok(null); d["driver_result"] = result; return Json(d);
+                    string vStop = Motor.StopVStirrer();
+                    string hStop = Motor.StopHStirrer();
+                    var d = Ok(null); d["driver_result"] = "V:" + vStop + " H:" + hStop; return Json(d);
                 }
                 default:
                     return Err("unknown cmd: " + name);

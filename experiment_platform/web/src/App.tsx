@@ -5,6 +5,7 @@ import Timeline from './pages/Timeline';
 import Settings from './pages/Settings';
 import PhoneSync from './pages/PhoneSync';
 import Chamber from './pages/Chamber';
+import RsspCalibration from './pages/RsspCalibration';
 import { Badge, Card, Icon, ToastHost } from './components/ui';
 import { OperatorContextProvider, useOperatorContext } from './context';
 import { LanguageProvider, useLanguage } from './language';
@@ -58,7 +59,7 @@ function ContextBar() {
 
 function Advanced({ nav }: { nav: (path: string) => void }) {
   return <div className="stack"><div className="page-head"><div><div className="title">Advanced / Research Tools</div><div className="subtitle">Hardware diagnostics and administrative settings outside the normal Run workflow.</div></div></div>
-    <div className="grid cols-2"><Card title="RC Hardware" sub="Connection, manual jog, DLL, helper and simulation diagnostics."><button className="btn" onClick={() => nav('/advanced/rc-hardware')}>Open diagnostics</button></Card><Card title="System Settings" sub="OAI connectivity and administrative settings."><button className="btn" onClick={() => nav('/advanced/settings')}>Open settings</button></Card></div>
+    <div className="grid cols-2"><Card title="RSSP Calibration" sub="OAI-only RC power-control servo test with live calibration visualization."><button className="btn" onClick={() => nav('/advanced/rssp-calibration')}>Open calibration</button></Card><Card title="RC Hardware" sub="Connection, manual jog, DLL, helper and simulation diagnostics."><button className="btn" onClick={() => nav('/advanced/rc-hardware')}>Open diagnostics</button></Card><Card title="System Settings" sub="OAI connectivity and administrative settings."><button className="btn" onClick={() => nav('/advanced/settings')}>Open settings</button></Card></div>
   </div>;
 }
 
@@ -90,6 +91,7 @@ function AppShell() {
       break;
     case 'advanced':
       page = segments[1] === 'rc-hardware' ? <Chamber onBack={() => nav('/advanced')} />
+        : segments[1] === 'rssp-calibration' ? <RsspCalibration onBack={() => nav('/advanced')} />
         : segments[1] === 'settings' ? <Settings />
         : <Advanced nav={nav} />;
       break;

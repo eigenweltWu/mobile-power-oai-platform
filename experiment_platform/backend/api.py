@@ -952,6 +952,7 @@ def download_clip(clip_id: int):
 import threading as _threading
 
 from . import rc_flow as _rc
+from . import rssp_calibration as _rssp
 from .stirrer import StirrerAgent, StirrerError, list_com_ports
 
 _stirrer_lock = _threading.Lock()
@@ -976,6 +977,160 @@ def _stirrer(simulate: bool = False, com_port: Optional[str] = None) -> StirrerA
 
 def _runner() -> _rc.RcRunner:
     return _rc.get_runner(_settings, _db, _oai)
+
+
+def _rssp_runner() -> _rssp.RsspCalibrationRunner:
+    return _rssp.get_runner(_oai)
+
+
+def _diagnostic_gnb_status() -> dict:
+    status = _oai.status_raw()
+    controls = _oai.gnb_controls().model_dump(exclude_none=False)
+    telemetry = _oai.telemetry_ues_raw()
+    radio = status.get("radio") or {}
+    target = controls.get("puschTarget") or {}
+    scheduler = controls.get("ulScheduler") or {}
+    defaults = dict(templates.DEFAULT_OAI_CONFIGURATION)
+    configuration = {
+        "frequencyMHz": radio.get("frequencyMHz", defaults["frequencyMHz"]),
+        "bandwidthMHz": radio.get("bandwidthMHz", defaults["bandwidthMHz"]),
+        "txGainDb": radio.get("txGainDb", defaults["txGainDb"]),
+        "rxGainDb": radio.get("rxGainDb", defaults["rxGainDb"]),
+        "puschTargetMode": "manual",
+        "puschTargetSnrX10": (target.get("targetSnrX10")
+                                 if target.get("targetSnrX10") is not None
+                                 else defaults["puschTargetSnrX10"]),
+        "schedulerMode": scheduler.get("mode") or defaults["schedulerMode"],
+        "mcs": scheduler.get("mcs"), "qm": scheduler.get("qm"),
+        "nPrb": scheduler.get("nPrb"),
+    }
+    fresh = [ue for ue in telemetry.get("ues") or []
+             if ue.get("ageSeconds") is not None and float(ue["ageSeconds"]) <= 5.0]
+    return {
+        "ok": True, "gnb": status.get("gnb") or {}, "radio": radio,
+        "controls": controls, "configuration": configuration,
+        "supportedBandwidthMHz": radio.get("supportedBandwidthMHz") or [20, 40, 100],
+        "telemetry": {
+            "available": bool(fresh) and not (telemetry.get("collection") or {}).get("stale"),
+            "freshUeCount": len(fresh),
+            "ueRsrpDbm": max((float(ue["rsrpDbm"]) for ue in fresh
+                               if ue.get("rsrpDbm") is not None), default=None),
+            "puschRssiDbfs": max((float((ue.get("uplink") or {})["puschRssi"])
+                                   for ue in fresh
+                                   if (ue.get("uplink") or {}).get("puschRssi") is not None and
+                                   (ue.get("uplink") or {}).get("puschRssiUnit") == "dBFS"),
+                                  default=None),
+        },
+    }
+
+
+@app.get("/api/diagnostics/rssp-calibration/gnb")
+def rssp_calibration_gnb():
+    try:
+        return _diagnostic_gnb_status()
+    except OaiError as exc:
+        return _oai_error_response(exc)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, str(exc))
+
+
+@app.post("/api/diagnostics/rssp-calibration/gnb/configure")
+def rssp_calibration_gnb_configure(payload: dict = Body(...)):
+    if _rssp_runner().status().get("running"):
+        raise HTTPException(409, "stop RSSP calibration before changing gNB configuration")
+    allowed = {"frequencyMHz", "bandwidthMHz", "txGainDb", "rxGainDb",
+               "puschTargetMode", "puschTargetSnrX10", "schedulerMode",
+               "mcs", "qm", "nPrb"}
+    requested = {key: value for key, value in payload.items() if key in allowed}
+    try:
+        if float(requested.get("frequencyMHz", 0)) <= 0:
+            raise ValueError("frequencyMHz must be greater than 0")
+        if int(requested.get("bandwidthMHz", 0)) <= 0:
+            raise ValueError("bandwidthMHz must be greater than 0")
+        for key in ("txGainDb", "rxGainDb"):
+            if not 0 <= float(requested.get(key, -1)) <= 100:
+                raise ValueError(f"{key} must be between 0 and 100 dB")
+            requested[key] = round(float(requested[key]), 2)
+        if requested.get("puschTargetMode") != "manual":
+            raise ValueError("PUSCH Target supports manual mode only")
+        if not 0 <= int(requested.get("puschTargetSnrX10", -1)) <= 400:
+            raise ValueError("puschTargetSnrX10 must be between 0 and 400")
+        if requested.get("schedulerMode") not in {"auto", "manual"}:
+            raise ValueError("schedulerMode must be auto or manual")
+        if requested["schedulerMode"] == "manual":
+            if int(requested.get("qm", 0)) not in {2, 4, 6, 8}:
+                raise ValueError("manual scheduler Qm must be 2, 4, 6 or 8")
+            table2_ranges = {2: (0, 4), 4: (5, 10), 6: (11, 19), 8: (20, 27)}
+            low, high = table2_ranges[int(requested["qm"])]
+            if not low <= int(requested.get("mcs", -1)) <= high:
+                raise ValueError(f"Table 2 Qm={requested['qm']} requires MCS {low}..{high}")
+            if not 1 <= int(requested.get("nPrb", 0)) <= 273:
+                raise ValueError("manual scheduler N_PRB must be between 1 and 273")
+        result = _oai.apply_condition(
+            requested, force_restart=True, request_prefix="diagnostic-configure")
+        return {"ok": True, "operation": result, "status": _diagnostic_gnb_status()}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    except OaiError as exc:
+        return _oai_error_response(exc)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, str(exc))
+
+
+@app.post("/api/diagnostics/rssp-calibration/gnb/service")
+def rssp_calibration_gnb_service(payload: dict = Body(...)):
+    if _rssp_runner().status().get("running"):
+        raise HTTPException(409, "stop RSSP calibration before changing gNB service state")
+    action = str(payload.get("action") or "").lower()
+    if action not in {"start", "stop", "restart"}:
+        raise HTTPException(422, "action must be start, stop or restart")
+    try:
+        if action == "restart":
+            operation = _oai.apply_condition(
+                {}, force_restart=True, request_prefix="diagnostic-restart")
+        else:
+            operation = _oai.gnb_service(
+                action, request_id=_oai.new_request_id("diagnostic", action))
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                current = _oai.status_raw().get("gnb") or {}
+                if bool(current.get("running")) == (action == "start"):
+                    break
+                time.sleep(1.0)
+            else:
+                raise RuntimeError(f"gNB did not reach the requested {action} state")
+        return {"ok": True, "operation": operation, "status": _diagnostic_gnb_status()}
+    except OaiError as exc:
+        return _oai_error_response(exc)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, str(exc))
+
+
+@app.get("/api/diagnostics/rssp-calibration/status")
+def rssp_calibration_status():
+    return _rssp_runner().status()
+
+
+@app.post("/api/diagnostics/rssp-calibration/start")
+def rssp_calibration_start(payload: dict = Body(default={})):
+    terminal = {"completed", "stopped", "incomplete", "error"}
+    if any(campaign.state not in terminal for campaign in _runner().campaigns.values()):
+        raise HTTPException(409, "stop the active RC campaign before calibrating RSSP")
+    try:
+        status = _oai.status()
+        if not (status.gnb and status.gnb.running):
+            raise HTTPException(409, "gNB is not running; configure and start it first")
+        return _rssp_runner().start(payload)
+    except ValueError as e:
+        raise HTTPException(409 if "already running" in str(e) else 422, str(e))
+
+
+@app.post("/api/diagnostics/rssp-calibration/stop")
+def rssp_calibration_stop():
+    try:
+        return _rssp_runner().stop()
+    except ValueError as e:
+        raise HTTPException(409, str(e))
 
 
 @app.get("/api/stirrer/status")
@@ -1039,6 +1194,8 @@ def rc_campaign_start(payload: dict = Body(...)):
     the campaign then walks the stirrer, servos puschTargetSnrX10 to hold the
     receiver RSSP, and triggers one timed phone record window per step.
     """
+    if _rssp_runner().status().get("running"):
+        raise HTTPException(409, "stop the Advanced RSSP calibration before starting an RC campaign")
     try:
         return _runner().start(
             _flow(), payload["experimentId"],
@@ -1059,6 +1216,16 @@ def rc_campaign_stop(payload: dict = Body(...)):
         return _runner().stop(payload["experimentId"])
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+
+@app.post("/api/rc/campaign/resume")
+def rc_campaign_resume(payload: dict = Body(...)):
+    try:
+        return _runner().resume_after_configuration(payload["experimentId"])
+    except KeyError:
+        raise HTTPException(422, "experimentId is required")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
 
 
 @app.get("/api/rc/campaign/status")

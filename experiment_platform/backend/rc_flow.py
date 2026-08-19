@@ -37,6 +37,7 @@ from scipy.signal import find_peaks
 from .config import Settings
 from .db import Database
 from .oai_client import OaiClient
+from .rssp_calibration import average_measurement, proportional_target_x10, read_rssp_db
 from .stirrer import StirrerAgent, StirrerError
 
 
@@ -313,12 +314,11 @@ class RcConfig:
         "settle_s": 8.0,          # mechanical settle after the stirrer stops
         "target_rssp_db": -60.0,  # gNB PUSCH RSSI target (dBFS)
         "rssp_tol_db": 1.5,       # servo deadband
-        "pusch_step_x10": 10,     # ±1.0 dB target-SNR per servo iteration
-        "adjust_target_snr": 1,
-        "adjust_tx_gain": 0,
-        "tx_gain_step_db": 1.0,
+        "calibration_actuator": "target_snr",
+        "gain_alpha": 0.5,
         "max_servo_iters": 6,
-        "servo_settle_s": 5.0,    # TPC propagation wait between iterations
+        "listening_period_s": 90.0,
+        "settle_time_s": 5.0,
         "noise_frames": 20,       # 底噪标定帧数
         "noise_margin_db": 6.0,   # taps below floor+margin are noise
         "peak_prominence_db": 3.0,
@@ -339,12 +339,14 @@ class RcConfig:
         self.settle_s = float(c["settle_s"])
         self.target_rssp_db = float(c["target_rssp_db"])
         self.rssp_tol_db = float(c["rssp_tol_db"])
-        self.pusch_step_x10 = int(c["pusch_step_x10"])
-        self.adjust_target_snr = bool(int(c["adjust_target_snr"]))
-        self.adjust_tx_gain = bool(int(c["adjust_tx_gain"]))
-        self.tx_gain_step_db = float(c["tx_gain_step_db"])
+        raw = cfg or {}
+        self.calibration_actuator = str(raw.get("calibration_actuator") or (
+            "rx_gain" if not int(raw.get("adjust_target_snr", 1)) and
+            int(raw.get("adjust_tx_gain", 0)) else "target_snr"))
+        self.gain_alpha = float(c["gain_alpha"])
         self.max_servo_iters = int(c["max_servo_iters"])
-        self.servo_settle_s = float(c["servo_settle_s"])
+        self.listening_period_s = float(c["listening_period_s"])
+        self.settle_time_s = float(c["settle_time_s"])
         self.noise_frames = int(c["noise_frames"])
         self.noise_margin_db = float(c["noise_margin_db"])
         self.peak_prominence_db = float(c["peak_prominence_db"])
@@ -356,6 +358,14 @@ class RcConfig:
                                   ("SIMULATION" if legacy_simulation else "REAL_HARDWARE")).upper()
         if self.execution_mode not in {"REAL_HARDWARE", "SIMULATION"}:
             raise ValueError("execution_mode must be REAL_HARDWARE or SIMULATION")
+        if self.calibration_actuator not in {"rx_gain", "target_snr"}:
+            raise ValueError("calibration_actuator must be rx_gain or target_snr")
+        if not 0.01 <= self.gain_alpha <= 1.0:
+            raise ValueError("gain_alpha must be between 0.01 and 1.0")
+        if not 1.0 <= self.listening_period_s <= 300.0:
+            raise ValueError("listening_period_s must be between 1 and 300 seconds")
+        if not 0.0 <= self.settle_time_s <= 60.0:
+            raise ValueError("settle_time_s must be between 0 and 60 seconds")
         self.simulate_stirrer = self.execution_mode == "SIMULATION"
 
     def as_dict(self) -> dict:
@@ -365,11 +375,11 @@ class RcConfig:
             "step_deg": self.step_deg, "n_steps": self.n_steps,
             "dwell_s": self.dwell_s, "settle_s": self.settle_s,
             "target_rssp_db": self.target_rssp_db, "rssp_tol_db": self.rssp_tol_db,
-            "pusch_step_x10": self.pusch_step_x10, "max_servo_iters": self.max_servo_iters,
-            "adjust_target_snr": int(self.adjust_target_snr),
-            "adjust_tx_gain": int(self.adjust_tx_gain),
-            "tx_gain_step_db": self.tx_gain_step_db,
-            "servo_settle_s": self.servo_settle_s, "noise_frames": self.noise_frames,
+            "max_servo_iters": self.max_servo_iters,
+            "calibration_actuator": self.calibration_actuator,
+            "gain_alpha": self.gain_alpha,
+            "listening_period_s": self.listening_period_s,
+            "settle_time_s": self.settle_time_s, "noise_frames": self.noise_frames,
             "noise_margin_db": self.noise_margin_db,
             "peak_prominence_db": self.peak_prominence_db,
             "delay_window_start_ns": self.delay_window_start_ns,
@@ -394,6 +404,7 @@ class RcCampaign(threading.Thread):
         self.pc_port = pc_port
         self.cfg = cfg
         self._stop = threading.Event()
+        self._resume_after_configuration = threading.Event()
         # live state surfaced to the UI
         self.state = "preparing"
         self.samples_done = 0
@@ -413,6 +424,10 @@ class RcCampaign(threading.Thread):
         self.current_tx_gain_db: Optional[float] = None
         self.current_rx_gain_db: Optional[float] = None
         self.calibration_records: list[dict] = []
+        self.servo_failure_reason: Optional[str] = None
+        self.intervention_required = False
+        self.intervention_reason: Optional[str] = None
+        self.intervention_started_ms: Optional[int] = None
 
     # ---- helpers ------------------------------------------------------------ #
     def _say(self, stage: str, msg: str) -> None:
@@ -441,19 +456,45 @@ class RcCampaign(threading.Thread):
         measured uplink ``puschRssi`` and its unit, so use that authoritative
         receive-power observation instead.
         """
-        raw = self.oai.telemetry_ues_raw()
-        if (raw.get("collection") or {}).get("stale"):
-            return None
-        values = []
-        for ue in raw.get("ues") or []:
-            age = ue.get("ageSeconds")
-            if age is None or float(age) > 5.0:
-                continue
-            uplink = ue.get("uplink") or {}
-            value = uplink.get("puschRssi")
-            if value is not None and uplink.get("puschRssiUnit") == "dBFS":
-                values.append(float(value))
-        return max(values) if values else None
+        return read_rssp_db(self.oai)
+
+    def _average_rssp(self) -> Optional[tuple[float, int]]:
+        return average_measurement(
+            self.oai, lambda _oai: self._rssp_db(),
+            self.cfg.listening_period_s, self.cfg.settle_time_s, self._stop)
+
+    def _pause_for_configuration(self, reason: str) -> bool:
+        self.intervention_required = True
+        self.intervention_reason = reason
+        self.intervention_started_ms = _now_ms()
+        self.state = "awaiting_user_configuration"
+        self._resume_after_configuration.clear()
+        self._say("intervention", f"{reason}; configure/restart gNB, then continue with the next sample")
+        while not self._stop.is_set():
+            if self._resume_after_configuration.wait(0.5):
+                break
+        if self._stop.is_set():
+            return False
+        self.intervention_required = False
+        self.intervention_reason = None
+        self._resume_after_configuration.clear()
+        controls = self.oai.gnb_controls()
+        target = getattr(controls, "puschTarget", None)
+        current = getattr(target, "targetSnrX10", None)
+        if current is not None:
+            self.pusch_x10 = int(current)
+        actual = self.oai.telemetry_config_raw()
+        self.current_tx_gain_db = (float(actual["txGainDb"])
+                                   if actual.get("txGainDb") is not None else None)
+        self.current_rx_gain_db = (float(actual["rxGainDb"])
+                                   if actual.get("rxGainDb") is not None else None)
+        self._say("intervention", "user configuration accepted; current sample skipped")
+        return True
+
+    def resume_after_configuration(self) -> None:
+        if not self.intervention_required:
+            raise ValueError("RC campaign is not waiting for user configuration")
+        self._resume_after_configuration.set()
 
     def _phone(self):
         return self.flow._phone(self.serial, self.pc_port)
@@ -517,6 +558,7 @@ class RcCampaign(threading.Thread):
         UP, raising received power — so error>0 (too weak) → raise target.
         """
         log: list[dict] = []
+        self.servo_failure_reason = None
         # current setting from the OAI controls (authoritative)
         try:
             ctl = self.oai.gnb_controls()
@@ -531,18 +573,23 @@ class RcCampaign(threading.Thread):
         for it in range(self.cfg.max_servo_iters):
             if self._stop.is_set():
                 break
-            rssp = self._rssp_db()
+            observation = self._average_rssp()
+            rssp = observation[0] if observation else None
             self.last_rssp_db = rssp
             if rssp is None:
-                self._say("servo", "authoritative OAI PUSCH RSSI unavailable — skipping servo")
+                self.servo_failure_reason = "LISTENING_PERIOD_EXPIRED_WITHOUT_PUSCH_RSSI"
+                self._say("servo", "Listening Period expired without authoritative OAI PUSCH RSSI")
                 return log
             err = self.cfg.target_rssp_db - rssp
             point = {"ms": _now_ms(), "sample_index": getattr(self, "current_sample_index", 0),
                      "iter": it, "rssp_db": round(rssp, 2),
+                     "settle_sample_count": observation[1],
                      "target_rssp_db": self.cfg.target_rssp_db,
                      "err_db": round(err, 2), "pusch_x10": self.pusch_x10,
                      "target_snr_db": self.pusch_x10 / 10.0,
-                     "tx_gain_db": getattr(self, "current_tx_gain_db", None)}
+                     "tx_gain_db": getattr(self, "current_tx_gain_db", None),
+                     "rx_gain_db": getattr(self, "current_rx_gain_db", None),
+                     "calibration_actuator": self.cfg.calibration_actuator}
             log.append(point)
             if not hasattr(self, "calibration_records"):
                 self.calibration_records = []
@@ -551,18 +598,14 @@ class RcCampaign(threading.Thread):
             if abs(err) <= self.cfg.rssp_tol_db:
                 self._say("servo", f"RSSP {rssp:.1f} dB within ±{self.cfg.rssp_tol_db} dB of target")
                 return log
-            # scale the step: full step for large errors, half near the band
-            step = self.cfg.pusch_step_x10 if abs(err) > 2 * self.cfg.rssp_tol_db \
-                else max(1, self.cfg.pusch_step_x10 // 2)
-            new_x10 = self.pusch_x10 + (step if err > 0 else -step)
-            new_x10 = max(0, min(400, new_x10))  # 0..40 dB sanity clamp
-            self._say("servo", f"RSSP {rssp:.1f} dB (err {err:+.1f}) → pusch {self.pusch_x10 / 10:.1f}→{new_x10 / 10:.1f} dB")
             try:
-                # restart=false ALWAYS: a per-sample gNB restart (~40 s, UE
-                # re-attach) would destroy the sampled measurement cadence.
-                if not self.cfg.adjust_target_snr and not self.cfg.adjust_tx_gain:
-                    raise StirrerError("power calibration has no enabled actuator")
-                if self.cfg.adjust_target_snr:
+                if self.cfg.calibration_actuator == "target_snr":
+                    new_x10, requested_delta_db, delta_db = proportional_target_x10(
+                        self.pusch_x10, err, self.cfg.gain_alpha)
+                    self._say("servo", f"RSSP {rssp:.1f} dB (err {err:+.1f}) → "
+                              f"Target SNR {self.pusch_x10 / 10:.1f}→{new_x10 / 10:.1f} dB "
+                              f"(α={self.cfg.gain_alpha:g}, requested Δ={requested_delta_db:+.2f} dB, "
+                              f"OAI Δ={delta_db:+.2f} dB)")
                     r = self.oai.gnb_pusch_target_snr(
                         "manual", new_x10, restart=False,
                         request_id=self.oai.new_request_id(
@@ -574,24 +617,30 @@ class RcCampaign(threading.Thread):
                             "refusing to record an invalid servo sample")
                     self.pusch_x10 = new_x10
                     log[-1]["applied_x10"] = new_x10
+                    log[-1]["gain_alpha"] = self.cfg.gain_alpha
+                    log[-1]["requested_target_delta_db"] = requested_delta_db
+                    log[-1]["target_delta_db"] = delta_db
                     log[-1]["resp"] = str(r)[:200]
-                if self.cfg.adjust_tx_gain:
+                else:
                     if self.current_tx_gain_db is None or self.current_rx_gain_db is None:
                         raise StirrerError("TX/RX Gain unavailable for power calibration")
-                    gain = max(0.0, min(100.0, self.current_tx_gain_db +
-                                       (self.cfg.tx_gain_step_db if err > 0 else -self.cfg.tx_gain_step_db)))
+                    gain = round(max(0.0, min(100.0, self.current_rx_gain_db +
+                                             self.cfg.gain_alpha * err)), 2)
+                    self._say("servo", f"RSSP {rssp:.1f} dB (err {err:+.1f}) → "
+                              f"RX Gain {self.current_rx_gain_db:.1f}→{gain:.1f} dB; restarting gNB")
                     gain_result = self.flow.apply_calibration_gain(
                         self.experiment_id, self.run_id or self.experiment_id,
-                        self.serial, gain, self.current_rx_gain_db)
-                    self.current_tx_gain_db = gain
-                    log[-1]["applied_tx_gain_db"] = gain
+                        self.serial, self.current_tx_gain_db, gain)
+                    self.current_rx_gain_db = gain
+                    log[-1]["applied_rx_gain_db"] = gain
+                    log[-1]["gain_alpha"] = self.cfg.gain_alpha
                     log[-1]["gain_resp"] = str(gain_result)[:200]
             except Exception as e:
                 log[-1]["apply_error"] = str(e)[:200]
                 self._say("servo", f"pusch apply failed: {e}")
                 raise
-            time.sleep(self.cfg.servo_settle_s)
-        self._say("servo", "servo iterations exhausted — continuing with last setting")
+        self.servo_failure_reason = "MAX_ITERATIONS_WITHOUT_CONVERGENCE"
+        self._say("servo", "maximum iterations reached without convergence")
         return log
 
     def restore_pusch_target(self) -> None:
@@ -878,20 +927,24 @@ class RcCampaign(threading.Thread):
                 self.current_angle_deg = angle
                 self.state = "power_calibration"
                 servo_log = self.servo_pusch(stirrer)
-
-                if noise is None:
-                    self.state = "noise_capture"
-                    noise = self.calibrate_noise(stirrer)
-
-                self.state = "loaded_capture"
-                window = self.trigger_phone_window(plan)
-                if window is None:
-                    self._say("campaign", f"sample {i + 1} skipped (phone window failed)")
+                if self.servo_failure_reason:
+                    if not self._pause_for_configuration(self.servo_failure_reason):
+                        break
+                    self._say("campaign", f"sample {i + 1} skipped after user intervention")
                 else:
-                    self.state = "finalizing"
-                    self.finalize_sample(i + 1, angle, window, servo_log, noise)
-                    self.samples_done += 1
-                    self._say("campaign", f"sample {i + 1} stored @ {angle:.1f}°")
+                    if noise is None:
+                        self.state = "noise_capture"
+                        noise = self.calibrate_noise(stirrer)
+
+                    self.state = "loaded_capture"
+                    window = self.trigger_phone_window(plan)
+                    if window is None:
+                        self._say("campaign", f"sample {i + 1} skipped (phone window failed)")
+                    else:
+                        self.state = "finalizing"
+                        self.finalize_sample(i + 1, angle, window, servo_log, noise)
+                        self.samples_done += 1
+                        self._say("campaign", f"sample {i + 1} stored @ {angle:.1f}°")
 
                 if i + 1 < self.cfg.n_steps and not self._stop.is_set():
                     self.state = "stirrer_rotation"
@@ -918,6 +971,7 @@ class RcCampaign(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
+        self._resume_after_configuration.set()
 
 
 class RcRunner:
@@ -947,6 +1001,13 @@ class RcRunner:
         camp.stop()
         return {"ok": True, "state": "stopping"}
 
+    def resume_after_configuration(self, experiment_id: str) -> dict:
+        camp = self.campaigns.get(experiment_id)
+        if not camp:
+            raise ValueError("no RC campaign for this experiment")
+        camp.resume_after_configuration()
+        return {"ok": True, "state": "continuing_next_sample"}
+
     def status(self, experiment_id: str) -> dict:
         camp = self.campaigns.get(experiment_id)
         if not camp:
@@ -965,7 +1026,11 @@ class RcRunner:
             "noise_floor_db": camp.noise_floor_db,
             "current_sample_index": camp.current_sample_index,
             "current_tx_gain_db": camp.current_tx_gain_db,
+            "current_rx_gain_db": camp.current_rx_gain_db,
             "calibration_records": camp.calibration_records,
+            "intervention_required": camp.intervention_required,
+            "intervention_reason": camp.intervention_reason,
+            "intervention_started_ms": camp.intervention_started_ms,
             "error": camp.error,
             "config": camp.cfg.as_dict(),
             "log": camp.log[-40:],

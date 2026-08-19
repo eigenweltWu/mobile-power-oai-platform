@@ -91,9 +91,10 @@ def _servo_campaign(runtime_applied: bool) -> RcCampaign:
     campaign.cfg = RcConfig({
         "target_rssp_db": 20,
         "rssp_tol_db": 1,
-        "pusch_step_x10": 10,
+        "gain_alpha": 0.1,
         "max_servo_iters": 1,
-        "servo_settle_s": 0,
+        "listening_period_s": 1,
+        "settle_time_s": 0,
     })
     campaign._stop = threading.Event()
     campaign.run_id = "R1"
@@ -114,6 +115,70 @@ def test_servo_reads_nested_target_and_requires_hot_apply():
         "manual", 190, restart=False, request_id="R1-rc-1-servo-1-id")
     assert campaign.pusch_x10 == 190
     assert log[0]["pusch_x10"] == 200
+    assert log[0]["gain_alpha"] == 0.1
+    assert log[0]["requested_target_delta_db"] == -1.0
+    assert log[0]["target_delta_db"] == -1.0
+    assert campaign.servo_failure_reason == "MAX_ITERATIONS_WITHOUT_CONVERGENCE"
+
+
+def test_servo_can_adjust_rx_gain_instead_of_target_snr():
+    campaign = _servo_campaign(runtime_applied=True)
+    campaign.cfg = RcConfig({
+        "calibration_actuator": "rx_gain", "target_rssp_db": 20,
+        "rssp_tol_db": 1, "gain_alpha": 0.33, "max_servo_iters": 1,
+        "listening_period_s": 1, "settle_time_s": 0,
+    })
+    campaign.flow = Mock()
+    campaign.flow.apply_calibration_gain.return_value = {"ok": True}
+    campaign.experiment_id = "RC1"
+    campaign.serial = "UE1"
+    campaign.current_tx_gain_db = 60
+    campaign.current_rx_gain_db = 40
+    campaign._rssp_db = lambda: 30.03
+
+    log = campaign.servo_pusch(Mock())
+
+    campaign.flow.apply_calibration_gain.assert_called_once_with(
+        "RC1", "R1", "UE1", 60, 36.69)
+    campaign.oai.gnb_pusch_target_snr.assert_not_called()
+    assert campaign.current_rx_gain_db == 36.69
+    assert log[0]["applied_rx_gain_db"] == 36.69
+
+
+def test_servo_requests_intervention_when_listening_period_expires():
+    campaign = _servo_campaign(runtime_applied=True)
+    campaign._average_rssp = lambda: None
+
+    assert campaign.servo_pusch(Mock()) == []
+    assert campaign.servo_failure_reason == "LISTENING_PERIOD_EXPIRED_WITHOUT_PUSCH_RSSI"
+
+
+def test_user_configuration_resumes_paused_campaign():
+    campaign = RcCampaign.__new__(RcCampaign)
+    campaign._stop = threading.Event()
+    campaign._resume_after_configuration = threading.Event()
+    campaign.intervention_required = False
+    campaign.intervention_reason = None
+    campaign.intervention_started_ms = None
+    campaign.log = []
+    campaign.oai = Mock()
+    campaign.oai.gnb_controls.return_value = SimpleNamespace(
+        puschTarget=SimpleNamespace(targetSnrX10=270))
+    campaign.oai.telemetry_config_raw.return_value = {"txGainDb": 63, "rxGainDb": 42}
+    outcome = []
+    worker = threading.Thread(target=lambda: outcome.append(
+        campaign._pause_for_configuration("MAX_ITERATIONS_WITHOUT_CONVERGENCE")))
+
+    worker.start()
+    assert campaign._resume_after_configuration.wait(0.01) is False
+    assert campaign.intervention_required is True
+    campaign.resume_after_configuration()
+    worker.join(1)
+
+    assert outcome == [True]
+    assert campaign.intervention_required is False
+    assert campaign.pusch_x10 == 270
+    assert campaign.current_tx_gain_db == 63
 
 
 def test_servo_rejects_config_only_update():

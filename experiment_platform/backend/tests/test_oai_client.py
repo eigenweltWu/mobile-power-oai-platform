@@ -102,6 +102,21 @@ def test_channel_cir_uses_only_cached_8787_scope_snapshot(monkeypatch, tmp_path)
     assert snapshot["nSamples"] == 4096
 
 
+def test_gain_control_is_limited_to_hundredth_db(monkeypatch, tmp_path):
+    from experiment_platform.backend.config import Settings
+    from experiment_platform.backend.oai_client import OaiClient
+
+    client = OaiClient(Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web"))
+    sent = {}
+    monkeypatch.setattr(client, "_post", lambda path, payload: sent.update(
+        {"path": path, "payload": payload}) or {"ok": True})
+
+    client.gnb_gains(60.009, 40.006, restart=True, request_id="precision")
+
+    assert sent["payload"]["txGainDb"] == 60.01
+    assert sent["payload"]["rxGainDb"] == 40.01
+
+
 def test_apply_condition_force_restart_always_restarts(monkeypatch, tmp_path):
     """force_restart=True must issue a REAL gnb restart even when every
     parameter write answers restarted:false (plain persist, no restart hint),

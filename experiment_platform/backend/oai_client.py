@@ -254,7 +254,8 @@ class OaiClient:
     def gnb_gains(self, tx_gain_db: float, rx_gain_db: float, restart: bool,
                   request_id: Optional[str] = None) -> dict:
         return self._post("/api/gnb/gains", self._with_request_id(
-            {"txGainDb": tx_gain_db, "rxGainDb": rx_gain_db, "restart": restart}, request_id))
+            {"txGainDb": round(tx_gain_db, 2), "rxGainDb": round(rx_gain_db, 2),
+             "restart": restart}, request_id))
 
     def gnb_pusch_target_snr(self, mode: str, pusch_target_snr_x10: Optional[int], restart: bool,
                              request_id: Optional[str] = None) -> dict:

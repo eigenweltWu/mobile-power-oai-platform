@@ -19,6 +19,71 @@ const zh: Record<string, string> = {
   'RC Hardware': 'RC 硬件', 'System Settings': '系统设置', 'Open diagnostics': '打开诊断',
   'Open settings': '打开设置', 'Connection, manual jog, DLL, helper and simulation diagnostics.': '连接、手动点动、DLL、辅助程序与仿真诊断。',
   'OAI connectivity and administrative settings.': 'OAI 连接与管理设置。',
+  'RSSP Calibration': 'RSSP 校准', 'Open calibration': '打开校准',
+  'OAI-only RC power-control servo test with live calibration visualization.': '仅依赖 OAI 的 RC 功率控制伺服测试，并实时可视化校准过程。',
+  'RSSP Calibration Diagnostic': 'RSSP 校准诊断',
+  'Independent OAI/gNB configuration and receive-power calibration workspace.': '独立的 OAI/gNB 配置与接收功率校准工作区。',
+  'gNB State': 'gNB 状态', 'UE Telemetry': 'UE 遥测', 'FRESH': '新鲜',
+  'fresh UE(s)': '个新鲜 UE',
+  'gNB Startup Configuration': 'gNB 启动配置',
+  'PUSCH Target · Manual': 'PUSCH 目标值 · 手动',
+  'MCS Table 2 only': '仅使用 MCS Table 2',
+  'Gain α': 'Gain α', 'ΔGain = α × error': 'ΔGain = α × 误差',
+  'Control α': '控制 α', 'ΔActuator = α × error': 'Δ执行器 = α × 误差',
+  'Calculation 0.01 dB · OAI applies 0.1 dB': '计算精度 0.01 dB · OAI 应用精度 0.1 dB',
+  'Apply the complete OAI radio and uplink configuration with one verified gNB restart.': '应用完整的 OAI 无线与上行配置，并执行一次经过验证的 gNB 重启。',
+  'Apply configuration and restart': '应用配置并重启', 'Applying and restarting…': '正在应用配置并重启…',
+  'Apply configuration and start gNB': '应用配置并启动 gNB', 'Applying and starting…': '正在应用配置并启动…',
+  'Start gNB': '启动 gNB', 'Restart gNB': '重启 gNB', 'Stop gNB': '结束 gNB',
+  'gNB stopped.': 'gNB 已结束。', 'UE RSRP': 'UE RSRP', 'PUSCH RSSI': 'PUSCH RSSI',
+  'gNB receiver · live OAI telemetry': 'gNB 接收机 · 实时 OAI 遥测',
+  'gNB configuration applied and restart verified.': 'gNB 配置已应用，且重启验证通过。',
+  'UE RSRP is a UE-reported downlink measurement and is calibrated only with gNB TX Gain. PUSCH RSSI is a gNB receiver measurement and can be calibrated with RX Gain or PUSCH Target SNR. Gain changes require a verified gNB restart; Target SNR is applied at runtime. Initial calibration actuator settings are restored when the diagnostic ends.': 'UE RSRP 是由 UE 上报的下行测量值，只使用 gNB TX Gain 校准。PUSCH RSSI 是 gNB 接收机测量值，可使用 RX Gain 或 PUSCH Target SNR 校准。Gain 变化需要经过验证的 gNB 重启；Target SNR 在运行时应用。诊断结束时恢复校准执行器的初始设置。',
+  'Receive-Power Calibration Settings': '接收功率校准设置',
+  'Choose the physical measurement first; the page then exposes only compatible actuators.': '先选择物理测量量；页面随后只显示与其兼容的执行器。',
+  'Measurement': '测量量', 'Calibration actuator': '校准执行器',
+  'UE RSRP (dBm)': 'UE RSRP（dBm）', 'gNB PUSCH RSSI (dBFS)': 'gNB PUSCH RSSI（dBFS）',
+  'Target RSRP (dBm)': '目标 RSRP（dBm）', 'Target PUSCH RSSI (dBFS)': '目标 PUSCH RSSI（dBFS）',
+  'Gain step (dB)': 'Gain 步长（dB）', 'Start gNB before calibration.': '请在校准前启动 gNB。',
+  'Receive-power calibration started.': '接收功率校准已开始。',
+  'Stopping calibration and restoring the initial actuator setting.': '正在停止校准并恢复执行器初始设置。',
+  'TX / RX Gain': 'TX / RX Gain', 'Current calibration values': '当前校准值',
+  'PUSCH Target SNR': 'PUSCH Target SNR', 'Actuator': '执行器',
+  'Calibration / Actuator': '校准 / 执行器',
+  'One controlled variable per calibration': '每次校准只控制一个变量',
+  'Each point is one fresh OAI observation; hover shows Gain, Target SNR, error and applied actuator.': '每个点代表一次新鲜的 OAI 观测；悬停显示 Gain、Target SNR、误差和已应用的执行器。',
+  'Calibration points will appear after OAI returns the first fresh measurement.': 'OAI 返回首个新鲜测量值后将显示校准点。',
+  'Every observation records all three possible control variables, while only the selected actuator changes.': '每次观测都会记录三种可能的控制变量，但只有所选执行器发生变化。',
+  'Observed': '观测值',
+  'OAI connection, gNB restarts, calibration decisions and restore outcome.': 'OAI 连接、gNB 重启、校准决策与恢复结果。',
+  'OAI-only validation of the RC power-control servo, with live calibration visualization.': '仅依赖 OAI 验证 RC 功率控制伺服，并实时可视化校准过程。',
+  'This diagnostic needs only the OAI connection and fresh UE PUSCH RSSI. It does not start an Experiment, access the phone platform API, or use the chamber stirrer. Target SNR is applied without a gNB restart and the initial PUSCH policy is restored when the diagnostic ends.': '此诊断只需要 OAI 连接与新鲜的 UE PUSCH RSSI；不会启动实验、访问手机平台 API 或使用混响室搅拌器。Target SNR 无需重启 gNB 即可应用，诊断结束时会恢复初始 PUSCH 策略。',
+  'OAI Connection': 'OAI 连接', 'Control endpoint': '控制端点', 'Calibration State': '校准状态',
+  'observation(s)': '个观测点', 'Target': '目标', 'Initial': '初始',
+  'Calibration Settings': '校准设置',
+  'The same direction, deadband and adaptive step rule used by RC calibration.': '使用与 RC 校准相同的调节方向、死区和自适应步进规则。',
+  'Target RSSP (dBFS)': '目标 RSSP（dBFS）', 'Tolerance (dB)': '容差（dB）',
+  'Listening Period (s)': '监听周期（秒）', 'Maximum time without signal': '允许无信号的最长时间',
+  'Settle Time (s)': '稳定时间（秒）', 'Mean after signal appears': '信号出现后测量均值的时间窗口',
+  'Start calibration': '开始校准',
+  'Stop and restore': '停止并恢复', 'Iteration': '迭代',
+  'Each point is one OAI RSSP observation. Hover shows iteration, Target SNR, error and RSSP.': '每个点代表一次 OAI RSSP 观测；悬停可查看迭代次数、Target SNR、误差和 RSSP。',
+  'Calibration points will appear after OAI returns the first fresh PUSCH RSSI.': 'OAI 返回首个新鲜 PUSCH RSSI 后将显示校准点。',
+  'Calibration Observations': '校准观测记录',
+  'Runtime PUSCH Target SNR changes are shown explicitly; the initial policy is restored at completion.': '明确显示运行时 PUSCH Target SNR 的变化；完成后恢复初始策略。',
+  'Target RSSP': '目标 RSSP', 'Target SNR': 'Target SNR', 'Error': '误差', 'Applied Target SNR': '已应用 Target SNR',
+  'No observations yet.': '暂无观测记录。', 'Diagnostic Log': '诊断日志',
+  'OAI connection, calibration decisions and restore outcome.': 'OAI 连接、校准决策与恢复结果。',
+  'Stage': '阶段', 'Message': '消息', 'calibration': '校准', 'restore': '恢复', 'error': '错误',
+  'No diagnostic activity yet.': '暂无诊断活动。',
+  'OAI connected; RSSP calibration started.': 'OAI 已连接；RSSP 校准已开始。',
+  'Initial PUSCH target restored without gNB restart.': '已在不重启 gNB 的情况下恢复初始 PUSCH 目标。',
+  'Maximum iterations reached before convergence.': '达到最大迭代次数但尚未收敛。',
+  'RSSP calibration started.': 'RSSP 校准已开始。',
+  'Stopping RSSP calibration and restoring the initial PUSCH target.': '正在停止 RSSP 校准并恢复初始 PUSCH 目标。',
+  'CHECKING': '正在检查', 'CONNECTING': '正在连接', 'CALIBRATING': '正在校准', 'CONVERGED': '已收敛',
+  'RESTARTING': '正在重启', 'RESTORING': '正在恢复',
+  'EXHAUSTED': '达到迭代上限', 'STOPPING': '正在停止', 'IDLE': '空闲',
   'Page render failed': '页面渲染失败', 'Reload the page or return to Dashboard.': '请重新加载页面或返回仪表板。',
 
   'Run Control': 'Run 控制', 'Loading Run Control…': '正在加载 Run 控制…', 'Refresh': '刷新', 'Phone': '手机', 'Storage': '存储',
@@ -92,7 +157,20 @@ const zh: Record<string, string> = {
   'RC Chamber Workflow': 'RC 混响室工作流', 'Time Sync': '对时', 'Power Calibration': '功率校准',
   'Noise Capture': '噪声采集', 'Loaded Capture': '带载采集', 'Stirrer Rotation': '旋转搅拌器',
   'Clock exchanges': '对时交换次数', 'Maximum RTT': '最大 RTT', 'Tolerance': '容差',
-  'Max iterations': '最大迭代次数', 'Servo settle': '伺服稳定时间', 'Adjust Target SNR': '调整 Target SNR',
+  'Max iterations': '最大迭代次数', 'Listening Period': '监听周期', 'Settle Time': '稳定时间',
+  'seconds · maximum time without signal': '秒 · 允许无信号的最长时间',
+  'seconds · mean after signal appears': '秒 · 信号出现后的测量均值窗口',
+  'Adjust Target SNR': '调整 Target SNR',
+  'Each point is the mean measured during Settle Time after signal appears.': '每个点都是信号出现后在稳定时间内测量值的均值。',
+  'Each point is the RSSP mean measured during Settle Time after signal appears.': '每个点都是信号出现后在稳定时间内 RSSP 测量值的均值。',
+  'RC paused for user configuration': 'RC 已暂停，等待用户配置',
+  'The failed sample will be skipped. Apply a verified gNB restart, then the campaign continues with the next sample.': '失败样本将被跳过；应用配置并验证 gNB 重启后，实验从下一样本继续。',
+  'Calibration requires user configuration': '校准需要用户配置',
+  'MAX ITERATIONS WITHOUT CONVERGENCE': '达到最大迭代次数但未收敛',
+  'LISTENING PERIOD EXPIRED WITHOUT PUSCH RSSI': '监听周期结束但没有 PUSCH RSSI',
+  'Apply configuration, restart gNB and continue next sample': '应用配置、重启 gNB 并继续下一样本',
+  'Applying, restarting and verifying…': '正在应用、重启并验证…',
+  'gNB configuration verified; continuing with the next RC sample.': 'gNB 配置已验证；正在继续下一 RC 样本。',
   'Adjust TX Gain': '调整 TX Gain', 'Enabled': '启用', 'Disabled': '禁用', 'Noise frames': '噪声帧数',
   'Noise margin': '噪声裕量', 'Peak prominence': '峰值显著度', 'Delay window start': '时延窗口起点',
   'Delay window end': '时延窗口终点', 'Measurement dwell': '测量驻留时间', 'Mechanical settle': '机械稳定时间',
@@ -197,6 +275,7 @@ function translated(source: string): string {
       .replace(/^Configurations \((\d+)\)$/, '配置（$1）')
       .replace(/^History \((\d+)\)$/, '历史（$1）')
       .replace(/^Manual · (.+)$/, '手动 · $1')
+      .replace(/^Table 2 · (\d+)–(\d+)$/, 'Table 2 · $1–$2')
       .replace(/^(\d+) samples · REAL_HARDWARE$/, '$1 个样本 · 真实硬件')
       .replace(/^Created (.+) · used by (\d+) Run\(s\)$/, '创建于 $1 · 被 $2 个 Run 使用')
       .replace(/^(.+) FOUND$/, '$1 已找到')
@@ -206,6 +285,24 @@ function translated(source: string): string {
       .replace(/^(\d+) platform-only Experiments$/, '$1 个仅平台可见的实验')
       .replace(/^(\d+) phone-only Experiments$/, '$1 个仅手机可见的实验')
       .replace(/^Phase (\d+)$/, 'Phase $1')
+      .replace(/^(\d+) observation\(s\)$/, '$1 个观测点')
+      .replace(/^(\d+) fresh UE\(s\)$/, '$1 个新鲜 UE')
+      .replace(/^UE reported · (\d+) fresh UE\(s\)$/, 'UE 上报 · $1 个新鲜 UE')
+      .replace(/^(.+) · (\d+) observation\(s\)$/, '$1 · $2 个观测点')
+      .replace(/^gNB (start|stop|restart) completed\.$/, 'gNB $1 操作已完成。')
+      .replace(/^Waiting for fresh (UE RSRP|PUSCH RSSI) telemetry\.$/, '正在等待新鲜的 $1 遥测。')
+      .replace(/^Listening for fresh (UE RSRP|PUSCH RSSI) telemetry\.$/, '正在监听新鲜的 $1 遥测。')
+      .replace(/^(UE RSRP|PUSCH RSSI) \/ Target$/, '$1 / 目标值')
+      .replace(/^Target (UE RSRP|PUSCH RSSI)$/, '目标 $1')
+      .replace(/^Target ([-\d.]+) dBFS$/, '目标 $1 dBFS')
+      .replace(/^Initial (.+) · (.+)$/, '初始 $1 · $2')
+      .replace(/^Iteration (\d+)$/, '迭代 $1')
+      .replace(/^RSSP ([-\d.]+) dBFS is within ±([-\d.]+) dB of target\.$/, 'RSSP $1 dBFS 已处于目标值 ±$2 dB 范围内。')
+      .replace(/^RSSP ([-\d.]+) dBFS \(error ([+\-\d.]+)\) → Target SNR ([-\d.]+)→([-\d.]+) dB\.$/, 'RSSP $1 dBFS（误差 $2）→ Target SNR $3→$4 dB。')
+      .replace(/^OAI connected; (UE RSRP|PUSCH RSSI) calibration started\.$/, 'OAI 已连接；$1 校准已开始。')
+      .replace(/^(UE RSRP|PUSCH RSSI) ([-\d.]+) (dBm|dBFS) is within ±([-\d.]+) dB of target\.$/, '$1 $2 $3 已处于目标值 ±$4 dB 范围内。')
+      .replace(/^Initial TX\/RX Gain restored with a verified gNB restart\.$/, '已通过验证后的 gNB 重启恢复初始 TX/RX Gain。')
+      .replace(/^Restore failed: (.+)$/, '恢复失败：$1')
       .replace(/^Created (.+)$/, '创建于 $1');
   }
   return before + result + after;

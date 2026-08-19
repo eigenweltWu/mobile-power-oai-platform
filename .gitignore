@@ -3,10 +3,23 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# 仓库根目录的旧版/临时 Python 工具（正式后端位于 experiment_platform/backend）
+/*.py
+/scripts/*.py
+
 # 旧版 monitor.py 的运行时数据与工具（ADB/CIT/GPSTest 大文件，不提交）
 data/
 .tools/
 config.json
+/monitor.py
+/static/
+/start.ps1
+
+# 本地研究资料、过程日志与导出文档；仓库只保留正式项目 README/API 指南
+/*.md
+!/README.md
+/*.pdf
+/*.docx
 
 # 实验平台
 experiment_platform/data/

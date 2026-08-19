@@ -29,6 +29,8 @@ experiment_platform/web/dist/
 
 # 混响室厂商控制程序（76MB 第三方 SDK/DLL，仅本地参考）
 measurement system/
+/ReverbChamberMeasSys.sln
+/ReverbChamberMeasSys/
 
 # 临时脚本 / 提交信息文件
 .tmp_*

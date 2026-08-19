@@ -133,7 +133,7 @@ const zh: Record<string, string> = {
   'Connect': '连接', 'Disconnect': '断开',
   '← Advanced': '← 高级', 'Motor idle': '电机空闲', 'REAL HARDWARE': '真实硬件',
   'Read-only checks used by Run Control Preflight.': '供 Run 控制预检使用的只读检查。',
-  'FOUND': '已找到', 'Helper READY': '辅助程序已就绪', 'USB auto': 'USB 自动',
+  'FOUND': '已找到', 'Helper READY': '辅助程序已就绪', 'Select COM port': '选择 COM 口', 'COM port not selected': '未选择 COM 口',
   'Diagnostic connection only': '仅诊断连接', 'Session': '会话', 'CLOSED': '已关闭', 'OPEN': '已打开',
   'The selected COM port is saved and reused by RC Campaigns.': '所选 COM 口会保存并供 RC Campaign 重用。',
   'Connection checks and manual jog only. Workflow Preflight and Campaign execution remain in Run Control.': '此处仅执行连接检查与手动点动；工作流预检和 Campaign 执行位于 Run 控制。',

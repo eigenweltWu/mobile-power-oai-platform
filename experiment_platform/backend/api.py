@@ -980,7 +980,7 @@ def stirrer_status(simulate: bool = False, port: Optional[str] = None):
 
 @app.post("/api/stirrer/connect")
 def stirrer_connect(payload: dict = Body(default={})):
-    """Open the USB link to the stirrer controller (or start the virtual motor)."""
+    """Probe the stirrer serial port (or start the virtual motor)."""
     port = str(payload.get("port") or "").upper() or None
     if port and not port.startswith("COM"):
         raise HTTPException(422, "invalid COM port")

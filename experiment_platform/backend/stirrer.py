@@ -1,11 +1,9 @@
 """Stirrer motor control for the reverberation chamber (RC).
 
-The chamber's stirrer controller speaks the MT_API.dll protocol (USB,
-position mode, 3200 steps per degree — see ``measurement system/
-AntennaTurntableController/ASimpleDemo``). That DLL is 32-BIT, so a 64-bit
-Python cannot ctypes it directly; instead we compile (once, with the
-Windows-built-in .NET Framework csc) a tiny x86 helper EXE that P/Invokes
-MT_API.dll and answers JSON-line commands on stdin/stdout.
+The chamber controller is driven through ``StirrerDll.Stirrers``, matching
+the working ``ReverbChamberMeasSys`` job-queue path.  A tiny .NET helper keeps
+that vendor DLL and its synchronous serial calls outside the Python process
+and answers JSON-line commands on stdin/stdout.
 
 A ``simulated`` mode (no hardware) exists so the full RC campaign flow can
 be exercised outside the chamber: positions update virtually, moves finish
@@ -25,63 +23,33 @@ from typing import Any, Optional
 
 from .config import Settings
 
-STEPS_PER_DEG = 3200
+STEPS_PER_DEG = 50000 / 360
 
-# 32-bit x86 helper — the MT_API.dll it loads is 32-bit (PE machine 0x014C).
+# The vendor application runs 32-bit; keep the helper in the same runtime mode.
 _HELPER_CS = r"""
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Runtime.InteropServices;
+using System.IO.Ports;
 using System.Text;
-
-public class MT_API
-{
-    public const Int32 R_OK = 0;
-
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Init();
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_DeInit();
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Open_UART(String sCOM);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Close_UART();
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Open_USB();
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Close_USB();
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Check();
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Get_Axis_Num(ref Int32 pValue);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Set_Axis_Mode_Position(UInt16 AObj);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Set_Axis_Acc(UInt16 AObj, Int32 Value);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Set_Axis_Dec(UInt16 AObj, Int32 Value);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Set_Axis_Position_V_Max(UInt16 AObj, Int32 Value);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Set_Axis_Position_P_Target_Rel(UInt16 AObj, Int32 Value);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Set_Axis_Position_P_Target_Abs(UInt16 AObj, Int32 Value);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Set_Axis_Position_Stop(UInt16 AObj);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Set_Axis_Halt(UInt16 AObj);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Get_Axis_Software_P_Now(UInt16 AObj, ref Int32 pValue);
-    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
-    public static extern Int32 MT_Get_Axis_Status_Run(UInt16 AObj, ref Byte pRun);
-}
+using StirrerDll;
 
 public static class StirrerAgent
 {
-    private const double StepsPerDeg = 3200.0;
+    private const double StepsPerDeg = 50000.0 / 360.0;
+    private static readonly Stirrers Motor = new Stirrers();
     private static bool _opened = false;
-    private static bool _uart = false;
+    private static string _port = "";
+    private static double _positionDeg = 0.0;
+
+    private static void ProbePort(string port)
+    {
+        using (var serial = new SerialPort(port, 9600, Parity.Even, 8, StopBits.One))
+        {
+            serial.RtsEnable = false;
+            serial.Open();
+        }
+    }
 
     private static string Cmd(string name, Dictionary<string, object> args)
     {
@@ -93,73 +61,60 @@ public static class StirrerAgent
                 case "open":
                     if (!_opened)
                     {
-                        int rc = MT_API.MT_Init();
-                        if (rc != MT_API.R_OK) return Err("MT_Init rc=" + rc);
                         object portValue;
                         string port = args.TryGetValue("port", out portValue) ? Convert.ToString(portValue) : "";
-                        _uart = !String.IsNullOrEmpty(port);
-                        rc = _uart ? MT_API.MT_Open_UART(port) : MT_API.MT_Open_USB();
-                        if (rc != MT_API.R_OK) { MT_API.MT_DeInit(); return Err((_uart ? "MT_Open_UART " + port : "MT_Open_USB") + " rc=" + rc + " (controller attached?)"); }
+                        if (String.IsNullOrWhiteSpace(port)) return Err("COM port is required");
+                        ProbePort(port);
+                        _port = port;
+                        Motor.PortNameString = port;
                         _opened = true;
-                        int axes = 0;
-                        MT_API.MT_Get_Axis_Num(ref axes);
-                        MT_API.MT_Set_Axis_Mode_Position(0);
                     }
-                    return Json(Ok(null));
+                    var opened = Ok(null); opened["port"] = _port; opened["transport"] = "serial"; return Json(opened);
                 case "close":
-                    if (_opened) { try { if (_uart) MT_API.MT_Close_UART(); else MT_API.MT_Close_USB(); } catch { } try { MT_API.MT_DeInit(); } catch { } _opened = false; _uart = false; }
+                    _opened = false;
                     return Json(Ok(null));
                 case "check":
                 {
                     if (!_opened) return Err("not_open");
-                    int rc = MT_API.MT_Check();
-                    var d = Ok(null); d["check"] = (rc == MT_API.R_OK); d["rc"] = rc; return Json(d);
+                    try { ProbePort(_port); var d = Ok(null); d["check"] = true; d["rc"] = 0; return Json(d); }
+                    catch (Exception ex) { var d = Ok(null); d["check"] = false; d["rc"] = -1; d["detail"] = ex.Message; return Json(d); }
                 }
                 case "position":
                 {
                     if (!_opened) return Err("not_open");
-                    Int32 pos = 0;
-                    int rc = MT_API.MT_Get_Axis_Software_P_Now(0, ref pos);
-                    if (rc != MT_API.R_OK) return Err("MT_Get_Axis_Software_P_Now rc=" + rc);
-                    var d = Ok(null); d["steps"] = pos; d["deg"] = Math.Round(pos / StepsPerDeg, 3); return Json(d);
+                    var d = Ok(null); d["steps"] = (int)Math.Round(_positionDeg * StepsPerDeg); d["deg"] = Math.Round(_positionDeg, 3); return Json(d);
                 }
                 case "running":
                 {
                     if (!_opened) return Err("not_open");
-                    Byte run = 0;
-                    int rc = MT_API.MT_Get_Axis_Status_Run(0, ref run);
-                    if (rc != MT_API.R_OK) return Err("MT_Get_Axis_Status_Run rc=" + rc);
-                    var d = Ok(null); d["running"] = (run == 1); return Json(d);
+                    var d = Ok(null); d["running"] = false; return Json(d);
                 }
                 case "set_params":
                 {
                     if (!_opened) return Err("not_open");
-                    double speed = Argd(args, "speed_deg_s", 20.0);
-                    double acc = Argd(args, "accel_deg_s2", 40.0);
-                    double dec = Argd(args, "dec_deg_s2", 40.0);
-                    int r1 = MT_API.MT_Set_Axis_Acc(0, Deg(acc));
-                    int r2 = MT_API.MT_Set_Axis_Dec(0, Deg(dec));
-                    int r3 = MT_API.MT_Set_Axis_Position_V_Max(0, Deg(speed));
-                    var d = Ok(null); d["acc_rc"] = r1; d["dec_rc"] = r2; d["vmax_rc"] = r3; return Json(d);
+                    return Json(Ok(null));
                 }
                 case "move_rel":
                 case "move_abs":
                 {
                     if (!_opened) return Err("not_open");
-                    double deg = Argd(args, "deg", 0.0);
-                    int steps = (int)Math.Truncate(deg * StepsPerDeg);
-                    int rc = name == "move_rel"
-                        ? MT_API.MT_Set_Axis_Position_P_Target_Rel(0, steps)
-                        : MT_API.MT_Set_Axis_Position_P_Target_Abs(0, steps);
-                    if (rc != MT_API.R_OK) return Err("move rc=" + rc);
-                    var d = Ok(null); d["steps"] = steps; return Json(d);
+                    double requested = Argd(args, "deg", 0.0);
+                    double delta = name == "move_rel" ? requested : requested - _positionDeg;
+                    int steps = (int)Math.Round(delta * StepsPerDeg);
+                    if (steps != 0)
+                    {
+                        int speed = Math.Min(Math.Abs(steps), 2000);
+                        string result = Motor.RotateV(steps, speed, 138, 138);
+                        _positionDeg += delta;
+                        var moved = Ok(null); moved["steps"] = steps; moved["driver_result"] = result; return Json(moved);
+                    }
+                    var unchanged = Ok(null); unchanged["steps"] = 0; return Json(unchanged);
                 }
                 case "stop":
                 {
                     if (!_opened) return Err("not_open");
-                    int rc = MT_API.MT_Set_Axis_Position_Stop(0);
-                    if (rc != MT_API.R_OK) MT_API.MT_Set_Axis_Halt(0);
-                    return Json(Ok(null));
+                    string result = Motor.StopVStirrer();
+                    var d = Ok(null); d["driver_result"] = result; return Json(d);
                 }
                 default:
                     return Err("unknown cmd: " + name);
@@ -168,7 +123,6 @@ public static class StirrerAgent
         catch (Exception ex) { return Err(ex.Message); }
     }
 
-    private static int Deg(double deg) { return (int)Math.Truncate(deg * StepsPerDeg); }
     private static double Argd(Dictionary<string, object> a, string k, double def)
     { object v; return (a != null && a.TryGetValue(k, out v) && v != null) ? Convert.ToDouble(v) : def; }
 
@@ -177,6 +131,8 @@ public static class StirrerAgent
     {
         var d = new Dictionary<string, object>();
         if (string.IsNullOrEmpty(s)) return d;
+        s = s.Trim();
+        if (s.StartsWith("{") && s.EndsWith("}")) s = s.Substring(1, s.Length - 2);
         foreach (string part in s.Split(','))
         {
             int c = part.IndexOf(':');
@@ -244,14 +200,16 @@ _CSC_CANDIDATES = [
 ]
 
 
-def find_mt_api_dll() -> Optional[Path]:
-    """Locate MT_API.dll — vendored copy first, then the measurement-system tree."""
+def find_stirrer_dll() -> Optional[Path]:
+    """Locate the vendor StirrerDll.dll used by ReverbChamberMeasSys."""
     root = Path(__file__).resolve().parents[2]
-    vendored = root / "experiment_platform" / "backend" / "vendor" / "MT_API.dll"
+    vendored = root / "experiment_platform" / "backend" / "vendor" / "StirrerDll.dll"
     if vendored.exists():
         return vendored
-    for cand in (root / "measurement system").rglob("MT_API.dll"):
-        return cand
+    reference_tree = root / "measurement system"
+    if reference_tree.exists():
+        for cand in reference_tree.rglob("StirrerDll.dll"):
+            return cand
     return None
 
 
@@ -309,26 +267,25 @@ class StirrerAgent:
     def _exe_path(self) -> Path:
         return self.tools_dir / "StirrerAgent.exe"
 
-    def _stage_mt_api_dll(self) -> None:
-        """Copy the vendored MT_API.dll next to the helper so P/Invoke finds it."""
-        dll = find_mt_api_dll()
+    def _stage_stirrer_dll(self) -> Path:
+        """Copy StirrerDll.dll next to the helper and return the staged path."""
+        dll = find_stirrer_dll()
         if not dll:
-            raise StirrerError("MT_API.dll not found (measurement system not installed?)")
-        dst = self.tools_dir / "MT_API.dll"
+            raise StirrerError("StirrerDll.dll not found")
+        dst = self.tools_dir / "StirrerDll.dll"
         if not dst.exists() or dst.stat().st_size != dll.stat().st_size:
             shutil.copy2(dll, dst)
+        return dst
 
     def ensure_helper(self, force: bool = False) -> Path:
-        """Compile the x86 helper (once) and stage MT_API.dll next to it."""
+        """Compile the helper once and stage its vendor assembly."""
         self.tools_dir.mkdir(parents=True, exist_ok=True)
+        dll = self._stage_stirrer_dll()
         exe = self._exe_path()
         src_hash = hashlib.sha256(_HELPER_CS.encode("utf-8")).hexdigest()[:16]
         hash_file = self.tools_dir / "StirrerAgent.srcsha"
         if (not force and exe.exists() and hash_file.exists()
                 and hash_file.read_text(encoding="utf-8").strip() == src_hash):
-            # Cached exe — still make sure the DLL is staged (it may have been
-            # deleted or never copied by an earlier run).
-            self._stage_mt_api_dll()
             return exe
         csc = next((c for c in _CSC_CANDIDATES if Path(c).exists()), None)
         if not csc:
@@ -336,12 +293,11 @@ class StirrerAgent:
         cs = self.tools_dir / "StirrerAgent.cs"
         cs.write_text(_HELPER_CS, encoding="utf-8")
         cmd = [csc, "/nologo", "/platform:x86", "/optimize+",
-               "/out:" + str(exe), str(cs)]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+               "/reference:" + str(dll), "/out:" + str(exe), str(cs)]
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=120)
         if r.returncode != 0:
             raise StirrerError(f"csc failed: {r.stderr[:500]}")
         hash_file.write_text(src_hash, encoding="utf-8")
-        self._stage_mt_api_dll()
         return exe
 
     def _spawn(self) -> None:
@@ -448,11 +404,9 @@ class StirrerAgent:
         if not r.get("ok"):
             self.last_error = r.get("error")
             return r
-        # MT_Open_USB can "succeed" at the driver level with no controller
-        # attached — MT_Check is the real liveness probe.
         chk = self._request("check")
         if not chk.get("ok") or not chk.get("check"):
-            self.last_error = "controller not attached (MT_Check failed)"
+            self.last_error = chk.get("detail") or "stirrer COM port is unavailable"
             self.close()
             return {"ok": False, "error": self.last_error}
         self._opened = True
@@ -513,7 +467,7 @@ class StirrerAgent:
     def status(self) -> dict:
         st: dict[str, Any] = {"simulated": self.simulate, "opened": self._opened,
                               "com_port": self.com_port,
-                              "dll_found": find_mt_api_dll() is not None}
+                              "dll_found": find_stirrer_dll() is not None}
         try:
             exe = self._exe_path()
             st["exe_ready"] = exe.exists()

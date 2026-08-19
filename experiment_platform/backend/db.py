@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     flow TEXT,
     initial_oai_config TEXT,
     default_template_id INTEGER,
+    ac_template_enabled INTEGER NOT NULL DEFAULT 0,
+    ac_template_json TEXT,
     created_utc TEXT NOT NULL,
     schema_version INTEGER NOT NULL
 );
@@ -151,6 +153,7 @@ CREATE TABLE IF NOT EXISTS runs (
     alignment_json TEXT,
     started_utc_ms INTEGER, ended_utc_ms INTEGER,
     quality_status TEXT, quality_flags_json TEXT,
+    run_plan_json TEXT,
     FOREIGN KEY(experiment_id) REFERENCES experiments(experiment_id),
     FOREIGN KEY(condition_id) REFERENCES conditions(condition_id)
 );
@@ -315,7 +318,9 @@ class Database:
             self._conn.executescript(SCHEMA_DDL)
             # migration: add task fields to pre-existing experiments table
             for col, typ in (("purpose", "TEXT"), ("flow", "TEXT"), ("initial_oai_config", "TEXT"),
-                             ("default_template_id", "INTEGER")):
+                             ("default_template_id", "INTEGER"),
+                             ("ac_template_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                             ("ac_template_json", "TEXT")):
                 try:
                     self._conn.execute(f"ALTER TABLE experiments ADD COLUMN {col} {typ}")
                 except Exception:
@@ -329,7 +334,7 @@ class Database:
                           ("execution_mode", "TEXT NOT NULL DEFAULT 'REAL_HARDWARE'"),
                           ("simulation", "INTEGER NOT NULL DEFAULT 0"),
                           ("time_origin_type", "TEXT"), ("time_origin_utc_ms", "INTEGER"),
-                          ("alignment_json", "TEXT"))),
+                          ("alignment_json", "TEXT"), ("run_plan_json", "TEXT"))),
                 ("clips", (("updated_utc", "TEXT"), ("configuration_snapshot_json", "TEXT"),
                            ("execution_mode", "TEXT"), ("time_origin_type", "TEXT"),
                            ("time_origin_utc_ms", "INTEGER"), ("quality_status", "TEXT"),

@@ -7,6 +7,7 @@ import PhoneSync from './pages/PhoneSync';
 import Chamber from './pages/Chamber';
 import { Badge, Card, Icon, ToastHost } from './components/ui';
 import { OperatorContextProvider, useOperatorContext } from './context';
+import { LanguageProvider, useLanguage } from './language';
 
 class PageErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
   state = { error: null as Error | null };
@@ -48,7 +49,7 @@ function ContextBar() {
   return <div className="context-bar" aria-label="Current experiment and run context">
     <div><span>Experiment</span><b>{value.experimentId || '—'}</b></div>
     <div><span>Environment</span><b>{value.environment || '—'}</b></div>
-    <div><span>Configuration</span><b>{value.configurationName || '—'}</b></div>
+    <div><span>{value.environment === 'RC' ? 'Workflow' : 'Configuration'}</span><b>{value.configurationName || '—'}</b></div>
     <div><span>Run</span><b>{value.runId || '—'}</b></div>
     <div><span>Status</span>{value.status ? <Badge tone={value.status === 'RUNNING' ? 'warn' : value.status === 'COMPLETE' ? 'good' : 'muted'}>{value.status}</Badge> : <b>—</b>}</div>
     <div><span>Quality</span><b>{value.quality || '—'}</b></div>
@@ -62,6 +63,7 @@ function Advanced({ nav }: { nav: (path: string) => void }) {
 }
 
 function AppShell() {
+  const { language, setLanguage } = useLanguage();
   const [hash, nav] = useHashRoute();
   const pathPart = hash.split('?')[0];
   const segments = pathPart.replace(/^\/+/, '').split('/').filter(Boolean);
@@ -140,6 +142,7 @@ function AppShell() {
           </div>
           <div className="topbar-actions">
             <span className="live-dot">live</span>
+            <label className="language-switch"><span>Language</span><select aria-label="Language" value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh')}><option value="en">English</option><option value="zh">Chinese</option></select></label>
           </div>
         </header>
         <ContextBar />
@@ -151,5 +154,5 @@ function AppShell() {
 }
 
 export default function App() {
-  return <OperatorContextProvider><AppShell /></OperatorContextProvider>;
+  return <LanguageProvider><OperatorContextProvider><AppShell /></OperatorContextProvider></LanguageProvider>;
 }

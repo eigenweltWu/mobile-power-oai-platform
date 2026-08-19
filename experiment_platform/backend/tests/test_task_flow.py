@@ -649,6 +649,19 @@ def test_default_configuration_cannot_be_archived(tmp_path):
     db.close()
 
 
+def test_rc_experiment_exposes_one_workflow_without_configuration_variants(tmp_path):
+    flow, db, _oai, tid = _make_template_flow(tmp_path)
+    db.execute("UPDATE experiments SET environment='RC' WHERE experiment_id='EXP3'")
+
+    rows = flow.list_templates("EXP3")
+    assert len(rows) == 1
+    assert rows[0]["id"] == tid
+    assert rows[0]["name"] == "RC Workflow"
+    with pytest.raises(ValueError, match="one Workflow"):
+        flow.add_template("EXP3", "Another", {})
+    db.close()
+
+
 def test_start_experiment_restart_failure_marks_run_error(tmp_path):
     """A failed Start-owned restart marks the fresh Run as ERROR."""
     import pytest

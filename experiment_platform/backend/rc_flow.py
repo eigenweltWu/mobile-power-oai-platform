@@ -305,6 +305,8 @@ class RcConfig:
     """Per-campaign knobs (validated defaults — the UI can override each)."""
 
     DEFAULTS = {
+        "sync_exchanges": 3,
+        "sync_max_rtt_ms": 1000.0,
         "step_deg": 5.0,          # stirrer increment per sample
         "n_steps": 12,            # number of samples (stirrer realizations)
         "dwell_s": 20.0,          # loaded window = the actual measurement
@@ -312,6 +314,9 @@ class RcConfig:
         "target_rssp_db": -60.0,  # gNB PUSCH RSSI target (dBFS)
         "rssp_tol_db": 1.5,       # servo deadband
         "pusch_step_x10": 10,     # ±1.0 dB target-SNR per servo iteration
+        "adjust_target_snr": 1,
+        "adjust_tx_gain": 0,
+        "tx_gain_step_db": 1.0,
         "max_servo_iters": 6,
         "servo_settle_s": 5.0,    # TPC propagation wait between iterations
         "noise_frames": 20,       # 底噪标定帧数
@@ -327,12 +332,17 @@ class RcConfig:
         c = dict(self.DEFAULTS)
         c.update({k: v for k, v in (cfg or {}).items() if v is not None})
         self.step_deg = float(c["step_deg"])
+        self.sync_exchanges = max(1, int(c["sync_exchanges"]))
+        self.sync_max_rtt_ms = float(c["sync_max_rtt_ms"])
         self.n_steps = int(c["n_steps"])
         self.dwell_s = float(c["dwell_s"])
         self.settle_s = float(c["settle_s"])
         self.target_rssp_db = float(c["target_rssp_db"])
         self.rssp_tol_db = float(c["rssp_tol_db"])
         self.pusch_step_x10 = int(c["pusch_step_x10"])
+        self.adjust_target_snr = bool(int(c["adjust_target_snr"]))
+        self.adjust_tx_gain = bool(int(c["adjust_tx_gain"]))
+        self.tx_gain_step_db = float(c["tx_gain_step_db"])
         self.max_servo_iters = int(c["max_servo_iters"])
         self.servo_settle_s = float(c["servo_settle_s"])
         self.noise_frames = int(c["noise_frames"])
@@ -350,10 +360,15 @@ class RcConfig:
 
     def as_dict(self) -> dict:
         return {
+            "sync_exchanges": self.sync_exchanges,
+            "sync_max_rtt_ms": self.sync_max_rtt_ms,
             "step_deg": self.step_deg, "n_steps": self.n_steps,
             "dwell_s": self.dwell_s, "settle_s": self.settle_s,
             "target_rssp_db": self.target_rssp_db, "rssp_tol_db": self.rssp_tol_db,
             "pusch_step_x10": self.pusch_step_x10, "max_servo_iters": self.max_servo_iters,
+            "adjust_target_snr": int(self.adjust_target_snr),
+            "adjust_tx_gain": int(self.adjust_tx_gain),
+            "tx_gain_step_db": self.tx_gain_step_db,
             "servo_settle_s": self.servo_settle_s, "noise_frames": self.noise_frames,
             "noise_margin_db": self.noise_margin_db,
             "peak_prominence_db": self.peak_prominence_db,
@@ -395,6 +410,9 @@ class RcCampaign(threading.Thread):
         self.started_ms = _now_ms()
         self.run_id: Optional[str] = None
         self.current_sample_index = 0
+        self.current_tx_gain_db: Optional[float] = None
+        self.current_rx_gain_db: Optional[float] = None
+        self.calibration_records: list[dict] = []
 
     # ---- helpers ------------------------------------------------------------ #
     def _say(self, stage: str, msg: str) -> None:
@@ -519,8 +537,17 @@ class RcCampaign(threading.Thread):
                 self._say("servo", "authoritative OAI PUSCH RSSI unavailable — skipping servo")
                 return log
             err = self.cfg.target_rssp_db - rssp
-            log.append({"iter": it, "rssp_db": round(rssp, 2),
-                        "err_db": round(err, 2), "pusch_x10": self.pusch_x10})
+            point = {"ms": _now_ms(), "sample_index": getattr(self, "current_sample_index", 0),
+                     "iter": it, "rssp_db": round(rssp, 2),
+                     "target_rssp_db": self.cfg.target_rssp_db,
+                     "err_db": round(err, 2), "pusch_x10": self.pusch_x10,
+                     "target_snr_db": self.pusch_x10 / 10.0,
+                     "tx_gain_db": getattr(self, "current_tx_gain_db", None)}
+            log.append(point)
+            if not hasattr(self, "calibration_records"):
+                self.calibration_records = []
+            self.calibration_records.append(dict(point))
+            self.calibration_records = self.calibration_records[-300:]
             if abs(err) <= self.cfg.rssp_tol_db:
                 self._say("servo", f"RSSP {rssp:.1f} dB within ±{self.cfg.rssp_tol_db} dB of target")
                 return log
@@ -533,18 +560,32 @@ class RcCampaign(threading.Thread):
             try:
                 # restart=false ALWAYS: a per-sample gNB restart (~40 s, UE
                 # re-attach) would destroy the sampled measurement cadence.
-                r = self.oai.gnb_pusch_target_snr(
-                    "manual", new_x10, restart=False,
-                    request_id=self.oai.new_request_id(
-                        getattr(self, "run_id", None),
-                        f"rc-{getattr(self, 'current_sample_index', 0)}-servo-{it + 1}"))
-                if not r.get("runtimeApplied"):
-                    raise StirrerError(
-                        "PUSCH target update was not applied to the running gNB; "
-                        "refusing to record an invalid servo sample")
-                self.pusch_x10 = new_x10
-                log[-1]["applied_x10"] = new_x10
-                log[-1]["resp"] = str(r)[:200]
+                if not self.cfg.adjust_target_snr and not self.cfg.adjust_tx_gain:
+                    raise StirrerError("power calibration has no enabled actuator")
+                if self.cfg.adjust_target_snr:
+                    r = self.oai.gnb_pusch_target_snr(
+                        "manual", new_x10, restart=False,
+                        request_id=self.oai.new_request_id(
+                            getattr(self, "run_id", None),
+                            f"rc-{getattr(self, 'current_sample_index', 0)}-servo-{it + 1}"))
+                    if not r.get("runtimeApplied"):
+                        raise StirrerError(
+                            "PUSCH target update was not applied to the running gNB; "
+                            "refusing to record an invalid servo sample")
+                    self.pusch_x10 = new_x10
+                    log[-1]["applied_x10"] = new_x10
+                    log[-1]["resp"] = str(r)[:200]
+                if self.cfg.adjust_tx_gain:
+                    if self.current_tx_gain_db is None or self.current_rx_gain_db is None:
+                        raise StirrerError("TX/RX Gain unavailable for power calibration")
+                    gain = max(0.0, min(100.0, self.current_tx_gain_db +
+                                       (self.cfg.tx_gain_step_db if err > 0 else -self.cfg.tx_gain_step_db)))
+                    gain_result = self.flow.apply_calibration_gain(
+                        self.experiment_id, self.run_id or self.experiment_id,
+                        self.serial, gain, self.current_rx_gain_db)
+                    self.current_tx_gain_db = gain
+                    log[-1]["applied_tx_gain_db"] = gain
+                    log[-1]["gain_resp"] = str(gain_result)[:200]
             except Exception as e:
                 log[-1]["apply_error"] = str(e)[:200]
                 self._say("servo", f"pusch apply failed: {e}")
@@ -757,8 +798,23 @@ class RcCampaign(threading.Thread):
         if self._stop.is_set():
             self.state = "stopped"
             return False
-        self._say("sync", "UE synchronized; Run time anchor recorded")
-        return True
+        if not hasattr(loop, "seq") or not hasattr(self, "cfg"):
+            self._say("sync", "UE synchronized; Run time anchor recorded")
+            return True
+        first_seq = loop.seq
+        deadline = time.monotonic() + max(30.0, self.cfg.sync_exchanges * loop.interval_s * 3)
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            ack = loop.last_ack or {}
+            if (loop.seq - first_seq + 1 >= self.cfg.sync_exchanges and
+                    float(ack.get("rtt_ms") or float("inf")) <= self.cfg.sync_max_rtt_ms):
+                self._say("sync", f"UE synchronized; {self.cfg.sync_exchanges} exchanges confirmed")
+                return True
+            self._stop.wait(0.25)
+        if self._stop.is_set():
+            self.state = "stopped"
+            return False
+        raise StirrerError(
+            f"clock synchronization did not meet RTT ≤ {self.cfg.sync_max_rtt_ms:.0f} ms")
 
     def run(self) -> None:
         try:
@@ -798,6 +854,9 @@ class RcCampaign(threading.Thread):
             initial_x10 = getattr(target, "targetSnrX10", None)
             self.initial_pusch_x10 = int(initial_x10) if initial_x10 is not None else None
             self.pusch_x10 = self.initial_pusch_x10
+            actual = self.oai.telemetry_config_raw()
+            self.current_tx_gain_db = float(actual.get("txGainDb")) if actual.get("txGainDb") is not None else None
+            self.current_rx_gain_db = float(actual.get("rxGainDb")) if actual.get("rxGainDb") is not None else None
         except Exception as e:
             raise StirrerError(f"cannot read initial PUSCH target: {e}") from e
 
@@ -810,35 +869,38 @@ class RcCampaign(threading.Thread):
                                f"(enable 'simulate' for dry runs)")
 
         try:
-            self.state = "noise_calibration"
-            noise = self.calibrate_noise(stirrer)
             angle = stirrer.position_deg() or 0.0
+            noise = None
             for i in range(self.cfg.n_steps):
                 if self._stop.is_set():
                     break
-                self.state = "moving"
                 self.current_sample_index = i + 1
-                self._say("stirrer", f"sample {i + 1}/{self.cfg.n_steps}: move +{self.cfg.step_deg}°")
-                mv = stirrer.move_rel_and_wait(self.cfg.step_deg, timeout_s=180.0)
-                if not mv.get("ok"):
-                    raise StirrerError(f"stirrer move failed: {mv.get('error')}")
-                angle = mv.get("deg", angle)
                 self.current_angle_deg = angle
-                time.sleep(self.cfg.settle_s)
-
-                self.state = "servo"
+                self.state = "power_calibration"
                 servo_log = self.servo_pusch(stirrer)
 
-                self.state = "recording"
+                if noise is None:
+                    self.state = "noise_capture"
+                    noise = self.calibrate_noise(stirrer)
+
+                self.state = "loaded_capture"
                 window = self.trigger_phone_window(plan)
                 if window is None:
                     self._say("campaign", f"sample {i + 1} skipped (phone window failed)")
-                    continue
+                else:
+                    self.state = "finalizing"
+                    self.finalize_sample(i + 1, angle, window, servo_log, noise)
+                    self.samples_done += 1
+                    self._say("campaign", f"sample {i + 1} stored @ {angle:.1f}°")
 
-                self.state = "finalizing"
-                self.finalize_sample(i + 1, angle, window, servo_log, noise)
-                self.samples_done += 1
-                self._say("campaign", f"sample {i + 1} stored @ {angle:.1f}°")
+                if i + 1 < self.cfg.n_steps and not self._stop.is_set():
+                    self.state = "stirrer_rotation"
+                    self._say("stirrer", f"rotate +{self.cfg.step_deg}° for sample {i + 2}")
+                    mv = stirrer.move_rel_and_wait(self.cfg.step_deg, timeout_s=180.0)
+                    if not mv.get("ok"):
+                        raise StirrerError(f"stirrer move failed: {mv.get('error')}")
+                    angle = mv.get("deg", angle)
+                    time.sleep(self.cfg.settle_s)
         finally:
             try:
                 stirrer.close()
@@ -901,6 +963,9 @@ class RcRunner:
             "last_rssp_db": camp.last_rssp_db,
             "target_rssp_db": camp.cfg.target_rssp_db,
             "noise_floor_db": camp.noise_floor_db,
+            "current_sample_index": camp.current_sample_index,
+            "current_tx_gain_db": camp.current_tx_gain_db,
+            "calibration_records": camp.calibration_records,
             "error": camp.error,
             "config": camp.cfg.as_dict(),
             "log": camp.log[-40:],

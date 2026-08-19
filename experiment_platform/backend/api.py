@@ -314,7 +314,10 @@ def create_experiment(payload: dict = Body(...)):
             config["executionMode"] = "REAL_HARDWARE"
         else:
             config.setdefault("executionMode", "REAL_HARDWARE")
-        row = _flow().add_template(exp["experiment_id"], "Default", config)
+        row = _flow().add_template(
+            exp["experiment_id"],
+            "RC Workflow" if payload.get("environment", "AC") == "RC" else "Default",
+            config)
         _flow().set_default_template(exp["experiment_id"], row["id"])
         exp = _db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (exp["experiment_id"],))
         exp["default_configuration"] = row
@@ -612,11 +615,14 @@ def update_experiment(experiment_id: str, payload: dict = Body(...)):
     exp = _db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (experiment_id,))
     if not exp:
         raise HTTPException(404, "experiment not found")
-    for field in ("purpose", "flow", "initial_oai_config", "notes", "operator_name"):
+    for field in ("purpose", "flow", "initial_oai_config", "notes", "operator_name",
+                  "ac_template_enabled", "ac_template_json"):
         if field in payload:
             v = payload[field]
-            if field == "initial_oai_config" and isinstance(v, (dict, list)):
+            if field in {"initial_oai_config", "ac_template_json"} and isinstance(v, (dict, list)):
                 v = json.dumps(v, ensure_ascii=False)
+            if field == "ac_template_enabled":
+                v = 1 if bool(v) else 0
             _db.execute(f"UPDATE experiments SET {field}=? WHERE experiment_id=?", (v, experiment_id))
     return _db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (experiment_id,))
 
@@ -731,6 +737,38 @@ def start_experiment(experiment_id: str, payload: dict = Body(...)):
         configuration_id = payload.get("template_id")
         if configuration_id is None:
             raise ValueError("Configuration is required")
+        experiment = _db.query_one(
+            "SELECT environment,ac_template_enabled,ac_template_json FROM experiments WHERE experiment_id=?",
+            (experiment_id,))
+        if not experiment:
+            raise ValueError("experiment not found")
+        ac_phases = None
+        if experiment["environment"] == "AC" and experiment.get("ac_template_enabled"):
+            try:
+                raw_phases = json.loads(experiment.get("ac_template_json") or "[]")
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid AC Template JSON: {exc}") from exc
+            if not isinstance(raw_phases, list) or not raw_phases:
+                raise ValueError("enabled AC Template must contain at least one Phase")
+            ac_phases = []
+            for index, raw in enumerate(raw_phases):
+                kind = str(raw.get("name") or raw.get("type") or "").upper()
+                duration = float(raw.get("durationSeconds") or 0)
+                if kind not in {"IDLE", "LOADED"} or duration <= 0:
+                    raise ValueError(f"AC Template Phase {index + 1} needs IDLE/LOADED and duration > 0")
+                phase = {"name": kind.lower(), "durationSeconds": duration}
+                if kind == "LOADED":
+                    cid = raw.get("configurationId")
+                    row = _db.query_one(
+                        "SELECT id,config_json FROM oai_templates WHERE id=? AND experiment_id=? AND archived_utc IS NULL",
+                        (cid, experiment_id))
+                    if not row:
+                        raise ValueError(f"AC Template Phase {index + 1} Configuration is unavailable")
+                    phase["configurationId"] = int(row["id"])
+                    phase["ulTrafficMbps"] = float(json.loads(row["config_json"]).get("ulTrafficMbps") or 0)
+                    if not any(p["name"] == "loaded" for p in ac_phases):
+                        configuration_id = int(row["id"])
+                ac_phases.append(phase)
         preflight = run_control_preflight(experiment_id, int(configuration_id))
         if not preflight["ready"]:
             raise HTTPException(409, {"message": "Run cannot start", "issues": preflight["issues"]})
@@ -740,7 +778,8 @@ def start_experiment(experiment_id: str, payload: dict = Body(...)):
             int(payload.get("pc_port", 8420)),
             collection_seconds=payload.get("collection_seconds"),
             idle_seconds=payload.get("idle_seconds"),
-            template_id=payload.get("template_id"),
+            template_id=configuration_id,
+            ac_phases=ac_phases,
         )
         if preflight["experiment"]["environment"] == "RC":
             chamber = dict((preflight["selected"]["config"].get("rcChamber") or {}))
@@ -763,6 +802,63 @@ def start_experiment(experiment_id: str, payload: dict = Body(...)):
         return _oai_error_response(exc)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, str(e))
+
+
+@app.get("/api/experiments/{experiment_id}/runtime")
+def experiment_runtime(experiment_id: str, limit: int = Query(300, ge=10, le=1800)):
+    """One read for Run Control: phase/controller state plus chart-ready data."""
+    run = _db.query_one(
+        "SELECT run_id,state,configuration_id,configuration_name FROM runs WHERE experiment_id=? "
+        "ORDER BY rowid DESC LIMIT 1", (experiment_id,))
+    series = []
+    if run:
+        series = _db.query(
+            "SELECT fetched_utc_ms AS time,ul_goodput_mbps AS throughput,pusch_rssi AS rssp,"
+            "pusch_snr_db AS snr FROM oai_snapshots WHERE run_id=? "
+            "ORDER BY fetched_utc_ms DESC LIMIT ?", (run["run_id"], limit))
+        series.reverse()
+    ac = {"running": False, "state": "idle"}
+    ac_runner = _flow().ac_templates.get(experiment_id)
+    if ac_runner:
+        ac = ac_runner.status()
+        cid = ac.get("configuration_id")
+        if cid:
+            row = _db.query_one("SELECT name,version FROM oai_templates WHERE id=?", (cid,))
+            ac["configuration_name"] = row["name"] if row else None
+            ac["configuration_version"] = row.get("version") if row else None
+    rc = _runner().status(experiment_id)
+    try:
+        gnb = _oai.status()
+        gnb_state = gnb.gnb.status if gnb.gnb else "STOPPED"
+    except Exception:
+        gnb_state = "UNAVAILABLE"
+    return {"run": run, "environment": (_db.query_one(
+                "SELECT environment FROM experiments WHERE experiment_id=?", (experiment_id,)) or {}).get("environment"),
+            "gnb_state": gnb_state, "ac": ac, "rc": rc,
+            "series": series}
+
+
+@app.get("/api/experiments/{experiment_id}/result-tree")
+def experiment_result_tree(experiment_id: str):
+    """Batch-read the complete result inventory as Experiment/Run children."""
+    runs = _db.query(
+        "SELECT run_id,state,started_utc_ms,ended_utc_ms,configuration_name FROM runs "
+        "WHERE experiment_id=? ORDER BY COALESCE(started_utc_ms,0) DESC,rowid DESC", (experiment_id,))
+    children = []
+    for run in runs:
+        rid = run["run_id"]
+        counts = {
+            "phone": (_db.query_one("SELECT COUNT(*) n FROM phone_samples WHERE run_id=?", (rid,)) or {"n": 0})["n"],
+            "gnb": (_db.query_one("SELECT COUNT(*) n FROM oai_snapshots WHERE run_id=?", (rid,)) or {"n": 0})["n"],
+            "events": (_db.query_one("SELECT COUNT(*) n FROM oai_events WHERE run_id=?", (rid,)) or {"n": 0})["n"],
+            "rc_samples": (_db.query_one("SELECT COUNT(*) n FROM rc_samples WHERE run_id=?", (rid,)) or {"n": 0})["n"],
+            "sync": (_db.query_one("SELECT COUNT(*) n FROM sync_anchors WHERE run_id=?", (rid,)) or {"n": 0})["n"],
+        }
+        files = _db.query(
+            "SELECT file_path,size_bytes,sha256 FROM files WHERE file_path LIKE ? ORDER BY file_path",
+            (f"%{rid}%",))
+        children.append({**run, "counts": counts, "files": files})
+    return {"experiment_id": experiment_id, "runs": children, "run_count": len(children)}
 
 
 @app.post("/api/experiments/{experiment_id}/stop")
@@ -856,17 +952,18 @@ def download_clip(clip_id: int):
 import threading as _threading
 
 from . import rc_flow as _rc
-from .stirrer import StirrerAgent, StirrerError
+from .stirrer import StirrerAgent, StirrerError, list_com_ports
 
 _stirrer_lock = _threading.Lock()
 _stirrer_agents: dict[str, StirrerAgent] = {}
 
 
-def _stirrer(simulate: bool = False) -> StirrerAgent:
-    key = "sim" if simulate else "usb"
+def _stirrer(simulate: bool = False, com_port: Optional[str] = None) -> StirrerAgent:
+    selected = (com_port or "").upper()
+    key = "sim" if simulate else f"hardware:{selected or 'saved'}"
     with _stirrer_lock:
         if key not in _stirrer_agents:
-            _stirrer_agents[key] = StirrerAgent(_settings, simulate=simulate)
+            _stirrer_agents[key] = StirrerAgent(_settings, simulate=simulate, com_port=selected or None)
         return _stirrer_agents[key]
 
 
@@ -875,14 +972,21 @@ def _runner() -> _rc.RcRunner:
 
 
 @app.get("/api/stirrer/status")
-def stirrer_status(simulate: bool = False):
-    return _stirrer(simulate).status()
+def stirrer_status(simulate: bool = False, port: Optional[str] = None):
+    status = _stirrer(simulate, port).status()
+    status["ports"] = list_com_ports()
+    return status
 
 
 @app.post("/api/stirrer/connect")
 def stirrer_connect(payload: dict = Body(default={})):
     """Open the USB link to the stirrer controller (or start the virtual motor)."""
-    agent = _stirrer(bool(payload.get("simulate")))
+    port = str(payload.get("port") or "").upper() or None
+    if port and not port.startswith("COM"):
+        raise HTTPException(422, "invalid COM port")
+    if port:
+        (_settings.data_dir / "stirrer_port.txt").write_text(port, encoding="utf-8")
+    agent = _stirrer(bool(payload.get("simulate")), port)
     try:
         agent.ensure_helper()
     except StirrerError as e:
@@ -895,7 +999,7 @@ def stirrer_connect(payload: dict = Body(default={})):
 
 @app.post("/api/stirrer/disconnect")
 def stirrer_disconnect(payload: dict = Body(default={})):
-    agent = _stirrer(bool(payload.get("simulate")))
+    agent = _stirrer(bool(payload.get("simulate")), payload.get("port"))
     agent.close()
     return agent.status()
 
@@ -903,7 +1007,7 @@ def stirrer_disconnect(payload: dict = Body(default={})):
 @app.post("/api/stirrer/move")
 def stirrer_move(payload: dict = Body(...)):
     """Manual jog: {"deg": 5} relative move (blocks until standstill)."""
-    agent = _stirrer(bool(payload.get("simulate")))
+    agent = _stirrer(bool(payload.get("simulate")), payload.get("port"))
     if not agent._opened:
         raise HTTPException(409, "stirrer not connected")
     try:
@@ -914,7 +1018,7 @@ def stirrer_move(payload: dict = Body(...)):
 
 @app.post("/api/stirrer/stop")
 def stirrer_stop(payload: dict = Body(default={})):
-    agent = _stirrer(bool(payload.get("simulate")))
+    agent = _stirrer(bool(payload.get("simulate")), payload.get("port"))
     if not agent._opened:
         raise HTTPException(409, "stirrer not connected")
     return agent.stop()

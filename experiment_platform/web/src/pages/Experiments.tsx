@@ -21,6 +21,8 @@ type RunDetail = Run & {
 };
 type ConfigEditor = { id: number | null; name: string; environment: string; config: Record<string, string>; original: string };
 type DetailTab = 'overview' | 'configurations' | 'history';
+type AcPhase = { name: 'idle' | 'loaded'; durationSeconds: number; configurationId?: number };
+type ResultTree = { experiment_id: string; run_count: number; runs: Array<Run & { counts: Record<string, number>; files: Array<{ file_path: string; size_bytes?: number }> }> };
 
 const EMPTY_FORM = { experiment_id: '', environment: 'AC', operator_name: '', notes: '', purpose: '', flow: '' };
 const PAGE_SIZE = 12;
@@ -30,10 +32,10 @@ const DEFAULT_CONFIGURATION: Record<string, unknown> = {
   puschTargetMode: 'manual', puschTargetSnrX10: 89, schedulerMode: 'auto', ulTrafficMbps: 5,
 };
 const CONFIG_KEYS = ['frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb', 'puschTargetMode', 'puschTargetSnrDb', 'schedulerMode', 'qm', 'mcs', 'nPrb', 'ulTrafficMbps'];
-const RC_DEFAULTS: Record<string, unknown> = { step_deg: 5, n_steps: 12, dwell_s: 20, settle_s: 8, servo_settle_s: 5, target_rssp_db: -60, rssp_tol_db: 1.5, pusch_step_x10: 10, max_servo_iters: 6, noise_frames: 20, noise_margin_db: 6, peak_prominence_db: 3, delay_window_start_ns: 0, delay_window_end_ns: 0 };
+const RC_DEFAULTS: Record<string, unknown> = { sync_exchanges: 3, sync_max_rtt_ms: 1000, step_deg: 5, n_steps: 12, dwell_s: 20, settle_s: 8, servo_settle_s: 5, target_rssp_db: -60, rssp_tol_db: 1.5, pusch_step_x10: 10, adjust_target_snr: 1, adjust_tx_gain: 0, tx_gain_step_db: 1, max_servo_iters: 6, noise_frames: 20, noise_margin_db: 6, peak_prominence_db: 3, delay_window_start_ns: 0, delay_window_end_ns: 0, stirrer_speed_deg_s: 20 };
 const RC_KEYS = Object.keys(RC_DEFAULTS);
 const QM_OPTIONS = [{ value: '2', label: '2 · QPSK' }, { value: '4', label: '4 · 16QAM' }, { value: '6', label: '6 · 64QAM' }, { value: '8', label: '8 · 256QAM' }];
-const QM_MCS_RANGE: Record<string, { min: number; max: number }> = { '2': { min: 0, max: 9 }, '4': { min: 10, max: 16 }, '6': { min: 17, max: 27 }, '8': { min: 28, max: 31 } };
+const QM_MCS_RANGE: Record<string, { min: number; max: number }> = { '2': { min: 0, max: 9 }, '4': { min: 10, max: 16 }, '6': { min: 17, max: 27 }, '8': { min: 27, max: 31 } };
 
 function parseConfig(json: string | null | undefined): Record<string, unknown> {
   try { return json ? JSON.parse(json) ?? {} : {}; } catch { return {}; }
@@ -153,8 +155,8 @@ export default function Experiments({ nav, initialExperimentId = '' }: { nav: (p
     try {
       const created = await api.post<Experiment & { configuration_error?: string }>('/api/experiments', { ...form, experiment_id: form.experiment_id.trim() });
       setShowCreate(false); setForm({ ...EMPTY_FORM }); experiments.reload();
-      if (created.configuration_error) toast('err', `Experiment created, but Default Configuration failed: ${created.configuration_error}`);
-      else toast('ok', 'Experiment and Default Configuration created.');
+      if (created.configuration_error) toast('err', `Experiment created, but ${form.environment === 'RC' ? 'RC Workflow' : 'Default Configuration'} failed: ${created.configuration_error}`);
+      else toast('ok', form.environment === 'RC' ? 'Experiment and RC Workflow created.' : 'Experiment and Default Configuration created.');
       nav(`/experiments/${encodeURIComponent(created.experiment_id)}`);
     } catch (error) { setCreateError(error instanceof Error ? error : new Error(String(error))); }
     finally { setCreating(false); }
@@ -169,7 +171,7 @@ export default function Experiments({ nav, initialExperimentId = '' }: { nav: (p
     finally { setDeleteTarget(''); setDeleteText(''); }
   };
   const confirmDelete = (experimentId: string) => { setDeleteTarget(experimentId); setDeleteText(''); };
-  const deleteModal = deleteTarget && <Modal title="Delete Experiment?" sub="This removes conditions, Runs, Configurations and derived files." onClose={() => setDeleteTarget('')} footer={<><button className="btn" onClick={() => setDeleteTarget('')}>Cancel</button><button className="btn danger" disabled={deleteText !== deleteTarget} onClick={() => deleteExperiment(deleteTarget)}>Delete Experiment</button></>}><Field label={`Type ${deleteTarget} to confirm`}><input autoFocus value={deleteText} onChange={(event) => setDeleteText(event.target.value)} /></Field></Modal>;
+  const deleteModal = deleteTarget && <Modal title="Delete Experiment?" sub="This removes its Workflow or Configurations, Runs and derived files." onClose={() => setDeleteTarget('')} footer={<><button className="btn" onClick={() => setDeleteTarget('')}>Cancel</button><button className="btn danger" disabled={deleteText !== deleteTarget} onClick={() => deleteExperiment(deleteTarget)}>Delete Experiment</button></>}><Field label={`Type ${deleteTarget} to confirm`}><input autoFocus value={deleteText} onChange={(event) => setDeleteText(event.target.value)} /></Field></Modal>;
 
   if (initialExperimentId) {
     if (experiments.loading && !experiments.data) return <Spinner label="Loading Experiment…" />;
@@ -194,14 +196,14 @@ export default function Experiments({ nav, initialExperimentId = '' }: { nav: (p
         return <article key={item.experiment_id} className={`card experiment-card ${item.environment === 'RC' ? 'rc' : 'ac'}`}>
           <div className="row between"><div><h2 className="mono">{item.experiment_id}</h2><div className="card-sub">Created {fmtIso(item.created_utc)}</div></div><Badge tone={item.environment === 'RC' ? 'warn' : 'accent'}>{item.environment ?? '—'}</Badge></div>
           <div className="experiment-purpose">{item.purpose || 'No purpose recorded.'}</div><dl className="kv"><dt>Operator</dt><dd>{item.operator_name || '—'}</dd></dl>
-          <div className="experiment-card-stats"><span><b>{item.configuration_count ?? 0}</b> Configurations</span><span><b>{item.run_count ?? 0}</b> Runs / History</span><span>Last result {result ? <Badge tone={statusTone(result)}>{result}</Badge> : '—'}</span><span>Last activity <b>{fmtTs(item.last_activity_utc_ms)}</b></span></div>
+          <div className="experiment-card-stats"><span>{item.environment === 'RC' ? <><b>1</b> Workflow</> : <><b>{item.configuration_count ?? 0}</b> Configurations</>}</span><span><b>{item.run_count ?? 0}</b> Runs / History</span><span>Last result {result ? <Badge tone={statusTone(result)}>{result}</Badge> : '—'}</span><span>Last activity <b>{fmtTs(item.last_activity_utc_ms)}</b></span></div>
           <div className="row between" style={{ marginTop: 16 }}><button className="btn primary" onClick={() => nav(`/experiments/${encodeURIComponent(item.experiment_id)}`)}>Manage Experiment</button><details className="more-menu"><summary aria-label={`More actions for ${item.experiment_id}`}>•••</summary><div><button onClick={() => exportExperiment(item.experiment_id)}>Export experiment</button><button className="danger-text" onClick={() => confirmDelete(item.experiment_id)}>Delete experiment</button></div></details></div>
         </article>;
       })}</div>
       <div className="pagination"><span>{filtered.length} Experiments · page {page} of {totalPages}</span><button className="btn sm" disabled={page === 1} onClick={() => setPage((x) => x - 1)}>Previous</button><button className="btn sm" disabled={page === totalPages} onClick={() => setPage((x) => x + 1)}>Next</button></div>
     </>}
-    {showCreate && <Modal title="New Experiment" sub="Create the Experiment first, then manage its Configurations." onClose={() => setShowCreate(false)} footer={<><button className="btn" onClick={() => setShowCreate(false)}>Cancel</button><button className="btn primary" form="create-experiment" type="submit" disabled={creating}>{creating ? 'Creating…' : 'Create & Configure'}</button></>}>
-      <form id="create-experiment" className="stack" onSubmit={create}>{createError && <ErrorBox error={createError} />}<div className="notice-box">A Default Configuration will be created automatically and shown explicitly after creation.</div><div className="grid cols-2"><Field label="Experiment ID"><input required autoFocus className="mono" value={form.experiment_id} onChange={(e) => setForm({ ...form, experiment_id: e.target.value })} /></Field><Field label="Environment"><select value={form.environment} onChange={(e) => setForm({ ...form, environment: e.target.value })}><option value="AC">AC</option><option value="RC">RC</option></select></Field><Field label="Operator"><input value={form.operator_name} onChange={(e) => setForm({ ...form, operator_name: e.target.value })} /></Field></div><Field label="Purpose"><textarea rows={2} value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })} /></Field><Field label="Flow"><textarea rows={2} value={form.flow} onChange={(e) => setForm({ ...form, flow: e.target.value })} /></Field><Field label="Notes"><textarea rows={2} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field></form>
+    {showCreate && <Modal title="New Experiment" sub={form.environment === 'RC' ? 'Create the Experiment, then edit its single complete Workflow.' : 'Create the Experiment first, then manage its Configurations.'} onClose={() => setShowCreate(false)} footer={<><button className="btn" onClick={() => setShowCreate(false)}>Cancel</button><button className="btn primary" form="create-experiment" type="submit" disabled={creating}>{creating ? 'Creating…' : form.environment === 'RC' ? 'Create Workflow' : 'Create & Configure'}</button></>}>
+      <form id="create-experiment" className="stack" onSubmit={create}>{createError && <ErrorBox error={createError} />}<div className="notice-box">{form.environment === 'RC' ? 'One complete RC Workflow will be created automatically. RC has no Default or alternate Configuration.' : 'A Default Configuration will be created automatically and shown explicitly after creation.'}</div><div className="grid cols-2"><Field label="Experiment ID"><input required autoFocus className="mono" value={form.experiment_id} onChange={(e) => setForm({ ...form, experiment_id: e.target.value })} /></Field><Field label="Environment"><select value={form.environment} onChange={(e) => setForm({ ...form, environment: e.target.value })}><option value="AC">AC</option><option value="RC">RC</option></select></Field><Field label="Operator"><input value={form.operator_name} onChange={(e) => setForm({ ...form, operator_name: e.target.value })} /></Field></div><Field label="Purpose"><textarea rows={2} value={form.purpose} onChange={(e) => setForm({ ...form, purpose: e.target.value })} /></Field><Field label="Flow"><textarea rows={2} value={form.flow} onChange={(e) => setForm({ ...form, flow: e.target.value })} /></Field><Field label="Notes"><textarea rows={2} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></Field></form>
     </Modal>}
     {deleteModal}
   </div>;
@@ -223,12 +225,25 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
   const [savingConfig, setSavingConfig] = useState(false);
   const [runPage, setRunPage] = useState(1);
   const [selectedRunId, setSelectedRunId] = useState('');
+  const [templateEnabled, setTemplateEnabled] = useState(!!experiment.ac_template_enabled);
+  const [acPhases, setAcPhases] = useState<AcPhase[]>(() => {
+    try { const value = JSON.parse(experiment.ac_template_json || '[]'); return Array.isArray(value) ? value : []; } catch { return []; }
+  });
+  const [savingTemplate, setSavingTemplate] = useState(false);
+  const [resultTree, setResultTree] = useState<ResultTree | null>(null);
   const [pending, setPending] = useState<{ title: string; body: string; action: () => void } | null>(null);
 
   useEffect(() => {
     const next = { operator_name: experiment.operator_name || '', purpose: experiment.purpose || '', flow: experiment.flow || '', notes: experiment.notes || '' };
     setOverview(next); setOverviewBaseline(JSON.stringify(next));
   }, [experiment]);
+  useEffect(() => {
+    const defaultId = configurations.data?.find((row) => row.is_default)?.id ?? configurations.data?.[0]?.id;
+    if (experiment.environment === 'AC' && defaultId) {
+      setAcPhases((rows) => rows.map((phase) => phase.name === 'loaded' && !phase.configurationId
+        ? { ...phase, configurationId: defaultId } : phase));
+    }
+  }, [configurations.data, experiment.environment]);
   const overviewDirty = overviewBaseline !== '' && JSON.stringify(overview) !== overviewBaseline;
   const configDirty = !!editor && JSON.stringify({ name: editor.name, config: editor.config }) !== editor.original;
   const dirty = overviewDirty || configDirty;
@@ -254,16 +269,29 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
   };
   const saveConfiguration = async () => {
     if (!editor) return;
-    const errors = validateConfig(editor.config, editor.environment === 'RC'); if (!editor.name.trim()) errors.name = 'Configuration name is required.';
+    const errors = validateConfig(editor.config, editor.environment === 'RC'); if (editor.environment !== 'RC' && !editor.name.trim()) errors.name = 'Configuration name is required.';
     setConfigErrors(errors); if (Object.keys(errors).length) return;
     setSavingConfig(true); setConfigApiError(null);
     try {
-      const body = { name: editor.name.trim(), config: buildConfig(editor.config, editor.environment === 'RC') };
+      const body = { name: editor.environment === 'RC' ? 'RC Workflow' : editor.name.trim(), config: buildConfig(editor.config, editor.environment === 'RC') };
       if (editor.id == null) await api.post(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates`, body);
       else await api.put(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates/${editor.id}`, body);
-      setEditor(null); configurations.reload(); onReload(); toast('ok', 'Configuration saved.');
+      setEditor(null); configurations.reload(); onReload(); toast('ok', editor.environment === 'RC' ? 'Workflow saved.' : 'Configuration saved.');
     } catch (error) { setConfigApiError(error instanceof Error ? error : new Error(String(error))); }
     finally { setSavingConfig(false); }
+  };
+  const saveAcTemplate = async () => {
+    if (templateEnabled && (!acPhases.length || acPhases.some((p) => p.durationSeconds <= 0 || (p.name === 'loaded' && !p.configurationId)))) {
+      setConfigApiError(new Error('Every Template Phase needs a positive duration; LOADED also needs a Configuration.')); return;
+    }
+    setSavingTemplate(true); setConfigApiError(null);
+    try {
+      await api.put(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}`, {
+        ac_template_enabled: templateEnabled, ac_template_json: acPhases,
+      });
+      onReload(); toast('ok', 'AC Template saved.');
+    } catch (error) { setConfigApiError(error instanceof Error ? error : new Error(String(error))); }
+    finally { setSavingTemplate(false); }
   };
   const setDefault = async (row: Configuration) => {
     try { await api.post(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/templates/${row.id}/default`); configurations.reload(); onReload(); toast('ok', `${row.name} is now the Default Configuration.`); }
@@ -287,7 +315,7 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
 
   return <div className="stack experiment-detail">
     <div className="page-head"><div><button className="btn ghost" onClick={back}>← Experiments</button><div className="title mono">{experiment.experiment_id}</div><div className="subtitle">Experiment management · execution controls are on Dashboard</div></div><Badge tone={experiment.environment === 'RC' ? 'warn' : 'accent'}>{experiment.environment ?? '—'}</Badge></div>
-    <div className="tabs" role="tablist">{(['overview', 'configurations', 'history'] as DetailTab[]).map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => changeTab(item)}>{item === 'overview' ? 'Overview' : item === 'configurations' ? `Configurations (${configurations.data?.length ?? 0})` : `History (${runs.data?.length ?? 0})`}</button>)}</div>
+    <div className="tabs" role="tablist">{(['overview', 'configurations', 'history'] as DetailTab[]).map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => changeTab(item)}>{item === 'overview' ? 'Overview' : item === 'configurations' ? (experiment.environment === 'RC' ? 'Workflow' : `Configurations (${configurations.data?.length ?? 0})`) : `History (${runs.data?.length ?? 0})`}</button>)}</div>
 
     {tab === 'overview' && <Card title="Overview" sub="Experiment metadata. ID, environment and creation time are read only."><div className="stack">
       {overviewError && <ErrorBox error={overviewError} />}<div className="grid cols-3"><Field label="Experiment ID"><StaticValue>{experiment.experiment_id}</StaticValue></Field><Field label="Environment"><StaticValue>{experiment.environment ?? '—'}</StaticValue></Field><Field label="Created time"><StaticValue>{fmtIso(experiment.created_utc)}</StaticValue></Field></div>
@@ -297,20 +325,28 @@ function ExperimentDetail({ experiment, nav, onReload, onExport, onDelete }: {
 
     {tab === 'configurations' && <div className="stack">
       {configApiError && <ErrorBox error={configApiError} />}
-      <Card title="Default Configuration" sub="Used for the next Run unless Dashboard explicitly selects another Configuration.">
+      {experiment.environment === 'AC' && <Card title="AC Run Template" sub="Optional platform-owned Phase sequence. Completion automatically sends End Experiment."><div className="stack">
+        <label className="row"><input type="checkbox" checked={templateEnabled} onChange={(event) => setTemplateEnabled(event.target.checked)} /> Enable Template for this Experiment</label>
+        {templateEnabled && <>{acPhases.map((phase, index) => <div className="grid cols-4" key={index}><Field label={`Phase ${index + 1}`}><select value={phase.name} onChange={(event) => setAcPhases((rows) => rows.map((item, i) => i === index ? { ...item, name: event.target.value as AcPhase['name'], configurationId: event.target.value === 'idle' ? undefined : (item.configurationId ?? defaultConfiguration?.id) } : item))}><option value="idle">IDLE</option><option value="loaded">LOADED</option></select></Field><Field label="Duration (s)"><input type="number" min={0.1} step={0.1} value={phase.durationSeconds} onChange={(event) => setAcPhases((rows) => rows.map((item, i) => i === index ? { ...item, durationSeconds: Number(event.target.value) } : item))} /></Field>{phase.name === 'loaded' ? <Field label="Configuration"><select value={phase.configurationId ?? defaultConfiguration?.id ?? ''} onChange={(event) => setAcPhases((rows) => rows.map((item, i) => i === index ? { ...item, configurationId: Number(event.target.value) } : item))}>{configurations.data?.map((row) => <option key={row.id} value={row.id}>{row.name} v{row.version ?? 1}</option>)}</select></Field> : <StaticValue>Radio remains idle</StaticValue>}<button className="btn danger sm" onClick={() => setAcPhases((rows) => rows.filter((_, i) => i !== index))}>Remove</button></div>)}<div className="row"><button className="btn" onClick={() => setAcPhases((rows) => [...rows, { name: 'idle', durationSeconds: 15 }])}>+ IDLE Phase</button><button className="btn" onClick={() => setAcPhases((rows) => [...rows, { name: 'loaded', durationSeconds: 30, configurationId: defaultConfiguration?.id }])}>+ LOADED Phase</button></div></>}
+        <div><button className="btn primary" disabled={savingTemplate} onClick={saveAcTemplate}>{savingTemplate ? 'Saving…' : 'Save Template'}</button></div>
+      </div></Card>}
+      {experiment.environment === 'RC' ? <Card title="RC Workflow" sub="One RC Experiment has one complete Workflow; there is no Default or alternate Configuration.">
+        {configurations.loading && !configurations.data ? <Spinner /> : configurations.error ? <ErrorBox error={configurations.error} /> : defaultConfiguration ? <div className="stack"><dl className="configuration-summary">{summary(parseConfig(defaultConfiguration.config_json)).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl><div><button className="btn primary" onClick={() => openConfiguration(defaultConfiguration)}>Edit Workflow</button></div></div> : <EmptyState>RC Workflow is unavailable.</EmptyState>}
+      </Card> : <><Card title="Default Configuration" sub="Used for the next Run unless Dashboard explicitly selects another Configuration.">
         {configurations.loading && !configurations.data ? <Spinner /> : configurations.error ? <><ErrorBox error={configurations.error} /><button className="btn sm" onClick={configurations.reload}>Retry</button></> : defaultConfiguration ? <ConfigurationCard row={defaultConfiguration} onEdit={() => openConfiguration(defaultConfiguration)} onDuplicate={() => openConfiguration(defaultConfiguration, true)} /> : <EmptyState><b>Configuration required</b><br />Add a Configuration, then explicitly set it as default.</EmptyState>}
       </Card>
       <Card title="Saved Configurations" sub="Cards are read-only until an explicit action is selected." right={<button className="btn" onClick={() => openConfiguration()}>+ Add Configuration</button>}>
         {configurations.loading && !configurations.data ? <Spinner /> : configurations.error ? <><ErrorBox error={configurations.error} /><button className="btn sm" onClick={configurations.reload}>Retry</button></> : !configurations.data?.some((row) => !row.is_default) ? <EmptyState>No non-default Configurations.</EmptyState> : <div className="stack">{configurations.data.filter((row) => !row.is_default).map((row) => <ConfigurationCard key={row.id} row={row} onEdit={() => openConfiguration(row)} onDuplicate={() => openConfiguration(row, true)} onDefault={() => setDefault(row)} onArchive={() => archive(row)} />)}</div>}
       </Card>
+      </>}
       {editor && <ConfigurationEditor editor={editor} setEditor={setEditor} errors={configErrors} apiError={configApiError} saving={savingConfig} onSave={saveConfiguration} onCancel={() => configDirty ? setPending({ title: 'Discard unsaved Configuration?', body: 'The current edits will be lost.', action: () => setEditor(null) }) : setEditor(null)} />}
     </div>}
 
-    {tab === 'history' && <div className="stack"><Card title="Run History" sub="Newest first. Each Run uses its execution-time Configuration snapshot.">
-      {runs.loading && !runs.data ? <Spinner /> : runs.error ? <><ErrorBox error={runs.error} /><button className="btn sm" onClick={runs.reload}>Retry</button></> : !runs.data?.length ? <EmptyState><b>No run history</b><br />No Runs have been recorded yet. Execute Runs from Dashboard.</EmptyState> : <><div className="table-wrap"><table className="data"><thead><tr><th>Time</th><th>Run ID</th><th>Configuration</th><th>Result</th><th>Quality</th><th>Actions</th></tr></thead><tbody>{visibleRuns.map((run) => <tr key={run.run_id}><td>{fmtTs(run.started_utc_ms)}</td><td className="mono">{run.run_id}</td><td>{run.configuration_name || (run.requested_config_json ? 'Recorded snapshot' : <span className="muted-text">Snapshot unavailable</span>)}</td><td><Badge tone={statusTone(run.state)}>{run.state}</Badge></td><td>{run.quality_status ? <Badge tone={statusTone(run.quality_status)}>{run.quality_status}</Badge> : '—'}</td><td><button className="btn sm" onClick={() => setSelectedRunId(run.run_id)}>View result</button></td></tr>)}</tbody></table></div><div className="pagination"><span>Page {runPage} of {totalRunPages}</span><button className="btn sm" disabled={runPage === 1} onClick={() => setRunPage((x) => x - 1)}>Previous</button><button className="btn sm" disabled={runPage === totalRunPages} onClick={() => setRunPage((x) => x + 1)}>Next</button></div></>}
-    </Card>{selectedRunId && <RunResultDetail runId={selectedRunId} nav={nav} onDelete={() => removeRun(selectedRunId)} onClose={() => setSelectedRunId('')} />}</div>}
+    {tab === 'history' && <div className="stack"><Card title="Run History" sub={experiment.environment === 'RC' ? 'Newest first. Each Run stores its execution-time Workflow snapshot.' : 'Newest first. Each Run uses its execution-time Configuration snapshot.'} right={<button className="btn" onClick={async () => { try { setResultTree(await api.get(`/api/experiments/${encodeURIComponent(experiment.experiment_id)}/result-tree`)); } catch (error) { toast('err', error instanceof Error ? error.message : String(error)); } }}>Batch read all results</button>}>
+      {runs.loading && !runs.data ? <Spinner /> : runs.error ? <><ErrorBox error={runs.error} /><button className="btn sm" onClick={runs.reload}>Retry</button></> : !runs.data?.length ? <EmptyState><b>No run history</b><br />No Runs have been recorded yet. Execute Runs from Dashboard.</EmptyState> : <><div className="table-wrap"><table className="data"><thead><tr><th>Time</th><th>Run ID</th><th>{experiment.environment === 'RC' ? 'Workflow' : 'Configuration'}</th><th>Result</th><th>Quality</th><th>Actions</th></tr></thead><tbody>{visibleRuns.map((run) => <tr key={run.run_id}><td>{fmtTs(run.started_utc_ms)}</td><td className="mono">{run.run_id}</td><td>{experiment.environment === 'RC' ? 'RC Workflow' : run.configuration_name || (run.requested_config_json ? 'Recorded snapshot' : <span className="muted-text">Snapshot unavailable</span>)}</td><td><Badge tone={statusTone(run.state)}>{run.state}</Badge></td><td>{run.quality_status ? <Badge tone={statusTone(run.quality_status)}>{run.quality_status}</Badge> : '—'}</td><td><button className="btn sm" onClick={() => setSelectedRunId(run.run_id)}>View result</button></td></tr>)}</tbody></table></div><div className="pagination"><span>Page {runPage} of {totalRunPages}</span><button className="btn sm" disabled={runPage === 1} onClick={() => setRunPage((x) => x - 1)}>Previous</button><button className="btn sm" disabled={runPage === totalRunPages} onClick={() => setRunPage((x) => x + 1)}>Next</button></div></>}
+    </Card>{resultTree && <Card title={`${resultTree.experiment_id}/`} sub={`${resultTree.run_count} Run root director${resultTree.run_count === 1 ? 'y' : 'ies'} loaded in one request.`}><div className="stack">{resultTree.runs.map((run) => <details className="details" key={run.run_id}><summary>📁 {run.run_id}/ · {run.state}</summary><div className="details-body"><div className="result-counts">{Object.entries(run.counts).map(([name, count]) => <span key={name}>📂 {name}/ <b>{count}</b></span>)}</div>{run.files.map((file) => <div className="mono" key={file.file_path}>└─ {file.file_path}</div>)}<button className="btn sm" onClick={() => setSelectedRunId(run.run_id)}>Open Run</button></div></details>)}</div></Card>}{selectedRunId && <RunResultDetail runId={selectedRunId} nav={nav} onDelete={() => removeRun(selectedRunId)} onClose={() => setSelectedRunId('')} />}</div>}
 
-    <details className="danger-zone"><summary>Danger Zone</summary><div className="row between"><div><b>Export or delete this Experiment</b><div className="muted-text">Deletion includes conditions, Runs, Configurations and derived files.</div></div><div className="row"><button className="btn" onClick={onExport}>Export everything</button><button className="btn danger" onClick={onDelete}>Delete Experiment</button></div></div></details>
+    <details className="danger-zone"><summary>Danger Zone</summary><div className="row between"><div><b>Export or delete this Experiment</b><div className="muted-text">Deletion includes the {experiment.environment === 'RC' ? 'Workflow' : 'Configurations'}, Runs and derived files.</div></div><div className="row"><button className="btn" onClick={onExport}>Export everything</button><button className="btn danger" onClick={onDelete}>Delete Experiment</button></div></div></details>
     {pending && <Modal title={pending.title} sub={pending.body} onClose={() => setPending(null)} footer={<><button className="btn" onClick={() => setPending(null)}>Cancel</button><button className="btn danger" onClick={() => { const action = pending.action; setPending(null); action(); }}>Confirm</button></>}><p>This action is explicit and will not alter frozen historical Run snapshots unless the action is Run deletion.</p></Modal>}
   </div>;
 }
@@ -331,24 +367,27 @@ function ConfigurationEditor({ editor, setEditor, errors, apiError, saving, onSa
   editor: ConfigEditor; setEditor: Dispatch<SetStateAction<ConfigEditor | null>>; errors: Record<string, string>;
   apiError: Error | null; saving: boolean; onSave: () => void; onCancel: () => void;
 }) {
+  const [rcStage, setRcStage] = useState<'sync' | 'calibration' | 'noise' | 'loaded' | 'rotation'>('sync');
   const c = editor.config;
   const set = (key: string, value: string) => setEditor((old) => old ? { ...old, config: { ...old.config, [key]: value } } : old);
   const input = (label: string, key: string, hint?: string) => <Field label={label} hint={hint}><input className="mono" type="number" value={c[key]} onChange={(e) => set(key, e.target.value)} />{errors[key] && <span className="field-error">{errors[key]}</span>}</Field>;
   const range = QM_MCS_RANGE[c.qm];
-  return <Card title={editor.id == null ? 'Add Configuration' : 'Edit Configuration'} sub="Unsaved changes are protected when you leave this editor."><div className="stack">
-    {apiError && <ErrorBox error={apiError} />}<Field label="Configuration name"><input value={editor.name} onChange={(e) => setEditor({ ...editor, name: e.target.value })} />{errors.name && <span className="field-error">{errors.name}</span>}</Field>
+  return <Card title={editor.environment === 'RC' ? 'Edit RC Workflow' : editor.id == null ? 'Add Configuration' : 'Edit Configuration'} sub="Unsaved changes are protected when you leave this editor."><div className="stack">
+    {apiError && <ErrorBox error={apiError} />}{editor.environment !== 'RC' && <Field label="Configuration name"><input value={editor.name} onChange={(e) => setEditor({ ...editor, name: e.target.value })} />{errors.name && <span className="field-error">{errors.name}</span>}</Field>}
     <section><h3>RF</h3><div className="grid cols-4">{input('Frequency', 'frequencyMHz', 'MHz')}{input('Bandwidth', 'bandwidthMHz', 'MHz')}{input('TX Gain', 'txGainDb', 'dB')}{input('RX Gain', 'rxGainDb', 'dB')}</div></section>
     <section><h3>PUSCH</h3><div className="grid cols-3"><Field label="Mode"><select value={c.puschTargetMode} onChange={(e) => set('puschTargetMode', e.target.value)}><option value="auto">Auto</option><option value="manual">Manual</option></select></Field>{c.puschTargetMode === 'manual' && input('Target SNR', 'puschTargetSnrDb', 'dB · stored internally as ×10')}</div></section>
     <section><h3>UL Scheduler</h3><div className="grid cols-4"><Field label="Mode"><select value={c.schedulerMode} onChange={(e) => set('schedulerMode', e.target.value)}><option value="auto">Auto</option><option value="manual">Manual</option></select></Field>{c.schedulerMode === 'manual' && <><Field label="Modulation"><select value={c.qm} onChange={(e) => set('qm', e.target.value)}><option value="">Select…</option>{QM_OPTIONS.map((x) => <option key={x.value} value={x.value}>{x.label}</option>)}</select>{errors.qm && <span className="field-error">{errors.qm}</span>}</Field>{input('MCS', 'mcs', range ? `${range.min}–${range.max} for selected modulation` : 'Select modulation first')}{input('N_PRB', 'nPrb')}</>}</div></section>
     <section><h3>Traffic</h3><div className="grid cols-3">{input('UL Traffic', 'ulTrafficMbps', 'Mbps · values ≥100 request saturation')}</div></section>
-    {editor.environment === 'RC' && <section><h3>RC Chamber</h3>
-      <h4>Stirrer</h4><div className="grid cols-3">{input('Step angle', 'rc.step_deg', 'degrees')}{input('Samples', 'rc.n_steps')}</div>
-      <h4>Timing</h4><div className="grid cols-3">{input('Measurement dwell', 'rc.dwell_s', 'seconds')}{input('Mechanical settle', 'rc.settle_s', 'seconds')}{input('Servo settle', 'rc.servo_settle_s', 'seconds')}</div>
-      <h4>RSSP Servo</h4><div className="grid cols-4">{input('Target PUSCH RSSI', 'rc.target_rssp_db', 'dBFS')}{input('Tolerance', 'rc.rssp_tol_db', 'dB')}{input('PUSCH step', 'rc.pusch_step_x10', '×0.1 dB')}{input('Max iterations', 'rc.max_servo_iters')}</div>
-      <h4>CIR / Noise</h4><div className="grid cols-3">{input('Noise frames', 'rc.noise_frames')}{input('Noise margin', 'rc.noise_margin_db', 'dB')}{input('Peak prominence', 'rc.peak_prominence_db', 'dB')}{input('Delay window start', 'rc.delay_window_start_ns', 'ns')}{input('Delay window end', 'rc.delay_window_end_ns', 'ns · 0 = auto')}</div>
-      <h4>Execution Mode</h4><Field label="Mode"><select value={c.executionMode} onChange={(e) => set('executionMode', e.target.value)}><option value="REAL_HARDWARE">Real hardware</option><option value="SIMULATION">Simulation</option></select></Field>
+    {editor.environment === 'RC' && <section><h3>RC Chamber Workflow</h3><div className="rc-stage-flow">{([['sync', 'Time Sync'], ['calibration', 'Power Calibration'], ['noise', 'Noise Capture'], ['loaded', 'Loaded Capture'], ['rotation', 'Stirrer Rotation']] as const).map(([key, label], index) => <span key={key}><button type="button" className={rcStage === key ? 'active' : ''} onClick={() => setRcStage(key)}>{label}</button>{index < 4 && <b>→</b>}</span>)}</div>
+      <div className="rc-stage-panel">
+        {rcStage === 'sync' && <><h4>Time Sync</h4><div className="grid cols-3">{input('Clock exchanges', 'rc.sync_exchanges')}{input('Maximum RTT', 'rc.sync_max_rtt_ms', 'ms')}</div></>}
+        {rcStage === 'calibration' && <><h4>Power Calibration</h4><div className="grid cols-4">{input('Target RSSP', 'rc.target_rssp_db', 'dBFS')}{input('Tolerance', 'rc.rssp_tol_db', 'dB')}{input('Target SNR step', 'rc.pusch_step_x10', '×0.1 dB')}{input('TX Gain step', 'rc.tx_gain_step_db', 'dB')}{input('Max iterations', 'rc.max_servo_iters')}{input('Servo settle', 'rc.servo_settle_s', 'seconds')}<Field label="Adjust Target SNR"><select value={c['rc.adjust_target_snr']} onChange={(e) => set('rc.adjust_target_snr', e.target.value)}><option value="1">Enabled</option><option value="0">Disabled</option></select></Field><Field label="Adjust TX Gain"><select value={c['rc.adjust_tx_gain']} onChange={(e) => set('rc.adjust_tx_gain', e.target.value)}><option value="0">Disabled</option><option value="1">Enabled</option></select></Field></div></>}
+        {rcStage === 'noise' && <><h4>Noise Capture</h4><div className="grid cols-3">{input('Noise frames', 'rc.noise_frames')}{input('Noise margin', 'rc.noise_margin_db', 'dB')}{input('Peak prominence', 'rc.peak_prominence_db', 'dB')}{input('Delay window start', 'rc.delay_window_start_ns', 'ns')}{input('Delay window end', 'rc.delay_window_end_ns', 'ns · 0 = physical auto window')}</div></>}
+        {rcStage === 'loaded' && <><h4>Loaded Capture</h4><div className="grid cols-3">{input('Measurement dwell', 'rc.dwell_s', 'seconds')}{input('Mechanical settle', 'rc.settle_s', 'seconds')}</div></>}
+        {rcStage === 'rotation' && <><h4>Stirrer Rotation</h4><div className="grid cols-3">{input('Step angle', 'rc.step_deg', 'degrees')}{input('Samples', 'rc.n_steps')}{input('Speed', 'rc.stirrer_speed_deg_s', 'degrees / second')}<Field label="Execution Mode"><select value={c.executionMode} onChange={(e) => set('executionMode', e.target.value)}><option value="REAL_HARDWARE">Real hardware</option><option value="SIMULATION">Simulation</option></select></Field></div></>}
+      </div>
     </section>}
-    <div className="row"><button className="btn primary" disabled={saving} onClick={onSave}>{saving ? 'Saving…' : 'Save Configuration'}</button><button className="btn" onClick={onCancel}>Cancel</button></div>
+    <div className="row"><button className="btn primary" disabled={saving} onClick={onSave}>{saving ? 'Saving…' : editor.environment === 'RC' ? 'Save Workflow' : 'Save Configuration'}</button><button className="btn" onClick={onCancel}>Cancel</button></div>
   </div></Card>;
 }
 
@@ -358,8 +397,9 @@ function RunResultDetail({ runId, nav, onDelete, onClose }: { runId: string; nav
   if (run.error) return <Card title="Run Result"><ErrorBox error={run.error} /><button className="btn sm" onClick={run.reload}>Retry</button></Card>;
   if (!run.data) return null;
   const item = run.data;
+  const isRc = item.condition?.environment === 'RC';
   return <Card title="Result Detail" sub={`${item.experiment_id} / ${item.run_id}`} right={<button className="btn sm" onClick={onClose}>Close</button>}><div className="stack">
-    <div className="result-context"><div><span>Experiment</span><b>{item.experiment_id}</b></div><div><span>Run</span><b>{item.run_id}</b></div><div><span>Configuration</span><b>{item.configuration_name || (item.requested_config ? 'Recorded snapshot' : 'Snapshot unavailable')}</b></div><div><span>Status</span><Badge tone={statusTone(item.quality_status || item.state)}>{item.quality_status || item.state}</Badge></div></div>
+    <div className="result-context"><div><span>Experiment</span><b>{item.experiment_id}</b></div><div><span>Run</span><b>{item.run_id}</b></div><div><span>{isRc ? 'Workflow' : 'Configuration'}</span><b>{isRc ? 'RC Workflow' : item.configuration_name || (item.requested_config ? 'Recorded snapshot' : 'Snapshot unavailable')}</b></div><div><span>Status</span><Badge tone={statusTone(item.quality_status || item.state)}>{item.quality_status || item.state}</Badge></div></div>
     <section><h3>Run Summary</h3><dl className="config-values"><div><dt>Run ID</dt><dd>{item.run_id}</dd></div><div><dt>Experiment ID</dt><dd>{item.experiment_id}</dd></div><div><dt>Condition ID</dt><dd>{item.condition_id}</dd></div><div><dt>Started</dt><dd>{fmtTs(item.started_utc_ms)}</dd></div><div><dt>Completed</dt><dd>{fmtTs(item.ended_utc_ms)}</dd></div><div><dt>State</dt><dd>{item.state}</dd></div><div><dt>Quality</dt><dd>{item.quality_status || 'Not evaluated'}</dd></div></dl></section>
     <section><h3>Requested Configuration</h3><ConfigValues data={item.requested_config} /></section><section><h3>Applied / Verified Configuration</h3><ConfigValues data={item.actual_config} /></section>
     <section><h3>Result</h3><div className="result-counts"><span>Phone records <b>{item.record_counts?.phone ?? 0}</b></span><span>gNB records <b>{item.record_counts?.gnb ?? 0}</b></span><span>CIR records <b>{item.record_counts?.cir ?? 0}</b></span><span>Clips <b>{item.record_counts?.clips ?? 0}</b></span></div>{item.last_error && <ErrorBox error={item.last_error} />}<button className="btn primary" onClick={() => nav(`/timeline/${encodeURIComponent(item.experiment_id)}/${encodeURIComponent(item.run_id)}`)}>Open Result Workspace</button></section>

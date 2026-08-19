@@ -44,6 +44,10 @@ public class MT_API
     [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
     public static extern Int32 MT_DeInit();
     [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
+    public static extern Int32 MT_Open_UART(String sCOM);
+    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
+    public static extern Int32 MT_Close_UART();
+    [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
     public static extern Int32 MT_Open_USB();
     [DllImport("MT_API.dll", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
     public static extern Int32 MT_Close_USB();
@@ -77,6 +81,7 @@ public static class StirrerAgent
 {
     private const double StepsPerDeg = 3200.0;
     private static bool _opened = false;
+    private static bool _uart = false;
 
     private static string Cmd(string name, Dictionary<string, object> args)
     {
@@ -90,8 +95,11 @@ public static class StirrerAgent
                     {
                         int rc = MT_API.MT_Init();
                         if (rc != MT_API.R_OK) return Err("MT_Init rc=" + rc);
-                        rc = MT_API.MT_Open_USB();
-                        if (rc != MT_API.R_OK) { MT_API.MT_DeInit(); return Err("MT_Open_USB rc=" + rc + " (controller attached?)"); }
+                        object portValue;
+                        string port = args.TryGetValue("port", out portValue) ? Convert.ToString(portValue) : "";
+                        _uart = !String.IsNullOrEmpty(port);
+                        rc = _uart ? MT_API.MT_Open_UART(port) : MT_API.MT_Open_USB();
+                        if (rc != MT_API.R_OK) { MT_API.MT_DeInit(); return Err((_uart ? "MT_Open_UART " + port : "MT_Open_USB") + " rc=" + rc + " (controller attached?)"); }
                         _opened = true;
                         int axes = 0;
                         MT_API.MT_Get_Axis_Num(ref axes);
@@ -99,7 +107,7 @@ public static class StirrerAgent
                     }
                     return Json(Ok(null));
                 case "close":
-                    if (_opened) { try { MT_API.MT_Close_USB(); } catch { } try { MT_API.MT_DeInit(); } catch { } _opened = false; }
+                    if (_opened) { try { if (_uart) MT_API.MT_Close_UART(); else MT_API.MT_Close_USB(); } catch { } try { MT_API.MT_DeInit(); } catch { } _opened = false; _uart = false; }
                     return Json(Ok(null));
                 case "check":
                 {
@@ -251,6 +259,26 @@ class StirrerError(RuntimeError):
     pass
 
 
+def list_com_ports() -> list[str]:
+    """Enumerate Windows COM ports without adding a pyserial dependency."""
+    ports: set[str] = set()
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM")
+        index = 0
+        while True:
+            try:
+                _, value, _ = winreg.EnumValue(key, index)
+                ports.add(str(value).upper())
+                index += 1
+            except OSError:
+                break
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+    return sorted(ports, key=lambda value: (len(value), value))
+
+
 class StirrerAgent:
     """Thread-safe wrapper over the x86 helper process (or a virtual motor).
 
@@ -259,11 +287,15 @@ class StirrerAgent:
     """
 
     def __init__(self, settings: Settings, simulate: bool = False,
+                 com_port: Optional[str] = None,
                  speed_deg_s: float = 20.0, accel_deg_s2: float = 40.0):
         self.s = settings
         self.simulate = simulate
         self.speed_deg_s = speed_deg_s
         self.accel_deg_s2 = accel_deg_s2
+        saved_port = settings.data_dir / "stirrer_port.txt"
+        self.com_port = (com_port or (saved_port.read_text(encoding="utf-8").strip()
+                                     if saved_port.exists() else "")) or None
         self.tools_dir = settings.data_dir / "tools"
         self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
@@ -404,7 +436,7 @@ class StirrerAgent:
 
     # ---- public API --------------------------------------------------------- #
     def open(self) -> dict:
-        r = self._request("open", timeout=30.0)
+        r = self._request("open", {"port": self.com_port or ""}, timeout=30.0)
         if not r.get("ok"):
             self.last_error = r.get("error")
             return r
@@ -472,6 +504,7 @@ class StirrerAgent:
 
     def status(self) -> dict:
         st: dict[str, Any] = {"simulated": self.simulate, "opened": self._opened,
+                              "com_port": self.com_port,
                               "dll_found": find_mt_api_dll() is not None}
         try:
             exe = self._exe_path()

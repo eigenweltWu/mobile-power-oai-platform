@@ -8,6 +8,8 @@ export interface Experiment {
   purpose?: string | null;
   flow?: string | null;
   initial_oai_config?: string | null;
+  ac_template_enabled?: number | boolean | null;
+  ac_template_json?: string | null;
   created_utc: string | null;
   schema_version: number | null;
 }

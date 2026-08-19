@@ -461,17 +461,172 @@ class DownlinkLoop:
             pass
 
 
+class AcTemplateRunner(threading.Thread):
+    """Platform-owned AC phase sequencer.
+
+    The phone receives one finite phase at a time. This lets the platform
+    restart/apply the Configuration before a LOADED interval without charging
+    that restart time to the requested phase duration.
+    """
+
+    def __init__(self, flow, experiment_id: str, run_id: str, serial: str,
+                 pc_port: int, phases: list[dict], initial_configuration_id: int | None):
+        super().__init__(daemon=True, name=f"ac-template-{experiment_id}")
+        self.flow = flow
+        self.experiment_id = experiment_id
+        self.run_id = run_id
+        self.serial = serial
+        self.pc_port = pc_port
+        self.phases = phases
+        self.configuration_id = initial_configuration_id
+        self._stop_event = threading.Event()
+        self.state = "waiting_sync"
+        self.phase_index = -1
+        self.phase_started_ms: int | None = None
+        self.error: str | None = None
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def status(self) -> dict:
+        phase = self.phases[self.phase_index] if 0 <= self.phase_index < len(self.phases) else None
+        duration = float((phase or {}).get("durationSeconds") or 0)
+        elapsed = max(0.0, (int(time.time() * 1000) - self.phase_started_ms) / 1000.0) if self.phase_started_ms else 0.0
+        return {
+            "running": self.is_alive(), "state": self.state, "run_id": self.run_id,
+            "phase_index": self.phase_index, "phase_count": len(self.phases),
+            "phase": phase, "phase_elapsed_s": elapsed,
+            "phase_remaining_s": max(0.0, duration - elapsed) if duration else None,
+            "configuration_id": self.configuration_id, "error": self.error,
+        }
+
+    def _phone_phase(self, phase: dict) -> None:
+        plan = {
+            "experimentId": self.experiment_id, "runId": self.run_id,
+            "conditionId": f"{self.experiment_id}_default", "environment": "AC",
+            "plannedStartUtc": "", "startDelaySeconds": 0.0,
+            "idleSeconds": float(phase.get("durationSeconds") or 0),
+            "collectionSeconds": float(phase.get("durationSeconds") or 0),
+            "ulTrafficMbps": float(phase.get("ulTrafficMbps") or 0),
+            "phases": [
+                {"name": str(phase["name"]).lower(),
+                 "durationSeconds": float(phase["durationSeconds"])},
+                {"name": "idle", "durationSeconds": 0.0},
+            ],
+        }
+        with self.flow._phone(self.serial, self.pc_port) as (agent, _):
+            agent.session(plan)
+            agent.rearm()
+
+    def _start_nettest(self, target_mbps: float) -> None:
+        if target_mbps <= 0:
+            return
+        response = self.flow.oai.nettest_start("uplink", "udp", target_mbps)
+        session = response.get("session")
+        if not isinstance(session, dict):
+            candidate = response.get("state")
+            session = candidate if isinstance(candidate, dict) else response
+        if not (session.get("running") or session.get("state") in {"STARTING", "RUNNING"}):
+            raise RuntimeError("OAI NetworkTest did not start for LOADED phase")
+
+    def _stop_nettest(self) -> None:
+        try:
+            self.flow.oai.nettest_stop()
+        except Exception:
+            pass
+
+    def run(self) -> None:
+        try:
+            loop = self.flow.downlinks.get(self.experiment_id)
+            while not self._stop_event.is_set() and loop and not loop.sync_confirmed:
+                self._stop_event.wait(0.25)
+            if self._stop_event.is_set() or not loop:
+                return
+            for index, phase in enumerate(self.phases):
+                if self._stop_event.is_set():
+                    return
+                self.phase_index = index
+                kind = str(phase["name"]).upper()
+                target_id = phase.get("configurationId")
+                if kind == "LOADED" and target_id is not None and int(target_id) != self.configuration_id:
+                    self.state = "restarting_gnb"
+                    self.flow.apply_template(
+                        self.experiment_id, int(target_id), self.serial, self.pc_port,
+                        rearm=False)
+                    self.configuration_id = int(target_id)
+                    if self._stop_event.is_set():
+                        return
+                self.state = kind.lower()
+                self._phone_phase(phase)
+                phase_anchor = time.monotonic()
+                self.phase_started_ms = int(time.time() * 1000)
+                if kind == "LOADED":
+                    row = self.flow.db.query_one("SELECT config_json FROM oai_templates WHERE id=?", (self.configuration_id,))
+                    cfg = json.loads(row["config_json"]) if row else {}
+                    target = float(phase.get("ulTrafficMbps") or cfg.get("ulTrafficMbps") or 0)
+                    self._start_nettest(target)
+                remaining = max(0.0, float(phase["durationSeconds"]) -
+                                (time.monotonic() - phase_anchor))
+                if self._stop_event.wait(remaining):
+                    self._stop_nettest()
+                    return
+                self._stop_nettest()
+            self.state = "finishing"
+            result = self.flow.stop_experiment(
+                self.experiment_id, self.serial, self.pc_port, requested_run_id=self.run_id)
+            if not result.get("discarded") and self.flow.db.get_run(self.run_id):
+                self.flow.db.transition(self.run_id, "COMPLETE", "AC Template completed automatically")
+            self.state = "completed"
+        except Exception as exc:
+            self.error = str(exc)
+            self.state = "failed"
+            self._stop_nettest()
+            if self._stop_event.is_set():
+                return
+            try:
+                self.flow.stop_experiment(
+                    self.experiment_id, self.serial, self.pc_port, requested_run_id=self.run_id)
+            finally:
+                if self.flow.db.get_run(self.run_id):
+                    self.flow.db.transition(self.run_id, "FAILED", f"AC Template failed: {exc}")
+
+
 class TaskFlow:
     def __init__(self, settings: Settings, db: Database, oai: OaiClient):
         self.s = settings
         self.db = db
         self.oai = oai
         self.downlinks: dict[str, DownlinkLoop] = {}
+        self.ac_templates: dict[str, AcTemplateRunner] = {}
         # OAI telemetry collectors per experiment (SnapshotCollector writes
         # ul/dl_goodput_mbps + PUSCH stats into oai_snapshots every second).
         self.collectors: dict[str, list] = {}
 
     # ---- phone connection (detected before every phone operation) ---------- #
+    def apply_calibration_gain(self, experiment_id: str, run_id: str, serial: str,
+                               tx_gain_db: float, rx_gain_db: float) -> dict:
+        """Apply an RC calibration Gain with the required real restart.
+
+        Gain is not a live OAI control. The phone is quiesced across the
+        restart and the PDU address is refreshed before calibration resumes.
+        """
+        quiesced = quiesce_phone(serial, True)
+        if quiesced:
+            time.sleep(2.0)
+        try:
+            result = self.oai.apply_condition(
+                {"txGainDb": tx_gain_db, "rxGainDb": rx_gain_db},
+                force_restart=True, request_prefix=f"{run_id}-rc-gain")
+        finally:
+            if quiesced:
+                quiesce_phone(serial, False)
+                time.sleep(8.0)
+        shake = shake_and_refresh(
+            self.s, self.oai, self.db, experiment_id, run_id, n_exchanges=1)
+        if not shake.get("ok"):
+            raise RuntimeError(f"UE did not return after calibration Gain restart: {shake}")
+        return {"result": result, "shake": shake}
+
     @contextmanager
     def _phone(self, serial: str, pc_port: int = 8420):
         """Yield (PhoneAgent, detection). Raise if the phone is unreachable.
@@ -572,15 +727,29 @@ class TaskFlow:
 
     # ---- OAI templates ----------------------------------------------------- #
     def list_templates(self, experiment_id: str) -> list[dict]:
-        return self.db.query(
+        rows = self.db.query(
             "SELECT t.*, CASE WHEN e.default_template_id=t.id THEN 1 ELSE 0 END AS is_default, "
             "(SELECT COUNT(*) FROM runs r WHERE r.configuration_id=t.id) AS used_by_runs "
             "FROM oai_templates t JOIN experiments e ON e.experiment_id=t.experiment_id "
             "WHERE t.experiment_id=? AND t.archived_utc IS NULL ORDER BY t.id",
             (experiment_id,))
+        experiment = self.db.query_one(
+            "SELECT environment,default_template_id FROM experiments WHERE experiment_id=?",
+            (experiment_id,))
+        if experiment and experiment.get("environment") == "RC" and rows:
+            workflow = next((row for row in rows if row.get("is_default")), rows[0])
+            workflow["name"] = "RC Workflow"
+            return [workflow]
+        return rows
 
     def add_template(self, experiment_id: str, name: str, config: dict) -> dict:
         from datetime import datetime, timezone
+        experiment = self.db.query_one(
+            "SELECT environment FROM experiments WHERE experiment_id=?", (experiment_id,))
+        if experiment and experiment.get("environment") == "RC" and self.db.query_one(
+                "SELECT 1 FROM oai_templates WHERE experiment_id=? AND archived_utc IS NULL",
+                (experiment_id,)):
+            raise ValueError("RC experiment has one Workflow; edit it instead")
         name = str(name or "").strip()
         if not name:
             raise ValueError("configuration name is required")
@@ -596,6 +765,10 @@ class TaskFlow:
 
     def update_template(self, experiment_id: str, template_id: int, name: str, config: dict) -> dict:
         from datetime import datetime, timezone
+        experiment = self.db.query_one(
+            "SELECT environment FROM experiments WHERE experiment_id=?", (experiment_id,))
+        if experiment and experiment.get("environment") == "RC":
+            name = "RC Workflow"
         name = str(name or "").strip()
         if not name:
             raise ValueError("configuration name is required")
@@ -665,7 +838,8 @@ class TaskFlow:
             (now, now, template_id, experiment_id))
 
     def apply_template(self, experiment_id: str, template_id: int,
-                       serial: str = "53616213", pc_port: int = 8420) -> dict:
+                       serial: str = "53616213", pc_port: int = 8420,
+                       rearm: bool = True) -> dict:
         row = self.db.query_one("SELECT * FROM oai_templates WHERE id=? AND experiment_id=?", (template_id, experiment_id))
         if not row:
             raise ValueError("template not found")
@@ -681,7 +855,7 @@ class TaskFlow:
             "SELECT run_id, state FROM runs WHERE experiment_id=? "
             "AND state IN ('PREPARING','ARMED','RUNNING') ORDER BY rowid DESC LIMIT 1",
             (experiment_id,))
-        if run:
+        if run and rearm:
             try:
                 with self._phone(serial, pc_port) as (agent, ph):
                     # NOTE: _phone() yields a (PhoneAgent, detection) tuple —
@@ -734,7 +908,7 @@ class TaskFlow:
         # The gNB restarted with new RF conditions — re-trigger the phone's
         # phase machine (idle → loaded → idle) over the 5G PDU link.
         rearm: dict = {"attempted": False}
-        if run:
+        if run and rearm:
             rearm["attempted"] = True
             try:
                 with self._phone(serial, pc_port) as (agent, ph):
@@ -762,7 +936,8 @@ class TaskFlow:
     def start_experiment(self, experiment_id: str, serial: str, pc_port: int = 8420,
                          collection_seconds: Optional[float] = None,
                          idle_seconds: Optional[float] = None,
-                         template_id: Optional[int] = None) -> dict:
+                         template_id: Optional[int] = None,
+                         ac_phases: Optional[list[dict]] = None) -> dict:
         exp = self.db.query_one("SELECT * FROM experiments WHERE experiment_id=?", (experiment_id,))
         if not exp:
             raise ValueError("experiment not found")
@@ -824,6 +999,15 @@ class TaskFlow:
             "ulTrafficMbps": ul_mbps,
             "phases": build_phases(idle_s, collection_s),
         }
+        requested_plan = json.loads(json.dumps(plan))
+        if ac_phases:
+            requested_plan["phases"] = ac_phases
+            requested_plan["templateEnabled"] = True
+            # The sequencer triggers one phase at a time after synchronization.
+            plan["idleSeconds"] = 0.0
+            plan["collectionSeconds"] = 0.0
+            plan["phases"] = [{"name": "idle", "durationSeconds": 0.0}]
+            plan["orchestrated"] = True
         if exp["environment"] == "RC":
             # RC measurement windows are owned exclusively by RcCampaign.
             # Arm into IDLE; do not run an unrelated AC-style loaded window
@@ -874,6 +1058,7 @@ class TaskFlow:
             "requested_config_json": json.dumps(initial or {}, ensure_ascii=False),
             "configuration_snapshot_json": json.dumps(snapshot, ensure_ascii=False),
             "execution_mode": mode, "simulation": 1 if mode == "SIMULATION" else 0,
+            "run_plan_json": json.dumps(requested_plan, ensure_ascii=False),
             "started_utc_ms": int(time.time() * 1000),
         })
         self.db.transition(run_id, "PREPARING", "start_experiment: gNB starting + downlink loop")
@@ -957,6 +1142,12 @@ class TaskFlow:
         loop.start()
         self.downlinks[experiment_id] = loop
 
+        if ac_phases:
+            runner = AcTemplateRunner(
+                self, experiment_id, run_id, serial, pc_port, ac_phases, configuration_id)
+            self.ac_templates[experiment_id] = runner
+            runner.start()
+
         # 6. OAI telemetry collectors — record per-UE ul/dl_goodput_mbps, PUSCH
         #    SNR/MCS/PRB into oai_snapshots (1 s) and scheduler events into
         #    oai_events (2 s) for THIS run, so the platform stores the gNB-side
@@ -966,7 +1157,8 @@ class TaskFlow:
                 "ue_in_sync": in_sync, "config_applied": initial,
                 "configuration_id": configuration_id, "configuration_name": configuration_name,
                 "downlink_started": True,
-                "sync_pending": True, "run_id": run_id, "phase_plan": plan,
+                "sync_pending": True, "run_id": run_id, "phase_plan": requested_plan,
+                "ac_template_started": bool(ac_phases),
                 "shake": shake}
 
     def stop_experiment(self, experiment_id: str, serial: str = "53616213",
@@ -978,6 +1170,9 @@ class TaskFlow:
         receives the stop command (records its stop timestamp) and the gNB
         is shut down, not just the downlink loop.
         """
+        ac_runner = self.ac_templates.pop(experiment_id, None)
+        if ac_runner and ac_runner is not threading.current_thread():
+            ac_runner.stop()
         loop = self.downlinks.pop(experiment_id, None)
         run_id = loop.run_id if loop else requested_run_id
         if loop:
@@ -1081,6 +1276,10 @@ class TaskFlow:
             "purpose": exp.get("purpose") or "",
             "flow": exp.get("flow") or "",
             "templates": [{"name": t["name"], "config": json.loads(t["config_json"])} for t in templates],
+            "runTemplate": {
+                "enabled": bool(exp.get("ac_template_enabled")),
+                "phases": json.loads(exp.get("ac_template_json") or "[]"),
+            } if exp["environment"] == "AC" else None,
         }
         with self._phone_usb(serial, pc_port) as agent:
             return agent.push_task(task)

@@ -95,10 +95,9 @@ class ExperimentService : Service() {
     }
 
     private fun arm(plan: ExperimentPlan) {
-        // Apply the phone-local "空载时间" override so the operator always
-        // gets their chosen stabilisation window regardless of what the PC
-        // plan originally contained.
-        val effective = applyLocalIdleOverride(plan)
+        // The platform owns every phase and duration. A phone-local override
+        // would make the measured run diverge from the recorded run plan.
+        val effective = plan
         Log.i(TAG, "arm() runId=" + effective.runId +
             " idleSec=" + effective.idleSeconds +
             " collectionSec=" + effective.collectionSeconds)
@@ -425,45 +424,6 @@ class ExperimentService : Service() {
         if (connected) {
             Log.w(TAG, "USB still connected when monitoring started — user should unplug it")
         }
-    }
-
-    /** Local "空载时间" override (seconds). The user can set this on the task
-     *  detail screen; it overrides whatever the PC plan shipped with so the
-     *  phone always observes the operator's chosen stabilisation window before
-     *  the loaded test begins. Default 15 s. */
-    private fun idleSecondsOverride(): Double {
-        val prefs = getSharedPreferences("agent_settings", Context.MODE_PRIVATE)
-        val raw = prefs.getLong("idle_seconds", -1L)
-        return if (raw < 0) 15.0 else raw.toDouble()
-    }
-
-    /**
-     * Apply the phone-local idle-seconds override to the PC-supplied plan.
-     * The first idle phase gets the overridden duration and the top-level
-     * idleSeconds field is aligned. All other phases and fields are preserved.
-     */
-    private fun applyLocalIdleOverride(plan: ExperimentPlan): ExperimentPlan {
-        val localIdle = idleSecondsOverride()
-        val phases = plan.phases.toMutableList()
-        if (phases.isEmpty()) {
-            phases += com.xjtlu.energyagent.run.Phase("idle", localIdle)
-            phases += com.xjtlu.energyagent.run.Phase("loaded", plan.collectionSeconds)
-            phases += com.xjtlu.energyagent.run.Phase("idle", 0.0)
-        } else {
-            var replacedFirstIdle = false
-            for (i in phases.indices) {
-                val p = phases[i]
-                if (!replacedFirstIdle && p.name.equals("idle", ignoreCase = true)) {
-                    phases[i] = p.copy(durationSeconds = localIdle)
-                    replacedFirstIdle = true
-                    break
-                }
-            }
-            if (!replacedFirstIdle) {
-                phases.add(0, com.xjtlu.energyagent.run.Phase("idle", localIdle))
-            }
-        }
-        return plan.copy(idleSeconds = localIdle, phases = phases)
     }
 
     private fun monitorSignal(nr: Map<String, Any?>, nowNs: Long) {

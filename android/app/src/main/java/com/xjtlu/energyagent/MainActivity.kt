@@ -370,14 +370,11 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /** Edit the no-signal refresh threshold (seconds) and the idle window
-     *  (空载时间, seconds before the loaded test begins). Both persist to the
-     *  same SharedPreferences bucket and are read by ExperimentService when
-     *  the next run arms. */
+    /** Phone-local recovery/network settings. Experiment phase timing is
+     *  intentionally controlled only by the platform run plan. */
     private fun showNoSignalSettings() {
         val prefs = getSharedPreferences("agent_settings", Context.MODE_PRIVATE)
         val currentNoSignal = prefs.getLong("no_signal_seconds", 60L)
-        val currentIdle = prefs.getLong("idle_seconds", 15L)
         val currentHost = prefs.getString("server_host", "192.168.70.129") ?: "192.168.70.129"
         val currentPort = prefs.getInt("server_port", 5201)
         val currentMbps = prefs.getFloat("target_mbps", 5.0f)
@@ -386,11 +383,6 @@ class MainActivity : AppCompatActivity() {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(currentNoSignal.toString())
             hint = "60"
-        }
-        val idleInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(currentIdle.toString())
-            hint = "15"
         }
         val hostInput = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT
@@ -447,13 +439,6 @@ class MainActivity : AppCompatActivity() {
         })
         container.addView(noSignalInput)
         container.addView(TextView(this).apply {
-            text = getString(R.string.settings_idle_title)
-            setTextColor(android.graphics.Color.parseColor("#111111"))
-            textSize = 14f
-            setPadding(0, 24, 0, 6)
-        })
-        container.addView(idleInput)
-        container.addView(TextView(this).apply {
             text = getString(R.string.settings_server_title)
             setTextColor(android.graphics.Color.parseColor("#111111"))
             textSize = 14f
@@ -465,7 +450,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(probeBtn)
         container.addView(probeResult)
         container.addView(TextView(this).apply {
-            text = getString(R.string.settings_idle_msg)
+            text = "实验的 IDLE / LOADED 时长由平台任务统一下发。"
             setTextColor(android.graphics.Color.parseColor("#666666"))
             textSize = 12f
             setPadding(0, 12, 0, 0)
@@ -475,7 +460,6 @@ class MainActivity : AppCompatActivity() {
             .setView(container)
             .setPositiveButton("保存") { _, _ ->
                 val ns = noSignalInput.text.toString().trim().toLongOrNull()
-                val ids = idleInput.text.toString().trim().toLongOrNull()
                 val host = hostInput.text.toString().trim()
                 val port = portInput.text.toString().trim().toIntOrNull()
                 val mbps = mbpsInput.text.toString().trim().toFloatOrNull()
@@ -483,10 +467,6 @@ class MainActivity : AppCompatActivity() {
                 if (ns != null && ns >= 5) {
                     prefs.edit().putLong("no_signal_seconds", ns).apply()
                     edits += "无信号阈值 ${ns}s"
-                }
-                if (ids != null && ids >= 0) {
-                    prefs.edit().putLong("idle_seconds", ids).apply()
-                    edits += "空载时间 ${ids}s"
                 }
                 if (host.isNotEmpty()) {
                     prefs.edit().putString("server_host", host).apply()

@@ -108,11 +108,14 @@ public static class StirrerAgent
                     if (steps != 0)
                     {
                         int speed = Math.Min(Math.Abs(steps), 2000);
-                        // Serial, one axis at a time: concurrent calls from two threads
-                        // interleave their writes on the same COM port, the controller
-                        // receives corrupted frames and does not rotate at all. The
-                        // vendor reference app also drives V then H sequentially.
+                        // Mirror the vendor app (FrmJQ.cs) exactly: it re-assigns
+                        // PortNameString immediately before every Rotate call and
+                        // drives V then H serially. Never issue Rotate calls from two
+                        // threads — interleaved writes on the same COM port corrupt
+                        // the frames and the controller stops executing them.
+                        Motor.PortNameString = _port;
                         string vResult = Motor.RotateV(steps, speed, 138, 138);
+                        Motor.PortNameString = _port;
                         string hResult = Motor.RotateH(steps, speed, 138, 138);
                         _positionDeg += delta;
                         var moved = Ok(null); moved["steps"] = steps;

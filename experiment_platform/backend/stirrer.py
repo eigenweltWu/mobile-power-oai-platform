@@ -309,6 +309,15 @@ class StirrerAgent:
     def _exe_path(self) -> Path:
         return self.tools_dir / "StirrerAgent.exe"
 
+    def _stage_mt_api_dll(self) -> None:
+        """Copy the vendored MT_API.dll next to the helper so P/Invoke finds it."""
+        dll = find_mt_api_dll()
+        if not dll:
+            raise StirrerError("MT_API.dll not found (measurement system not installed?)")
+        dst = self.tools_dir / "MT_API.dll"
+        if not dst.exists() or dst.stat().st_size != dll.stat().st_size:
+            shutil.copy2(dll, dst)
+
     def ensure_helper(self, force: bool = False) -> Path:
         """Compile the x86 helper (once) and stage MT_API.dll next to it."""
         self.tools_dir.mkdir(parents=True, exist_ok=True)
@@ -317,6 +326,9 @@ class StirrerAgent:
         hash_file = self.tools_dir / "StirrerAgent.srcsha"
         if (not force and exe.exists() and hash_file.exists()
                 and hash_file.read_text(encoding="utf-8").strip() == src_hash):
+            # Cached exe — still make sure the DLL is staged (it may have been
+            # deleted or never copied by an earlier run).
+            self._stage_mt_api_dll()
             return exe
         csc = next((c for c in _CSC_CANDIDATES if Path(c).exists()), None)
         if not csc:
@@ -329,11 +341,7 @@ class StirrerAgent:
         if r.returncode != 0:
             raise StirrerError(f"csc failed: {r.stderr[:500]}")
         hash_file.write_text(src_hash, encoding="utf-8")
-        dll = find_mt_api_dll()
-        if dll:
-            shutil.copy2(dll, self.tools_dir / "MT_API.dll")
-        else:
-            raise StirrerError("MT_API.dll not found (measurement system not installed?)")
+        self._stage_mt_api_dll()
         return exe
 
     def _spawn(self) -> None:

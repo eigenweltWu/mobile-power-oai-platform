@@ -20,6 +20,7 @@ experiment_platform/
 │   ├── phone_channel.py      USB(adb forward)/5G 双通道手机客户端
 │   ├── phone_detect.py       手机连接检测（OFFLINE/ATTACHED/CONNECTED）
 │   ├── collectors.py         snapshot / event / channel(CIR) / config 采集器
+│   ├── stirrer.py            混响室搅拌器 V/H 桨叶控制（内嵌 C# helper + 厂商 StirrerDll）
 │   ├── sync.py               手机↔PC NTP 式对时 + drift 修正
 │   ├── fusion.py             时钟修正 + 1 s 融合 + 能量积分
 │   ├── quality.py            运行质量标记
@@ -140,6 +141,21 @@ powershell -ExecutionPolicy Bypass -File E:\Pythonprojects\MOBILE\.tools\setup_r
 
 - CONNECTED 与 ATTACHED **可同时成立**（USB 连着 + 5G 也通）。
 - 手机操作自动选通道：CONNECTED 走 5G（PDU IP），否则 ATTACHED 走 adb forward；都不可达则报错 `phone OFFLINE`。
+
+---
+
+## 混响室搅拌器（RC Hardware Diagnosis）
+
+后端通过厂商 `StirrerDll`（32 位 .NET 程序集，`backend/vendor/`）驱动混响室 **V/H 两路搅拌桨叶**，
+由 `backend/stirrer.py` 内嵌的 C# helper（`data/tools/StirrerAgent.exe`，源码变更后自动重编译）代理调用，
+Web 端在 RC Hardware Diagnosis 页面连接/点动。
+
+- **双桨叶驱动**：每次旋转先 V 桨、后 H 桨（串行执行，与厂商参考应用 `ReverbChamberMeasSys` 一致）；stop 同时停两路。
+- **步数换算**：360° = 50000 步（`50000/360` 步/°），加/减速参数 138/138，转速上限 2000 步/s，均与厂商应用相同。
+- **COM 口独占**：连接期间 helper 进程持有串口（如 COM11）；厂商程序或其他软件使用前须先在页面 Disconnect。
+- **严禁并发调用** `RotateV`/`RotateH`：两个线程同时写串口会交错损坏指令帧，控制器收到乱码后将不再执行旋转
+  （此时 DLL 仍返回 done，勿被误导）。若已发生，给搅拌器控制器**断电重启**即可恢复。
+- 每次 Rotate 前重新赋值 `PortNameString`（复刻厂商应用的调用时序）；连接探活走 `TestConnection()`。
 
 ---
 

@@ -30,7 +30,6 @@ _HELPER_CS = r"""
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Ports;
 using System.Text;
 using StirrerDll;
 
@@ -42,13 +41,12 @@ public static class StirrerAgent
     private static string _port = "";
     private static double _positionDeg = 0.0;
 
-    private static void ProbePort(string port)
+    // The vendor Stirrers object opens and holds the COM port as soon as
+    // PortNameString is assigned, so liveness must be probed through the
+    // driver itself — an independent SerialPort open would collide with it.
+    private static bool ProbeOk(string result)
     {
-        using (var serial = new SerialPort(port, 9600, Parity.Even, 8, StopBits.One))
-        {
-            serial.RtsEnable = false;
-            serial.Open();
-        }
+        return result != null && result.IndexOf("success", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static string Cmd(string name, Dictionary<string, object> args)
@@ -64,9 +62,10 @@ public static class StirrerAgent
                         object portValue;
                         string port = args.TryGetValue("port", out portValue) ? Convert.ToString(portValue) : "";
                         if (String.IsNullOrWhiteSpace(port)) return Err("COM port is required");
-                        ProbePort(port);
+                        Motor.PortNameString = port;   // vendor driver opens and holds the port here
+                        string probe = Motor.TestConnection();
+                        if (!ProbeOk(probe)) return Err("open " + port + ": " + probe);
                         _port = port;
-                        Motor.PortNameString = port;
                         _opened = true;
                     }
                     var opened = Ok(null); opened["port"] = _port; opened["transport"] = "serial"; return Json(opened);
@@ -76,7 +75,12 @@ public static class StirrerAgent
                 case "check":
                 {
                     if (!_opened) return Err("not_open");
-                    try { ProbePort(_port); var d = Ok(null); d["check"] = true; d["rc"] = 0; return Json(d); }
+                    try
+                    {
+                        string r = Motor.TestConnection();
+                        bool ok = ProbeOk(r);
+                        var d = Ok(null); d["check"] = ok; d["rc"] = ok ? 0 : -1; d["detail"] = r; return Json(d);
+                    }
                     catch (Exception ex) { var d = Ok(null); d["check"] = false; d["rc"] = -1; d["detail"] = ex.Message; return Json(d); }
                 }
                 case "position":

@@ -125,6 +125,9 @@ const zh: Record<string, string> = {
   'Calibration points will appear when the first Sample reaches power calibration.': '首个样本进入功率校准后显示校准点。',
 
   'Overview': '概览', 'Configurations': '配置', 'History': '历史', 'Manage Experiment': '管理实验',
+  'Publish to Phone': '发布到手机', 'Publishing…': '正在发布…', '+ Add Phase': '+ 添加 Phase',
+  'No authorized USB phone is connected.': '未检测到已授权的 USB 手机。',
+  'USB phone connected, but Energy Agent is not running. Open the app on the phone and try again.': 'USB 手机已连接，但 Energy Agent 未运行。请在手机上打开应用后重试。',
   'New Experiment': '新建实验', '+ New Experiment': '+ 新建实验', 'Create Experiment': '创建实验', 'Create & Configure': '创建并配置',
   'Create Workflow': '创建工作流',
   'Search ID, operator or purpose': '搜索 ID、操作员或目的', 'All environments': '所有环境',

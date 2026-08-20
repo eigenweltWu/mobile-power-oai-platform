@@ -117,7 +117,7 @@ export default function PhoneSync() {
     (a, e) => a + e.runs.filter((r) => (r.phone_sample_count ?? 0) > r.platform_sample_count).length, 0);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div className="stack page-workspace phone-workspace">
       <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
         <StatCard
           icon="lock"

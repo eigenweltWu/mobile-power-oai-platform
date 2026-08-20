@@ -40,7 +40,7 @@ export default function Chamber({ onBack }: { initialExperimentId?: string; onBa
     finally { setBusy(false); }
   };
 
-  return <div className="stack">
+  return <div className="stack page-workspace hardware-workspace">
     <div className="page-head"><div><div className="title">RC Hardware Diagnostics</div><div className="subtitle">Connection checks and manual jog only. Workflow Preflight and Campaign execution remain in Run Control.</div></div>{onBack && <button className="btn" onClick={onBack}>← Advanced</button>}</div>
     {error != null && <ErrorBox error={error} />}
     <div className="notice-box">This page does not save the RC Workflow or start and stop Runs. Execution Mode belongs to the single RC Workflow.</div>

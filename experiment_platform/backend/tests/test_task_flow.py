@@ -54,6 +54,13 @@ def test_config_diff_reads_manual_scheduler_from_telemetry_controls():
     assert config_diff(requested, actual) == {}
 
 
+def test_config_diff_accepts_oai_frequency_quantization_only_within_half_mhz():
+    assert config_diff({"frequencyMHz": 3600}, {"frequencyMHz": 3600.48}) == {}
+    assert config_diff({"frequencyMHz": 3600}, {"frequencyMHz": 3600.51}) == {
+        "frequencyMHz": {"requested": 3600, "actual": 3600.51},
+    }
+
+
 def _make_loop(tmp_path) -> tuple[DownlinkLoop, Database, MagicMock]:
     from datetime import datetime, timezone
     s = Settings(data_dir=tmp_path / "data", web_dist_dir=tmp_path / "web",
@@ -554,6 +561,31 @@ def test_downlink_loop_shakes_when_phone_offline(tmp_path):
     assert loop.last_shake is not None
     assert loop.last_shake["ok"] is False
     # no ACK rows were written while offline
+    assert db.query("SELECT * FROM experiment_acks WHERE direction='downlink'") == []
+    db.close()
+
+
+def test_downlink_loop_shakes_when_cached_phone_ip_is_stale(tmp_path):
+    """A cached IP is not proof of reachability; failed downlink must re-shake."""
+    import json
+    import time as _t
+
+    loop, db, oai = _make_loop(tmp_path)
+    stale_agent = MagicMock()
+    stale_agent.downlink.side_effect = RuntimeError("stale UE address")
+    loop._resolve_agent = lambda: (stale_agent, None)
+    oai.shake.return_value = {
+        "ok": True, "ue_ip": "10.0.1.13", "monitoring": False, "exchanges": [],
+    }
+
+    loop.start()
+    _t.sleep(0.15)
+    loop.stop()
+
+    assert oai.shake.call_count == 1
+    assert loop.last_shake["ue_ip"] == "10.0.1.13"
+    state = json.loads((loop.settings.data_dir / "phone_state.json").read_text(encoding="utf-8"))
+    assert state["pdu_ip"] == "10.0.1.13"
     assert db.query("SELECT * FROM experiment_acks WHERE direction='downlink'") == []
     db.close()
 

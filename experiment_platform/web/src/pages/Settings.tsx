@@ -33,7 +33,7 @@ export default function Settings() {
   };
 
   return (
-    <div className="stack">
+    <div className="stack page-workspace settings-workspace">
       <div className="page-head">
         <div>
           <div className="title">Settings</div>

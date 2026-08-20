@@ -58,7 +58,7 @@ function ContextBar() {
 }
 
 function Advanced({ nav }: { nav: (path: string) => void }) {
-  return <div className="stack"><div className="page-head"><div><div className="title">Advanced / Research Tools</div><div className="subtitle">Hardware diagnostics and administrative settings outside the normal Run workflow.</div></div></div>
+  return <div className="stack page-workspace"><div className="page-head"><div><div className="title">Advanced / Research Tools</div><div className="subtitle">Hardware diagnostics and administrative settings outside the normal Run workflow.</div></div></div>
     <div className="grid cols-2"><Card title="RSSP Calibration" sub="OAI-only RC power-control servo test with live calibration visualization."><button className="btn" onClick={() => nav('/advanced/rssp-calibration')}>Open calibration</button></Card><Card title="RC Hardware" sub="Connection, manual jog, DLL, helper and simulation diagnostics."><button className="btn" onClick={() => nav('/advanced/rc-hardware')}>Open diagnostics</button></Card><Card title="System Settings" sub="OAI connectivity and administrative settings."><button className="btn" onClick={() => nav('/advanced/settings')}>Open settings</button></Card></div>
   </div>;
 }
@@ -66,6 +66,7 @@ function Advanced({ nav }: { nav: (path: string) => void }) {
 function AppShell() {
   const { language, setLanguage } = useLanguage();
   const [hash, nav] = useHashRoute();
+  const [compactNav, setCompactNav] = useState(() => window.localStorage.getItem('compact-nav') === '1');
   const pathPart = hash.split('?')[0];
   const segments = pathPart.replace(/^\/+/, '').split('/').filter(Boolean);
   const section = segments[0] || 'dashboard';
@@ -112,7 +113,7 @@ function AppShell() {
   const title = TITLES[section] ?? 'Dashboard';
 
   return (
-    <div className="app">
+    <div className={`app ${compactNav ? 'nav-compact' : ''}`}>
       <aside className="sidebar">
         <div className="sidebar-brand">
           <div className="logo">
@@ -124,10 +125,11 @@ function AppShell() {
             <div className="brand-name">5G Energy Platform</div>
             <div className="brand-sub">research instrument</div>
           </div>
+          <button className="nav-collapse" aria-label={compactNav ? 'Expand navigation' : 'Collapse navigation'} title={compactNav ? 'Expand navigation' : 'Collapse navigation'} onClick={() => setCompactNav((current) => { const next = !current; window.localStorage.setItem('compact-nav', next ? '1' : '0'); return next; })}>☰</button>
         </div>
         <nav className="side-nav">
           {NAV.map((n) => (
-            <button key={n.path} className={isActive(n.path) ? 'active' : ''} onClick={() => nav(n.path)}>
+            <button key={n.path} className={isActive(n.path) ? 'active' : ''} title={n.label} onClick={() => nav(n.path)}>
               <Icon name={n.icon} />
               {n.label}
             </button>
@@ -147,7 +149,7 @@ function AppShell() {
             <label className="language-switch"><span>Language</span><select aria-label="Language" value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh')}><option value="en">English</option><option value="zh">Chinese</option></select></label>
           </div>
         </header>
-        <ContextBar />
+        {section === 'dashboard' && <ContextBar />}
         <main className="page"><PageErrorBoundary key={hash}>{page}</PageErrorBoundary></main>
       </div>
       <ToastHost />

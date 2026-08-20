@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api';
 import type { Experiment, PlatformStatus } from '../types';
-import { Badge, Card, ErrorBox, Field, Spinner, StatCard, toast } from '../components/ui';
+import { readAcExecution } from '../acConfiguration';
+import { DEFAULT_GNB_CONFIGURATION, GnbConfigurationFields, TABLE2_MCS_RANGE, type GnbConfigurationKey, type GnbConfigurationValue } from '../components/GnbConfigurationFields';
+import { Badge, Card, ErrorBox, Field, Modal, Spinner, StatCard, toast } from '../components/ui';
 import { fmtBytes } from '../format';
 import { useOperatorContext } from '../context';
 import { Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
@@ -20,6 +22,22 @@ type Runtime = {
 
 const RUNNING = ['PREPARING', 'ARMED', 'RUNNING', 'STOPPING'];
 const parse = (json: string) => { try { return JSON.parse(json) as Record<string, any>; } catch { return {}; } };
+const runtimeForm = (config: Record<string, any>): GnbConfigurationValue => ({
+  frequencyMHz: config.frequencyMHz ?? DEFAULT_GNB_CONFIGURATION.frequencyMHz,
+  bandwidthMHz: config.bandwidthMHz ?? DEFAULT_GNB_CONFIGURATION.bandwidthMHz,
+  txGainDb: config.txGainDb ?? DEFAULT_GNB_CONFIGURATION.txGainDb,
+  rxGainDb: config.rxGainDb ?? DEFAULT_GNB_CONFIGURATION.rxGainDb,
+  puschTargetSnrDb: Number(config.puschTargetSnrX10 ?? DEFAULT_GNB_CONFIGURATION.puschTargetSnrDb * 10) / 10,
+  schedulerMode: config.schedulerMode === 'manual' ? 'manual' : 'auto',
+  qm: config.qm ?? DEFAULT_GNB_CONFIGURATION.qm, mcs: config.mcs ?? DEFAULT_GNB_CONFIGURATION.mcs,
+  nPrb: config.nPrb ?? DEFAULT_GNB_CONFIGURATION.nPrb, ulTrafficMbps: config.ulTrafficMbps ?? 5,
+});
+const runtimeConfig = (form: GnbConfigurationValue, base: Record<string, any>) => {
+  const config: Record<string, any> = { ...base, frequencyMHz: Number(form.frequencyMHz), bandwidthMHz: Number(form.bandwidthMHz), txGainDb: Number(form.txGainDb), rxGainDb: Number(form.rxGainDb), puschTargetMode: 'manual', puschTargetSnrX10: Math.round(Number(form.puschTargetSnrDb) * 10), schedulerMode: form.schedulerMode, ulTrafficMbps: Number(form.ulTrafficMbps) };
+  if (form.schedulerMode === 'manual') Object.assign(config, { qm: Number(form.qm), mcs: Number(form.mcs), nPrb: Number(form.nPrb) });
+  else { delete config.qm; delete config.mcs; delete config.nPrb; }
+  return config;
+};
 
 export default function Dashboard({ nav }: { nav: (path: string) => void }) {
   const { value: context, update: updateContext } = useOperatorContext();
@@ -32,14 +50,20 @@ export default function Dashboard({ nav }: { nav: (path: string) => void }) {
   const [preflight, setPreflight] = useState<Preflight | null>(null);
   const [campaign, setCampaign] = useState<Campaign | null>(null);
   const [runtime, setRuntime] = useState<Runtime | null>(null);
-  const [busy, setBusy] = useState<'apply' | 'start' | 'stop' | ''>('');
+  const [busy, setBusy] = useState<'start' | 'stop' | ''>('');
+  const [view, setView] = useState<'setup' | 'readiness' | 'monitor'>('setup');
   const [error, setError] = useState<Error | null>(null);
+  const [runForm, setRunForm] = useState<GnbConfigurationValue>({ ...DEFAULT_GNB_CONFIGURATION, ulTrafficMbps: 5 });
+  const [runFormBaseline, setRunFormBaseline] = useState('');
+  const [showRunEditor, setShowRunEditor] = useState(false);
 
   const experiment = experiments.find((row) => row.experiment_id === experimentId);
   const configuration = configurations.find((row) => row.id === configurationId);
   const latestRun = status?.experiment.latest_run;
   const running = !!latestRun && RUNNING.includes(latestRun.state);
   const isRc = experiment?.environment === 'RC';
+  const usesAcTemplate = experiment?.environment === 'AC' && !!experiment.ac_template_enabled;
+  const acExecution = readAcExecution(experiment?.ac_template_json);
 
   const load = useCallback(async () => {
     try {
@@ -58,10 +82,22 @@ export default function Dashboard({ nav }: { nav: (path: string) => void }) {
       if (cancelled) return;
       setConfigurationExperimentId(experimentId);
       setConfigurations(rows);
-      setConfigurationId((old) => rows.some((row) => row.id === old) ? old : (rows.find((row) => row.is_default)?.id ?? rows[0]?.id ?? null));
+      setConfigurationId(rows.find((row) => row.is_default)?.id ?? rows[0]?.id ?? null);
     }).catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause : new Error(String(cause))); });
     return () => { cancelled = true; };
   }, [experimentId]);
+
+  useEffect(() => {
+    if (!configuration) return;
+    const base = parse(configuration.config_json); const next = runtimeForm(base);
+    setRunForm(next); setRunFormBaseline(JSON.stringify(runtimeConfig(next, base)));
+  }, [configuration?.id, configuration?.config_json]);
+  useEffect(() => {
+    if (!configurations.length) return;
+    const firstTemplateId = usesAcTemplate ? readAcExecution(experiment?.ac_template_json).rows[0]?.configurationId : undefined;
+    const desired = configurations.find((row) => row.id === firstTemplateId)?.id ?? configurations.find((row) => row.is_default)?.id ?? configurations[0].id;
+    setConfigurationId((current) => current === desired ? current : desired);
+  }, [configurations, experiment?.ac_template_json, usesAcTemplate]);
 
   const loadPreflight = useCallback(async () => {
     if (!experimentId || configurationExperimentId !== experimentId || configurationId == null) { setPreflight(null); return; }
@@ -87,24 +123,28 @@ export default function Dashboard({ nav }: { nav: (path: string) => void }) {
     status: latestRun?.experiment_id === experimentId ? latestRun.state : '',
   }), [experimentId, experiment?.environment, configurationId, configuration, latestRun, isRc, updateContext]);
 
-  const apply = async () => {
-    if (configurationId == null) return;
-    setBusy('apply'); setError(null);
-    try {
-      const result = await api.post<any>(`/api/experiments/${encodeURIComponent(experimentId)}/templates/${configurationId}/apply`, { serial: status?.phone.serial || '' });
-      if (result.verification_status === 'VERIFIED') toast('ok', isRc ? 'Workflow applied and verified.' : 'Configuration applied and verified.');
-      else setError(new Error(`Applied with differences: ${JSON.stringify(result.diff)}`));
-      await Promise.all([load(), loadPreflight()]);
-    } catch (cause) { setError(cause instanceof Error ? cause : new Error(String(cause))); }
-    finally { setBusy(''); }
-  };
-  const start = async () => {
-    if (!preflight?.ready || configurationId == null) return;
+  const runFormDirty = !!configuration && runFormBaseline !== '' && JSON.stringify(runtimeConfig(runForm, parse(configuration.config_json))) !== runFormBaseline;
+  const schedulerRange = TABLE2_MCS_RANGE[Number(runForm.qm)];
+  const runFormValid = ['frequencyMHz', 'bandwidthMHz', 'txGainDb', 'rxGainDb', 'puschTargetSnrDb', 'ulTrafficMbps'].every((key) => Number.isFinite(Number(runForm[key as GnbConfigurationKey]))) && Number(runForm.frequencyMHz) > 0 && Number(runForm.bandwidthMHz) > 0 && (runForm.schedulerMode !== 'manual' || !!schedulerRange && Number(runForm.mcs) >= schedulerRange[0] && Number(runForm.mcs) <= schedulerRange[1] && Number(runForm.nPrb) >= 1);
+
+  const start = async (restart = false) => {
+    if (configurationId == null || !configuration || (!usesAcTemplate && !isRc && !runFormValid)) return;
     setBusy('start'); setError(null);
     try {
-      const result = await api.post<any>(`/api/experiments/${encodeURIComponent(experimentId)}/start`, { template_id: configurationId, serial: status?.phone.serial || '' });
+      if (restart && running) await api.post(`/api/experiments/${encodeURIComponent(latestRun?.experiment_id || experimentId)}/stop`, { serial: status?.phone.serial || '' });
+      let startConfigurationId = configurationId;
+      if (!isRc && !usesAcTemplate && runFormDirty) {
+        const updated = await api.put<Configuration>(`/api/experiments/${encodeURIComponent(experimentId)}/templates/${configurationId}`, { name: configuration.name, config: runtimeConfig(runForm, parse(configuration.config_json)) });
+        startConfigurationId = updated.id; setConfigurationId(updated.id); setRunFormBaseline(JSON.stringify(runtimeConfig(runForm, parse(configuration.config_json))));
+        const rows = await api.get<Configuration[]>(`/api/experiments/${encodeURIComponent(experimentId)}/templates`); setConfigurations(rows);
+      }
+      const nextPreflight = await api.get<Preflight>(`/api/run-control/preflight?experiment_id=${encodeURIComponent(experimentId)}&configuration_id=${startConfigurationId}`);
+      if (!nextPreflight.ready) throw new Error(nextPreflight.issues.map((issue) => issue.label).join('; ') || 'Run is not ready.');
+      setPreflight(nextPreflight);
+      const result = await api.post<any>(`/api/experiments/${encodeURIComponent(experimentId)}/start`, { template_id: startConfigurationId, serial: status?.phone.serial || '', ...(!isRc && !usesAcTemplate ? { idle_seconds: acExecution.warmupSeconds, collection_seconds: acExecution.testSeconds } : {}) });
       updateContext({ runId: result.run_id, status: 'PREPARING' });
-      toast('ok', result.rc_campaign_started ? 'Run started; RC is waiting for post-restart UE sync.' : 'gNB restarted; waiting for post-restart UE sync.');
+      setShowRunEditor(false);
+      toast('ok', result.rc_campaign_started ? 'Run started; RC is waiting for post-restart UE sync.' : 'gNB restarted; sync → warm-up → test started.');
       await load();
     } catch (cause) { setError(cause instanceof Error ? cause : new Error(String(cause))); }
     finally { setBusy(''); }
@@ -126,26 +166,40 @@ export default function Dashboard({ nav }: { nav: (path: string) => void }) {
   const displayRunTerm = (value: string) => isRc
     ? value.replace(/\bConfigurations\b/g, 'Workflow').replace(/\bConfiguration\b/g, 'Workflow').replace(/\bconfigurations\b/g, 'workflow').replace(/\bconfiguration\b/g, 'workflow')
     : value;
+  const startDisabled = busy !== '' || !preflight?.ready || (usesAcTemplate && !acExecution.rows.length) || (!isRc && !usesAcTemplate && !runFormValid);
+  const runButtons = <div className="row">{running && !isRc && !usesAcTemplate && <button className="btn primary" disabled={startDisabled} onClick={() => start(true)}>{busy === 'start' ? 'Restarting…' : 'Restart with Parameters'}</button>}{!running && <button className="btn primary" disabled={startDisabled} onClick={() => start()}>{busy === 'start' ? 'Restarting gNB…' : 'Start Run'}</button>}{running && <button className="btn danger" disabled={busy !== ''} onClick={stop}>{busy === 'stop' ? 'Stopping…' : 'Stop Run'}</button>}</div>;
+  const effectiveRequested = !isRc && !usesAcTemplate && configuration ? runtimeConfig(runForm, parse(configuration.config_json)) : requested;
 
-  return <div className="stack">
-    <div className="page-head"><div><div className="title">Run Control</div><div className="subtitle">{isRc ? 'Review the complete RC Workflow, check external dependencies, then Start.' : 'Select a Configuration, check external dependencies, then Start. Every Start applies it and force-restarts gNB.'}</div></div><button className="btn" onClick={() => { load(); loadPreflight(); }}>Refresh</button></div>
+  return <div className="stack page-workspace run-control">
+    <div className="page-head"><div><div className="title">Run Control</div><div className="subtitle">{isRc ? 'Review the complete RC Workflow, check external dependencies, then Start.' : usesAcTemplate ? 'Run the saved Template sequence from top to bottom.' : 'Edit the Default Configuration at any time; every Start or Restart performs sync → warm-up → test.'}</div></div><div className="row"><button className="btn" onClick={() => { load(); loadPreflight(); }}>Refresh</button>{runButtons}</div></div>
     {error && <ErrorBox error={error} />}
+    <div className="tabs workspace-tabs" role="tablist" aria-label="Run control stages"><button className={view === 'setup' ? 'active' : ''} onClick={() => setView('setup')}>1 · Setup</button><button className={view === 'readiness' ? 'active' : ''} onClick={() => setView('readiness')}>2 · Readiness <Badge tone={preflight?.ready ? 'good' : 'warn'}>{preflight?.ready ? 'READY' : `${preflight?.issues.length || 0} ISSUES`}</Badge></button><button className={view === 'monitor' ? 'active' : ''} onClick={() => setView('monitor')}>3 · Live Monitor {running && <Badge tone="good">LIVE</Badge>}</button></div>
+    <div className="workspace-content stack">
+    {view === 'setup' && <>
     <div className="stat-grid"><StatCard label="Phone" value={status.phone.state} sub={status.phone.device || 'Device unavailable'} tone={status.phone.state === 'CONNECTED' ? 'good' : 'bad'} /><StatCard label="gNB Current State" value={status.oai.gnb_running ? 'RUNNING' : 'STOPPED'} sub={isRc ? 'Start always reapplies the Workflow and restarts gNB' : 'Start always applies Selected and restarts gNB'} tone={status.oai.gnb_running ? 'good' : 'muted'} /><StatCard label="UE Sync" value={status.oai.ue_in_sync ? 'CURRENTLY SYNCED' : 'WAITING'} sub="Established after Start and recorded as the Run time anchor" tone={status.oai.ue_in_sync ? 'good' : 'muted'} /><StatCard label="Storage" value={fmtBytes(status.storage.bytes)} sub={`${status.storage.n_files} indexed files`} tone="muted" /></div>
 
-    <Card title="Run Context" sub="A fresh Run ID and standard timing values are generated automatically on every Start."><div className="grid cols-2"><label className="field"><span>Experiment</span><select value={experimentId} disabled={running} onChange={(event) => setExperimentId(event.target.value)}>{experiments.map((row) => <option key={row.experiment_id} value={row.experiment_id}>{row.experiment_id} · {row.environment}</option>)}</select></label>{!isRc && <label className="field"><span>Selected for next Run</span><select value={configurationId ?? ''} disabled={running} onChange={(event) => setConfigurationId(Number(event.target.value))}>{configurations.map((row) => <option key={row.id} value={row.id}>{row.name} v{row.version ?? 1}{row.is_default ? ' · Default' : ''}</option>)}</select></label>}{isRc && <div className="field"><span>Workflow</span><b>RC Workflow</b></div>}</div></Card>
+    <Card title="Run Context" sub="A fresh Run ID is generated on every Start."><div className="grid cols-2"><label className="field"><span>Experiment</span><select value={experimentId} disabled={running} onChange={(event) => setExperimentId(event.target.value)}>{experiments.map((row) => <option key={row.experiment_id} value={row.experiment_id}>{row.experiment_id} · {row.environment}</option>)}</select></label>{!isRc && <div className="field"><span>Default Configuration</span><b>{configuration?.name || '—'} v{configuration?.version ?? '—'}</b></div>}{isRc && <div className="field"><span>Workflow</span><b>RC Workflow</b></div>}</div></Card>
 
-    {!isRc && <Card title="Configuration State" sub="Applied is informational. Start always reapplies Selected and force-restarts gNB." right={<button className="btn" disabled={busy !== '' || running || configurationId == null} onClick={apply}>{busy === 'apply' ? 'Applying & verifying…' : 'Apply without starting'}</button>}><div className="configuration-state"><div><span>Default</span><b>{configurations.find((row) => row.is_default)?.name || '—'}</b></div><div><span>Selected</span><b>{configuration?.name || '—'} v{configuration?.version ?? '—'}</b><Badge tone="accent">SELECTED FOR NEXT RUN</Badge></div><div><span>Currently Applied</span><b>{applied ? `${applied.configuration_name} v${applied.configuration_version}` : 'Unknown'}</b><Badge tone={selectedApplied ? 'good' : 'muted'}>{selectedApplied ? 'CURRENT MATCH' : 'WILL APPLY ON START'}</Badge></div><div><span>Active Run Snapshot</span><b>{running ? context.configurationName : '—'}</b></div></div>{applied?.diff && Object.keys(applied.diff).length > 0 && <div className="diff-list"><h3>Requested vs Applied</h3>{Object.entries(applied.diff).map(([key, values]) => <div key={key}><span>{key}</span><code>Requested {String(values.requested)}</code><code>Applied {String(values.actual)}</code><Badge tone="warn">DIFFERENT</Badge></div>)}</div>}</Card>}
-    {isRc && <Card title="RC Workflow State" sub="The complete Workflow is reapplied and gNB is restarted on every Start." right={<button className="btn" disabled={busy !== '' || running || configurationId == null} onClick={apply}>{busy === 'apply' ? 'Applying & verifying…' : 'Apply Workflow without starting'}</button>}><div className="configuration-state"><div><span>Workflow</span><b>RC Workflow</b></div><div><span>Currently Applied</span><b>{applied?.configuration_id === configurationId ? 'RC Workflow' : 'Unknown'}</b><Badge tone={selectedApplied ? 'good' : 'muted'}>{selectedApplied ? 'CURRENT MATCH' : 'WILL APPLY ON START'}</Badge></div><div><span>Active Run Snapshot</span><b>{running ? 'RC Workflow' : '—'}</b></div></div></Card>}
+    {!isRc && !usesAcTemplate && <Card title="Run Parameters" sub="Changes are saved to the Default Configuration when Start or Restart is pressed." right={<button className="btn" onClick={() => setShowRunEditor(true)}>Edit Parameters</button>}><dl className="configuration-summary"><div><dt>Radio</dt><dd>{runForm.frequencyMHz} MHz · {runForm.bandwidthMHz} MHz BW</dd></div><div><dt>TX / RX Gain</dt><dd>{runForm.txGainDb} / {runForm.rxGainDb} dB</dd></div><div><dt>PUSCH Target</dt><dd>{runForm.puschTargetSnrDb} dB</dd></div><div><dt>Scheduler</dt><dd>{runForm.schedulerMode === 'manual' ? `Qm ${runForm.qm} · MCS ${runForm.mcs}` : 'Auto'}</dd></div><div><dt>Warm-up / Test</dt><dd>{acExecution.warmupSeconds} / {acExecution.testSeconds} s</dd></div><div><dt>Draft</dt><dd>{runFormDirty ? <Badge tone="warn">UNSAVED</Badge> : <Badge tone="good">DEFAULT</Badge>}</dd></div></dl></Card>}
+    {!isRc && usesAcTemplate && <Card title="Phase Sequence" sub="Each Phase performs synchronization, warm-up and test with its saved Configuration."><dl className="configuration-summary"><div><dt>Phases</dt><dd>{acExecution.rows.length}</dd></div><div><dt>Initial Configuration</dt><dd>{configuration?.name || '—'}</dd></div><div><dt>Execution</dt><dd>Automatic completion</dd></div></dl>{!acExecution.rows.length && <div className="error-box">Add and save at least one Phase before starting.</div>}</Card>}
+    {isRc && <Card title="RC Workflow State" sub="Start applies and verifies the complete Workflow, restarts gNB, and then begins the Run."><div className="configuration-state"><div><span>Workflow</span><b>RC Workflow</b></div><div><span>Currently Applied</span><b>{applied?.configuration_id === configurationId ? 'RC Workflow' : 'Unknown'}</b><Badge tone={selectedApplied ? 'good' : 'muted'}>{selectedApplied ? 'CURRENT MATCH' : 'WILL APPLY ON START'}</Badge></div><div><span>Active Run Snapshot</span><b>{running ? 'RC Workflow' : '—'}</b></div></div></Card>}
+    </>}
 
+    {view === 'readiness' && <>
     <Card title="Preflight Checklist" sub={preflight?.ready ? 'Ready to Start · gNB restart and UE synchronization happen after Start' : `${preflight?.issues.length || 0} external dependency issue(s) need attention`}><div className="preflight-grid">{groups.map(([group, checks]) => <section key={group}><h3>{displayRunTerm(group)}</h3>{checks.map((check) => <div className={`preflight-row ${check.ok ? 'ok' : 'bad'}`} key={check.key}><span>{check.ok ? '✓' : '!'}</span><div><b>{displayRunTerm(check.label)}</b>{!check.ok && check.action && <button className="link-btn" onClick={() => check.action?.includes('Experiment') ? nav(`/experiments/${encodeURIComponent(experimentId)}`) : check.action?.includes('Data Import') ? nav('/sync') : nav('/advanced')}>{displayRunTerm(check.action)}</button>}</div></div>)}</section>)}</div></Card>
 
-    <Card title="Run Summary" sub="Review the selected conditions before execution. Run ID is assigned only when Start is accepted." right={running ? <button className="btn danger" disabled={busy !== ''} onClick={stop}>{busy === 'stop' ? 'Stopping…' : 'Stop Run'}</button> : <button className="btn primary" disabled={busy !== '' || !preflight?.ready} onClick={start}>{busy === 'start' ? 'Restarting gNB…' : 'Start Run'}</button>}>{!preflight?.ready && <div className="run-blocked"><b>Run cannot start</b><span>{preflight?.issues.length || 0} issue(s) need attention:</span><ul>{preflight?.issues.map((issue) => <li key={issue.key}>{issue.label}</li>)}</ul></div>}<dl className="config-values"><div><dt>Experiment</dt><dd>{experimentId || '—'}</dd></div><div><dt>{isRc ? 'Workflow' : 'Configuration'}</dt><dd>{isRc ? 'RC Workflow' : `${configuration?.name || '—'} v${configuration?.version ?? '—'}`}</dd></div><div><dt>Environment</dt><dd>{experiment?.environment || '—'}</dd></div><div><dt>Execution Mode</dt><dd>{preflight?.execution_mode || '—'}</dd></div><div><dt>Run ID</dt><dd>Generated automatically on Start</dd></div><div><dt>Radio</dt><dd>{requested.frequencyMHz || '—'} MHz · {requested.bandwidthMHz || '—'} MHz BW</dd></div></dl></Card>
+    <Card title="Run Summary" sub="Review the conditions before execution. Run ID is assigned only when Start is accepted." right={runButtons}>{!preflight?.ready && <div className="run-blocked"><b>Run cannot start</b><span>{preflight?.issues.length || 0} issue(s) need attention:</span><ul>{preflight?.issues.map((issue) => <li key={issue.key}>{issue.label}</li>)}</ul></div>}<dl className="config-values"><div><dt>Experiment</dt><dd>{experimentId || '—'}</dd></div><div><dt>{isRc ? 'Workflow' : 'Configuration'}</dt><dd>{isRc ? 'RC Workflow' : `${configuration?.name || '—'} v${configuration?.version ?? '—'}`}</dd></div><div><dt>Environment</dt><dd>{experiment?.environment || '—'}</dd></div><div><dt>Execution Mode</dt><dd>{preflight?.execution_mode || '—'}</dd></div><div><dt>Run ID</dt><dd>Generated automatically on Start</dd></div><div><dt>Radio</dt><dd>{effectiveRequested.frequencyMHz || '—'} MHz · {effectiveRequested.bandwidthMHz || '—'} MHz BW</dd></div></dl></Card>
+    </>}
 
+    {view === 'monitor' && <>
     {isRc && running && campaign?.intervention_required && <RcIntervention experimentId={experimentId} reason={campaign.intervention_reason || 'Calibration requires user configuration'} />}
 
     {running && <Card title="Active Run Monitor" sub="Phase, gNB and measurement state are platform-authoritative." right={<button className="btn danger" disabled={busy !== ''} onClick={stop}>{busy === 'stop' ? 'Stopping…' : 'End task now'}</button>}><div className="configuration-state"><div><span>Run</span><b>{latestRun?.run_id}</b></div><div><span>gNB</span><Badge tone={runtime?.gnb_state === 'RUNNING' ? 'good' : 'warn'}>{runtime?.ac.state === 'restarting_gnb' ? 'RESTARTING' : runtime?.gnb_state || '—'}</Badge></div>{experiment?.environment === 'AC' ? <><div><span>Current Phase</span><b>{runtime?.ac.phase?.name?.toUpperCase() || (status.phone.status?.phase as string) || 'WAITING SYNC'}</b><small>{runtime?.ac.phase_index != null && runtime.ac.phase_index >= 0 ? `${runtime.ac.phase_index + 1} / ${runtime.ac.phase_count}` : 'Standard Run'}</small></div><div><span>LOADED Configuration</span><b>{runtime?.ac.phase?.name === 'loaded' ? runtime.ac.configuration_name || configuration?.name || '—' : '—'}</b></div></> : <><div><span>Sample / Angle</span><b>{runtime?.rc.current_sample_index ?? 0} / {runtime?.rc.n_steps ?? requested.rcChamber?.n_steps ?? '—'} · {runtime?.rc.current_angle_deg == null ? '—' : `${runtime.rc.current_angle_deg.toFixed(1)}°`}</b></div><div><span>Sample Phase</span><b>{runtime?.rc.state || 'Preparing'}</b></div><div><span>RSSP / Target</span><b>{runtime?.rc.last_rssp_db == null ? '—' : `${runtime.rc.last_rssp_db.toFixed(1)} / ${runtime.rc.target_rssp_db?.toFixed(1)} dBFS`}</b></div></>}</div>{campaign?.log?.length ? <div className="activity-list"><h3>Latest activity</h3>{campaign.log.slice(-3).reverse().map((item) => <div key={`${item.ms}-${item.msg}`}><time>{new Date(item.ms).toLocaleTimeString()}</time><span>{item.msg}</span></div>)}</div> : null}</Card>}
     <Card title="Live Throughput / RSSP / SNR" sub="Run-scoped 1 Hz gNB telemetry; hover to read the exact timestamp and values."><div style={{ height: 300 }}>{runtime?.series?.length ? <ResponsiveContainer><LineChart data={runtime.series.map((row) => ({ ...row, label: new Date(row.time).toLocaleTimeString() }))}><XAxis dataKey="label" minTickGap={28} /><YAxis yAxisId="rate" unit=" Mbps" /><YAxis yAxisId="radio" orientation="right" unit=" dB" /><Tooltip /><Legend /><Line yAxisId="rate" dataKey="throughput" name="UL throughput" stroke="#3157d5" dot={false} isAnimationActive={false} /><Line yAxisId="radio" dataKey="rssp" name="RSSP" stroke="#c0392b" dot={false} isAnimationActive={false} /><Line yAxisId="radio" dataKey="snr" name="SNR" stroke="#2e9e5b" dot={false} isAnimationActive={false} /></LineChart></ResponsiveContainer> : <div className="muted-text">Waiting for Run telemetry…</div>}</div></Card>
     {experiment?.environment === 'RC' && running && <Card title="Power Calibration Record" sub="Each point is the RSSP mean measured during Settle Time after signal appears."><div style={{ height: 260 }}>{runtime?.rc.calibration_records?.length ? <ResponsiveContainer><LineChart data={runtime.rc.calibration_records}><XAxis dataKey="ms" tickFormatter={(value) => new Date(value).toLocaleTimeString()} /><YAxis unit=" dBFS" /><Tooltip labelFormatter={(value) => new Date(Number(value)).toLocaleTimeString()} formatter={(value, name, item) => name === 'RSSP' ? [`${Number(value).toFixed(2)} dBFS · ${item.payload.settle_sample_count ?? 0} samples · RX Gain ${item.payload.rx_gain_db ?? '—'} dB · Target SNR ${item.payload.target_snr_db ?? '—'} dB`, `Sample ${item.payload.sample_index} · ${item.payload.calibration_actuator ?? '—'}`] : [value, name]} /><Line dataKey="rssp_db" name="RSSP" stroke="#3157d5" strokeWidth={2} dot={{ r: 4 }} isAnimationActive={false} /><ReferenceLine y={runtime.rc.target_rssp_db} stroke="#c0392b" strokeDasharray="6 4" label="Target RSSP" /></LineChart></ResponsiveContainer> : <div className="muted-text">Calibration points will appear when the first Sample reaches power calibration.</div>}</div></Card>}
+    </>}
+    </div>
+    {showRunEditor && <Modal size="lg" title="Default Run Parameters" sub="The draft is applied to the Default Configuration only when Start or Restart is pressed." onClose={() => setShowRunEditor(false)} footer={<><button className="btn" onClick={() => setShowRunEditor(false)}>Done</button>{running && <button className="btn primary" disabled={startDisabled} onClick={() => start(true)}>{busy === 'start' ? 'Restarting…' : 'Restart with These Parameters'}</button>}</>}><GnbConfigurationFields value={runForm} onChange={(key, value) => setRunForm((current) => ({ ...current, [key]: value }))} includeTraffic /></Modal>}
   </div>;
 }
 

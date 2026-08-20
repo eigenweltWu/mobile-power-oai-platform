@@ -24,7 +24,7 @@ export default function Export() {
   };
 
   return (
-    <div className="stack">
+    <div className="stack page-workspace">
       <div className="page-head">
         <div>
           <div className="title">Export</div>

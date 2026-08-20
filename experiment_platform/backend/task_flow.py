@@ -37,6 +37,7 @@ RADIO_CONFIG_KEYS = (
     "frequencyMHz", "bandwidthMHz", "txGainDb", "rxGainDb",
     "puschTargetMode", "puschTargetSnrX10", "schedulerMode", "mcs", "qm", "nPrb",
 )
+FREQUENCY_QUANTIZATION_TOLERANCE_MHZ = 0.5
 
 
 def execution_mode(config: dict) -> str:
@@ -64,7 +65,8 @@ def config_diff(requested: dict, actual: dict) -> dict:
     for key, wanted in radio_config(requested).items():
         got = scheduler_values.get(key, actual.get(key, actual.get(aliases.get(key, ""))))
         if isinstance(wanted, (int, float)) and isinstance(got, (int, float)):
-            same = abs(float(wanted) - float(got)) < 1e-6
+            tolerance = FREQUENCY_QUANTIZATION_TOLERANCE_MHZ if key == "frequencyMHz" else 1e-6
+            same = abs(float(wanted) - float(got)) <= tolerance
         else:
             same = wanted == got
         if not same:
@@ -349,6 +351,16 @@ class DownlinkLoop:
             return PhoneAgent(base_url=f"http://{pdu}:{AGENT_PORT}"), None
         return None, None
 
+    def _shake_if_due(self) -> None:
+        """Refresh a missing or stale UE PDU address, at most once per 10 s."""
+        now_ms = time.time() * 1000.0
+        if now_ms - self._last_shake_ms < 10_000:
+            return
+        self._last_shake_ms = now_ms
+        self.last_shake = shake_and_refresh(
+            self.settings, self.oai, self.db,
+            self.experiment_id, self.run_id, n_exchanges=1)
+
     def _gnb_timestamp_ms(self) -> int:
         """gNB-side data timestamp (ms) captured at sync-confirm for alignment."""
         ues = self.oai.telemetry_ues()
@@ -371,18 +383,20 @@ class DownlinkLoop:
                     # re-resolve the address (and sync clocks when the phone
                     # is already monitoring). Throttled: /shake scans UPF
                     # docker logs, too expensive to run every 2 s probe.
-                    now_ms = time.time() * 1000.0
-                    if now_ms - self._last_shake_ms >= 10_000:
-                        self._last_shake_ms = now_ms
-                        self.last_shake = shake_and_refresh(
-                            self.settings, self.oai, self.db,
-                            self.experiment_id, self.run_id, n_exchanges=1)
+                    self._shake_if_due()
                     self._stop.wait(self.interval_s)
                     continue
 
                 t_send = time.time() * 1000.0
                 self.seq += 1
-                resp = agent.downlink(self.seq, t_send)
+                try:
+                    resp = agent.downlink(self.seq, t_send)
+                except Exception:
+                    # A cached address can become stale after UE re-attach.
+                    # Re-resolve it through OAI instead of retrying it forever.
+                    self._shake_if_due()
+                    self._stop.wait(self.interval_s)
+                    continue
                 t_recv = time.time() * 1000.0
 
                 # The phone only returns a valid ACK when it is in monitoring mode
